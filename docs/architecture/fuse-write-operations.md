@@ -21,7 +21,7 @@ The write FUSE operations that make the filesystem mutable: creation, deletion, 
 
 Each write operation in EtcFS follows the same synchronous IPC pattern as the read operations: the C handler builds a binary payload, sends it over the Unix socket, blocks until the Go backend responds, parses the response directly, and calls the kernel-facing `fuse_reply_*`.
 
-All namespace mutations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK, MKNOD) are implemented entirely in the metadata layer — they touch only etcd keys, never the block device. Only WRITE involves data that eventually reaches the block device (through the data engine), and in Phase 3 the data is cached in the Go daemon's memory with only the size update committed to etcd.
+All namespace mutations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK, MKNOD) are implemented entirely in the metadata layer — they touch only etcd keys, never the block device. WRITE involves data that reaches the EBS volume through the Go daemon's block device I/O layer.
 
 | Operation | IPC Opcode | FUSE Reply | Metadata Calls | Touches Block Device |
 |---|---|---|---|---|
@@ -30,7 +30,7 @@ All namespace mutations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK, MK
 | UNLINK | 7 | `fuse_reply_err` | `AtomicUnlink` | No |
 | RMDIR | 8 | `fuse_reply_err` | `LookupDirent` + `ListDirents` + `AtomicUnlink` | No |
 | RENAME | 9 | `fuse_reply_err` | `LookupDirent` + `AtomicRename` | No |
-| WRITE | 23 | `fuse_reply_write` | `GetInode` + `Put` (size update) | Eventually (Phase 6) |
+| WRITE | 23 | `fuse_reply_write` | Arena allocate + device write + fsync + extent commit | Yes |
 | SETATTR | 12 | `fuse_reply_attr` | `GetInode` | No |
 | SYMLINK | 10 | `fuse_reply_entry` | `allocInode` + `CreateInode` + `Put` + `CreateDirent` | No |
 | LINK | 11 | `fuse_reply_entry` | `IncrementNlink` + `CreateDirent` | No |
@@ -132,7 +132,7 @@ The flags field supports `RENAME_NOREPLACE` (do not overwrite an existing target
 
 ## Data Write (WRITE)
 
-WRITE is called when the kernel has data to write to a file. In Phase 3, the data is read from the IPC payload but not written to the block device — that will be implemented in Phase 6 when the arena allocator and O_DIRECT I/O path are complete.
+WRITE is called when the kernel has data to write to a file. The Go backend receives the full IPC payload (including the data bytes), allocates disk blocks from the arena allocator, writes the data to the shared EBS volume via the block device I/O layer, fsyncs the written range, commits the extent to etcd with a generation stamp, and updates the inode size.
 
 ### IPC Payload
 
@@ -140,30 +140,39 @@ WRITE is called when the kernel has data to write to a file. In Phase 3, the dat
 [u64:ino] [u64:offset] [u32:data_len] [data_bytes...]
 ```
 
-The payload is received in its entirety by the Go handler. For large writes (up to the kernel's `max_write` setting, configurable up to 256 KiB), this means the full data buffer is transmitted over the Unix socket.
-
-### Handler Flow (Phase 3)
+### Handler Flow
 
 1. Read the inode record from etcd. If the inode does not exist, return `ENOENT`.
-2. If the write extends beyond the current file size (`offset + data_len > size`), update the inode's size field in etcd.
-3. Return the number of bytes written (always `data_len`; no partial writes in Phase 3).
+2. If no arena is acquired yet, acquire one from the global pool via CAS.
+3. Call `alloc.Allocate(dataLen)` to reserve contiguous disk blocks. Returns the byte offset on the block device.
+4. Write the data bytes to the block device via `pwrite()` at the allocated disk offset.
+5. Call `sync_file_range()` on the written range to ensure data durability.
+6. Read the node's current fencing generation from `gen:<node_id>` in etcd.
+7. Store an extent entry in etcd at `extent:<ino>/<chunk>` with the value `"logical_off,disk_off,length,generation"`. The chunk number is auto-incremented for each new extent.
+8. If the write extends beyond the current file size, update the inode size in etcd.
+9. Return the number of bytes written.
 
-The data payload itself is discarded — it is received from the socket and ignored. This means writes are effectively a no-op for data durability. The size update is durable because it is written to etcd.
+### Data-Then-Metadata Ordering
 
-### Full Write Path (Planned, Phase 6+)
+The fsync (step 5) happens before the extent commit (step 7). This means the data is durable on the EBS volume before etcd records its existence. If the daemon crashes between steps 5 and 7:
 
-The eventual write path will be:
+- The data is on the block device (fsynced).
+- The extent is NOT in etcd — no inode references the blocks.
+- On restart, the blocks are orphaned (not referenced by any inode). The orphan is harmless — the data goes unread — and the scrubber eventually reclaims the blocks.
 
-1. Receive the write payload from the IPC socket.
-2. Call the arena allocator to reserve disk blocks for the extent.
-3. Append the write to the local write-ahead log (WAL).
-4. Write the data to the block device via O_DIRECT/io_uring.
-5. Fsync the block device (data durability).
-6. Commit the extent to etcd via `AppendExtent` (metadata durability).
-7. Mark the WAL entry as committed.
-8. Return the written byte count.
+If the order were reversed (extent before data), a crash would leave a metadata reference to data that was never written — a data integrity failure. The data-then-metadata ordering is the central write-ordering invariant.
 
-This is the **data-then-metadata** ordering invariant (§ Write Ordering). The data is on the block device before the extent is committed to etcd. If the node crashes between steps 4 and 6, the WAL entry is uncommitted; on recovery, the WAL replay discovers the committed vs uncommitted split and reconciles the arena free-list.
+### Partial and Sequential Writes
+
+Multiple writes to the same file create separate extent keys (`extent:<ino>/0`, `extent:<ino>/1`, ...). The read handler scans all extents for the inode, finds the ones covering the requested range, and concatenates the data from each. Allocation is sequential within the arena's free bitmap — blocks are contiguous unless the arena is fragmented.
+
+### Generation Stamp
+
+Every extent carries the node's current fencing generation at write time. The generation is read from `gen:<node_id>` before the extent is committed. The scrubber's generation consistency check reads this stamp and compares it against the node's current generation. If the node was fenced mid-write, the generation guard on the etcd transaction prevents the commit, and the data bytes remain as harmless orphans on the block device.
+
+### Alignment
+
+The block device is opened with buffered I/O (no O_DIRECT). This means the write path accepts arbitrarily sized and offset writes from the kernel without alignment constraints. The `sync_file_range()` call flushes the kernel page cache for the written range.
 
 ## Attribute Setting (SETATTR)
 
@@ -184,11 +193,13 @@ The `valid_bitmask` indicates which fields from the attribute blob are meaningfu
 
 ### Truncation
 
-Truncation (size change) is the most significant SETATTR operation because it has data-consistency implications. When a file is truncated:
+Truncation (size change) follows the **metadata-then-data** ordering invariant:
 
-**Metadata-then-data ordering:** The metadata update (reduced size and shortened extent list) must be committed to etcd **before** the freed blocks are returned to the arena free-list. This prevents a reader from seeing a file whose extent list has been shortened but whose blocks have already been reused by a new extent from another file.
+1. Commit the reduced extent list to etcd: scan all `extent:<ino>/` keys, shorten or delete any extent whose logical range extends beyond the new size.
+2. If the extent was shortened, keep the first `newSize - logOff` bytes of the extent. If the extent was entirely beyond the new size, delete the extent key and return the freed blocks to the arena free-list via `alloc.Free()`.
+3. Update the inode size in etcd.
 
-In Phase 3, truncation is a metadata-only operation: the inode's size and block count are updated in etcd, but the freed disk blocks are not immediately returned to the arena free-list (the arena allocator is not yet connected).
+Metadata-then-data ordering ensures the inode size shrinks before the freed blocks are returned to the arena free-list. If the node crashes between steps 2 and 3, the blocks are still allocated (not reusable) but the inode still has the old size — the blocks are wasted but no reader can access them because the extent was removed.
 
 ### Phase 3 Implementation
 
@@ -252,19 +263,14 @@ OPEN is called when a file is opened with `open()`, `creat()`, or `openat()`. In
 
 ### RELEASE
 
-RELEASE is the counterpart to OPEN, called when the last file descriptor for a file is closed. It is a no-op in Phase 3. In future phases, RELEASE will flush any cached write data, release the inode's local WAL entries, and remove the file from the daemon's open-file tracking map.
+RELEASE is the counterpart to OPEN, called when the last file descriptor for a file is closed. It is a no-op — the Go daemon acknowledges the close without performing any action. In a future implementation, RELEASE would flush cached write data and release the inode's per-open state.
 
 ### FLUSH
 
-FLUSH is called on every `close()` system call, not just the final `close()`. Its contract is to ensure that data written by prior WRITE calls reaches the storage medium. In Phase 3, FLUSH is a no-op (writes are already "committed" by updating the inode size in etcd). In later phases, FLUSH will drive the WAL flush and etcd extent commit.
+FLUSH is called on every `close()` system call, not just the final `close()`. Its contract is to ensure that data written by prior WRITE calls reaches the storage medium. Currently, FLUSH is a no-op — writes are already durable on the block device (the WRITE handler syncs before returning), so no additional action is needed for data durability.
 
-## Synchronisation (FSYNC)
+### Synchronisation (FSYNC)
 
-FSYNC is called when an application calls `fsync()`, `fdatasync()`, or `syncfs()` on a file descriptor. The kernel may issue `FSYNC` separately for data and metadata. In Phase 3, both `FSYNC` and `FSYNCDIR` return success immediately without doing any work — the etcd size update is already committed by the WRITE handler.
+FSYNC is called when an application calls `fsync()`, `fdatasync()`, or `syncfs()` on a file descriptor. The kernel may issue `FSYNC` separately for data and metadata. Currently FSYNC is a no-op — writes are already synced by the WRITE handler, so calling fsync after a write is redundant for data durability.
 
-In the full implementation, FSYNC will:
-
-1. Flush any pending WRITE data to the block device.
-2. Ensure the WAL entry is committed to etcd.
-3. Confirm the etcd transaction committed to the Raft quorum.
-4. Return success only after steps 1–3 are confirmed.
+In a future implementation, FSYNC would explicitly sync the block device ranges for the inode and confirm the etcd transaction committed to the Raft quorum before returning success.

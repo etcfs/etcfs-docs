@@ -26,13 +26,13 @@ EtcFS chooses the second outcome: **data first, then metadata**. Orphaned bytes 
 
 The data-then-metadata ordering is the central write-ordering invariant. Every write operation follows this sequence:
 
-### Phase 3 (Metadata-Only Writes)
+### Metadata-Only Mode
 
-Writes are committed to etcd immediately by updating the inode's size field. There is no block device I/O, so the ordering invariant is trivially satisfied — the "data" is the size metadata itself.
+When no block device is configured (`--block-device` flag not provided), the daemon falls back to metadata-only mode: writes update the inode size in etcd but do not store data on disk. This mode is functionally correct for metadata-only testing but provides no data durability across restarts.
 
-### Phase 6+ (Full Block Device Writes)
+### Data-Then-Metadata (Full Write Path)
 
-The complete write protocol with the block device:
+The complete write protocol with the block device is implemented end-to-end:
 
 1. **Reserve disk blocks** from the arena allocator. The blocks are marked allocated in the local arena free-list but the extent is not yet visible to other nodes.
 

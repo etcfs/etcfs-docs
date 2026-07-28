@@ -175,11 +175,35 @@ STATFS does not query etcd. In the current implementation, the response is synth
 
 The handler (`ec_statfs`) fills a `struct statvfs` and calls `fuse_reply_statfs`.
 
+## READ
+
+READ is called when an application reads file data via `read()`, `cat`, or `dd`. The handler sends an IPC request to the Go backend, which retrieves the file content from the shared EBS volume.
+
+### Payload
+
+```
+[u64:ino] [u64:offset] [u32:size]
+```
+
+The `offset` is the byte position within the file where reading starts. The `size` is the maximum number of bytes to read (the kernel may request up to 256 KiB).
+
+### Processing
+
+The Go backend scans the inode's extent keys (`extent:<ino>/<chunk>`) from etcd. For each extent, it parses the CSV value `"logical_off,disk_off,length,generation"`. It finds the first extent that covers the requested offset and reads the data from the block device via `pread()` at the correct disk offset plus the offset within the extent.
+
+If the file has multiple extents (e.g., from sequential writes), the handler reads from each covering extent in order and concatenates the data. Gaps between extents (sparse file regions) are filled with zero bytes.
+
+### Response
+
+```
+[i32:error] [u32:data_len] [data_bytes...]
+```
+
+If the requested offset is beyond the file's last extent, the handler returns `data_len=0` to indicate EOF. Partial reads (fewer bytes than requested) are returned when the remaining file data is smaller than the requested size.
+
 ## OPEN and OPENDIR
 
-OPEN and OPENDIR are called when a file or directory is opened. In Phase 2 (read-only), these are no-ops that acknowledge the open. The file handle (`fh`) is set to zero — there is no server-side state tracked for open files.
-
-In Phase 3 (write operations), OPEN marks the file as writable and may trigger extent pre-allocation.
+OPEN and OPENDIR are called when a file or directory is opened. Both are acknowledged immediately with `fi->fh = 0`, `fi->direct_io = 1`, and `fi->keep_cache = 0`. The `direct_io = 1` flag tells the kernel to bypass its page cache for file data, sending all reads and writes directly to the FUSE daemon.
 
 ## Cache Timeouts
 

@@ -1,31 +1,32 @@
 # Block Device I/O Substrate
 
-The raw block device access layer that performs O_DIRECT reads and writes against the shared EBS Multi-Attach volume, providing the data path for file content storage.
+The raw block device access layer that performs reads and writes against the shared EBS Multi-Attach volume, providing the data path for file content storage. Two implementations exist: a C library (`pkg/block/`) for the FUSE daemon and a Go package (`pkg/blockio/`) for the metadata daemon. The Go package is the active data path — the C library exists for future use.
 
 ## Table of Contents
 
+- [Go Block I/O Library](#go-block-io-library)
 - [Architecture](#architecture)
 - [Device Discovery](#device-discovery)
-- [O_DIRECT Alignment](#o_direct-alignment)
 - [Synchronous I/O](#synchronous-io)
-- [Buffer Management](#buffer-management)
 - [Data Durability](#data-durability)
-- [io_uring (Planned)](#io_uring-planned)
+- [Buffer Management](#buffer-management)
+- [Go Block I/O Library](#go-block-io-library)
 - [Interaction with the Arena Allocator](#interaction-with-the-arena-allocator)
 - [Interaction with the Write-Ahead Log](#interaction-with-the-write-ahead-log)
 
 ## Architecture
 
-The block device I/O substrate is a C library (`pkg/block/`) that provides a minimal, aligned-I/O interface to the shared raw block device. It does not implement any filesystem format — the block device is treated as a flat array of bytes addressed by `uint64` byte offset. All I/O is O_DIRECT, bypassing the kernel page cache to avoid double caching (the FUSE daemon's internal cache provides the caching layer).
+The block device I/O substrate is implemented in two forms:
 
-The substrate has four responsibilities:
+### Go Block I/O Library (`pkg/blockio/`)
 
-1. **Device discovery** — opening the block device by path or volume ID, querying its geometry.
-2. **Alignment enforcement** — rejecting I/O requests with misaligned offsets, lengths, or buffers.
-3. **Synchronous I/O** — `pread`/`pwrite` with O_DIRECT, plus `sync_file_range` for data durability.
-4. **Buffer management** — allocating page-aligned buffers suitable for O_DIRECT.
+The primary data path. The Go metadata daemon opens the EBS volume at startup and performs all data I/O directly. This avoids an extra IPC round-trip between the C and Go daemons — the WRITE handler receives the data payload over the Unix socket, and the same goroutine allocates arena blocks, writes to the EBS volume, and commits the extent to etcd.
 
-The substrate is shared across all EtcFS nodes. Each node opens the same block device (the shared EBS Multi-Attach volume) independently. There is no coordination at the block I/O layer — coordination happens at the metadata layer (etcd) and the fencing layer.
+The package provides a `Device` struct with methods for opening the device, reading, writing, syncing ranges, and closing. The device is opened with buffered I/O (no O_DIRECT), which allows unaligned reads and writes without alignment constraints.
+
+### C Block I/O Library (`pkg/block/`)
+
+A secondary implementation that provides O_DIRECT access to the block device. This library is currently unused; it exists for a future io_uring-based data path that would run directly in the C FUSE daemon.
 
 ## Device Discovery
 
@@ -77,6 +78,16 @@ check_alignment(dev, buf, count, offset):
 ```
 
 ## Synchronous I/O
+
+### Go Blockio Package
+
+The Go `Device` provides aligned and unaligned I/O through the `pread`/`pwrite` syscalls:
+
+- `ReadAt(buf, offset)` — reads up to `len(buf)` bytes at the given offset. No alignment restrictions.
+- `WriteAt(buf, offset)` — writes all bytes at the given offset. No alignment restrictions.
+- `SyncRange(offset, length)` — calls `sync_file_range` to flush the kernel page cache for the given range.
+
+### C Library
 
 ### Reading
 
