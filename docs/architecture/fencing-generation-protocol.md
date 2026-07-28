@@ -1,0 +1,219 @@
+# Fencing Generation Protocol
+
+The monotonically increasing epoch counters that guard every metadata mutation, ensuring that writes from a fenced node are rejected even if the self-fencing watchdog and external fencing controller both fail.
+
+## Table of Contents
+
+- [Generation Key Model](#generation-key-model)
+- [Core Operations](#core-operations)
+- [CAS-Semantics of Generation Bump](#cas-semantics-of-generation-bump)
+- [Generation Guard on Transactions](#generation-guard-on-transactions)
+- [Integration with Extent Writes](#integration-with-extent-writes)
+- [Integration with Lock Grants](#integration-with-lock-grants)
+- [Integration with Arena Reclamation](#integration-with-arena-reclamation)
+- [Integration with the Scrubber](#integration-with-the-scrubber)
+- [Generation Lifecycle](#generation-lifecycle)
+
+## Generation Key Model
+
+Each node in the EtcFS cluster has a `gen:<node_id>` key in etcd storing a monotonically increasing unsigned 64-bit integer. The generation starts at zero when the key does not exist (node has never been fenced) and increases by exactly one per fencing event.
+
+The generation key is the single source of truth for determining whether a node has been fenced. Its value is:
+- **0**: Node has never been fenced. This is the initial state for every node. Extents written with generation 0 are pre-fence writes.
+- **> 0**: Node has been fenced at least once. The value is the number of times the node has been fenced. Extents written with a generation lower than the current value are stale.
+
+There is no maximum value. With 64 bits, even at one fence per second, the counter would not overflow for billions of years.
+
+## Core Operations
+
+### GetGeneration
+
+Reads the current generation for a node from etcd. If the `gen:<node_id>` key does not exist, returns 0. This is the initial generation for a node that has never been fenced.
+
+The generation is stored as a decimal ASCII string (e.g., `"7"`), not as a binary integer. This makes it human-readable in etcdctl queries while preserving the CAS semantics (string comparison on the Value target is the same as integer comparison for decimal representations of positive integers).
+
+### BumpGeneration
+
+Atomically increments a node's generation by 1. This is the most safety-critical operation in the entire system. It uses a Compare-And-Swap (CAS) etcd transaction:
+
+```
+BumpGeneration(ctx, nodeID, expectedOld):
+  key = gen:<nodeID>
+  newGen = expectedOld + 1
+
+  if expectedOld == 0:
+    cmp = CreateRevision(key) == 0
+  else:
+    cmp = Value(key) == str(expectedOld)
+
+  Txn:
+    If cmp:
+      Put(key, str(newGen))
+      return newGen
+    Else:
+      return CAS_FAILED
+```
+
+The two-branch comparison handles the first bump (when the key does not exist yet) differently from subsequent bumps. For `expectedOld == 0`, it checks that the key has never been created — meaning no fence has ever occurred. For `expectedOld > 0`, it checks that the stored value matches the expected value — meaning no concurrent bump occurred between the read (step 2 of the fence protocol) and the bump.
+
+If the CAS fails, the old value has changed (another controller replica bumped the generation concurrently). The caller must re-read the current generation and decide whether to retry or abort.
+
+### EnsureGeneration
+
+Writes a generation key with at least the given value. If the key already exists with a higher or equal value, the write is skipped. This is used during node bootstrap to initialise the generation counter to a known starting point, overwriting a stale value from a previous incarnation.
+
+### IsFenceActive
+
+Returns `true` if the node has been fenced (generation > 0). This is a convenience predicate used by other subsystems to check fence status without parsing the generation value.
+
+## CAS Semantics of Generation Bump
+
+The generation bump is a single etcd transaction. The CAS comparison ensures at-most-once semantics: exactly one bump happens for a given expected generation, even if multiple controller replicas attempt to bump simultaneously.
+
+The full serialisation guarantee is:
+
+1. **Controller replica A** reads `gen:node-X = 5`.
+2. **Controller replica B** reads `gen:node-X = 5` (same read, same state).
+3. **Replica A** executes the bump transaction with `Value == "5"`. The transaction succeeds; `gen:node-X` becomes `6`.
+4. **Replica B** executes the bump transaction with `Value == "5"`. The transaction fails because `gen:node-X` is now `6`.
+5. **Replica B** re-reads `gen:node-X = 6`, logs the conflict, and does not retry (the fence has already been recorded).
+
+This CAS guarantee extends to concurrent fence attempts from different nodes — it is not limited to controller replicas. If two separate fencing controllers in the cluster (watching different nodes) both fence the same node simultaneously (e.g., the node's membership key is deleted but comes back), only one fence is recorded.
+
+## Generation Guard on Transactions
+
+`WithGenerationGuard` produces an etcd comparison that can be included in any transaction to guard it against stale generations:
+
+```
+WithGenerationGuard(nodeID, expectedGen):
+  return Comparison: Value(gen:<nodeID>) == str(expectedGen)
+```
+
+This comparison is included in the transaction's `If` clause alongside the operation-specific comparisons. If the generation has been bumped since the expected value was read, the comparison fails, and the transaction is aborted.
+
+### Which Transactions Must Include a Guard
+
+Every metadata mutation that modifies extents or locks must include a generation guard. Specifically:
+
+| Transaction | Guard Checks | Why |
+|---|---|---|
+| `AppendExtent` | Writer's current generation | Prevents post-fence extent commits |
+| `UpdateInode` (size change) | Writer's current generation | Prevents post-fence attribute changes |
+| `IncrementNlink` | Writer's current generation | Prevents post-fence link creation |
+| `DecrementNlink` | Writer's current generation | Prevents post-fence link removal |
+| `AcquireLock` (from released lock) | Previous holder's bumped generation | Ensures old holder is truly fenced |
+| `BumpGeneration` (itself) | Self-CAS (see above) | Ensures at-most-once fence recording |
+
+The guard is NOT needed for:
+- Read-only operations (GetInode, Lookup, etc.)
+- Operations that create new keys (CreateInode when the inode doesn't exist yet — there is no pre-existing generation to check)
+- Operations that don't depend on the writer identity (e.g., listing directory entries)
+
+### What Happens When a Guard Fails
+
+When a generation guard fails, the transaction returns `false` (the success path was not executed). The caller receives an error with context about the generation mismatch. The typical response is:
+
+- **For extent writes:** The write data is already on the block device, but the metadata commit failed. The data becomes an orphaned extent. The WAL replay on the next restart (if the node is still alive) discovers the uncommitted write and returns the blocks to the arena free-list.
+
+- **For lock acquisitions:** The guarding node retries with an exponential backoff. If the generation was bumped by a concurrent fence, the retry will re-read the new generation and include it in the guard, allowing the transaction to succeed.
+
+- **For the self-fenced node:** All generation-guarded transactions fail. The node is effectively in read-only mode at the metadata layer, even if its FUSE frontend is still accepting writes (which it should not be, because the self-fencing watchdog should have fired).
+
+## Integration with Extent Writes
+
+Every extent write commits two pieces of information:
+
+1. **The extent itself** (the `extent:<ino>/<chunk>` key) — includes the `generation` field as a stamp. The generation stamp is the writer's current generation at the time of the write.
+
+2. **The generation guard** in the commit transaction — ensures that the writer's generation has not been bumped since the write was initiated.
+
+The generation stamp in the extent permits post-hoc verification by the scrubber. If the fence occurred mid-write (the generation was bumped while the writer was still processing), the scrubber can detect extents with stale stamps.
+
+The flow is:
+
+```
+1. Read current generation: gen = store.GetGeneration(ctx, nodeID)
+2. Write data to block device (O_DIRECT pwrite)
+3. Build extent record with generation = gen
+4. Commit to etcd with guard: WithGenerationGuard(nodeID, gen)
+5. If guard fails (generation was bumped during steps 2-4):
+     - Log the fence collision
+     - The data on the block device is orphaned
+     - Return EIO to the application (write was not committed)
+```
+
+The window between step 1 and step 4 is the "dangerous window" — during this time, the generation could be bumped (external fence) while the writer is still writing to the block device. If the write completes to the block device (step 2) but the generation is bumped before the metadata commit (step 4), the data becomes orphaned. This is acceptable — the data is unreachable because there is no extent list entry for it.
+
+## Integration with Lock Grants
+
+When granting a lock that was previously held by a node that is now believed dead, the lock-acquisition transaction must include a generation guard:
+
+```
+AcquireLock(ino, mode, ttl):
+  Read old lock record (if any)
+  Read previous holder's generation: gen = GetGeneration(ctx, previous_node)
+  Build CAS transaction:
+    If: GenerationGuard(previous_node, gen), and no lock key exists
+    Then: Create lock key with lease
+```
+
+The guard ensures that the previous holder's generation has been bumped (it was fenced) before the lock is granted. Without this check, the following race is possible:
+
+1. Node A acquires exclusive lock on inode 42.
+2. Node A is partitioned from etcd (lease expires, lock key deleted).
+3. Node B sees the lock key is gone, acquires the lock.
+4. Node A is still writing to the block device (it is partitioned, not crashed).
+5. Node B writes to the same inode — corruption.
+
+With the generation guard:
+1–3. Same as above.
+4. Node A's write's metadata commit (AppendExtent) includes `WithGenerationGuard(nodeA, 5)`.
+5. But the generation has been bumped to 6 by the external fencing controller.
+6. Node A's commit fails. The data is orphaned but the metadata is consistent.
+7. Node B writes safely.
+
+## Integration with Arena Reclamation
+
+When reclaiming an arena from a fenced node:
+
+1. Confirm the fenced node's generation has been bumped (the fence is complete).
+2. Read the current arena key for the fenced node.
+3. Delete the fenced node's arena key.
+4. Create a new arena key for the reclaiming node or for the free pool.
+
+The generation check prevents a partially-fenced node from claiming to still own an arena when its generation guard would reject the metadata update anyway.
+
+## Integration with the Scrubber
+
+The scrubber (Phase 8) reads each extent's generation stamp and compares it against the inode's current generation. If the extent stamp is less than the generation, the extent was written before a fence and may be stale.
+
+The scrubber reports `GENERATION_MISMATCH` findings, listing each extent with its stale stamp and the expected current generation. These findings are for human review — the scrubber does not automatically delete or reclaim generation-stale extents, because the data may still be valid (the node that wrote it may not have been the node that was fenced).
+
+## Generation Lifecycle
+
+```
+Node starts:
+  gen:node-X does not exist
+  → generation = 0 (GetGeneration returns 0)
+
+First fence event:
+  BumpGeneration(X, 0):
+    gen:node-X created, value = 1
+
+Node restarts after first fence:
+  gen:node-X exists, value = 1
+  → generation = 1
+  EnsureGeneration(X, 1): no-op (already 1)
+
+Second fence event:
+  BumpGeneration(X, 1):
+    gen:node-X → 2
+
+...continues for each fence event...
+
+Node permanently decommissioned:
+  gen:node-X may be deleted manually by an administrator
+  (or left in place for audit trail)
+```
+
+The generation is never reset. A node that is permanently decommissioned and replaced by a new node with the same ID should have its generation reset by deleting the key manually — but even without deletion, the generation would just start from the existing value, which is correct.

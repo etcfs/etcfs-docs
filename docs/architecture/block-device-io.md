@@ -1,0 +1,173 @@
+# Block Device I/O Substrate
+
+The raw block device access layer that performs O_DIRECT reads and writes against the shared EBS Multi-Attach volume, providing the data path for file content storage.
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Device Discovery](#device-discovery)
+- [O_DIRECT Alignment](#o_direct-alignment)
+- [Synchronous I/O](#synchronous-io)
+- [Buffer Management](#buffer-management)
+- [Data Durability](#data-durability)
+- [io_uring (Planned)](#io_uring-planned)
+- [Interaction with the Arena Allocator](#interaction-with-the-arena-allocator)
+- [Interaction with the Write-Ahead Log](#interaction-with-the-write-ahead-log)
+
+## Architecture
+
+The block device I/O substrate is a C library (`pkg/block/`) that provides a minimal, aligned-I/O interface to the shared raw block device. It does not implement any filesystem format — the block device is treated as a flat array of bytes addressed by `uint64` byte offset. All I/O is O_DIRECT, bypassing the kernel page cache to avoid double caching (the FUSE daemon's internal cache provides the caching layer).
+
+The substrate has four responsibilities:
+
+1. **Device discovery** — opening the block device by path or volume ID, querying its geometry.
+2. **Alignment enforcement** — rejecting I/O requests with misaligned offsets, lengths, or buffers.
+3. **Synchronous I/O** — `pread`/`pwrite` with O_DIRECT, plus `sync_file_range` for data durability.
+4. **Buffer management** — allocating page-aligned buffers suitable for O_DIRECT.
+
+The substrate is shared across all EtcFS nodes. Each node opens the same block device (the shared EBS Multi-Attach volume) independently. There is no coordination at the block I/O layer — coordination happens at the metadata layer (etcd) and the fencing layer.
+
+## Device Discovery
+
+The block device is opened by calling `etcfs_block_open(volume_id)`. The `volume_id` parameter accepts either:
+- A device path (e.g., `"/dev/nvme1n1"`, `"/dev/xvdf"`)
+- A volume ID string (e.g., `"vol-0abcdef1234567890"`)
+
+For path-based opens, the call directly opens the device with `O_RDWR | O_DIRECT`. If read-write fails, it falls back to `O_RDONLY | O_DIRECT`.
+
+For volume-ID-based opens, the call probes a list of known NVMe and virtual device paths:
+
+| Priority | Path | Device Type |
+|---|---|---|
+| 1 | `/dev/nvme1n1` | NVMe (EBS nitro instances) |
+| 2 | `/dev/sdf` | Xen/paravirtual |
+| 3 | `/dev/xvdf` | Xen PV |
+
+The first path that opens successfully is used. This heuristic covers the common attachment patterns for EBS Multi-Attach volumes.
+
+### Geometry Query
+
+After opening, the substrate queries the device geometry via two `ioctl` calls:
+
+- **`BLKSSZGET`** — returns the logical sector size (typically 512 or 4096 bytes). This value determines the alignment requirements for all subsequent I/O: offsets, lengths, and buffer pointers must all be multiples of this value.
+
+- **`BLKGETSIZE64`** — returns the total device capacity in bytes. This is used to compute the number of sectors and to validate that arena ranges do not exceed the device capacity.
+
+If an `ioctl` fails (unlikely on a real block device, possible in the test harness), the substrate falls back to defaults: sector size 512, total sectors 0 (unknown capacity).
+
+## O_DIRECT Alignment
+
+O_DIRECT I/O imposes three alignment requirements, all enforced by `check_alignment`:
+
+1. **Offset alignment.** The byte offset of the I/O must be a multiple of the device's logical sector size. A write at offset 4097 (sector size 512) returns `-EINVAL`.
+
+2. **Length alignment.** The transfer length must be a multiple of the sector size. A write of 513 bytes returns `-EINVAL`.
+
+3. **Buffer alignment.** The starting address of the I/O buffer must be aligned to the sector size boundary. A `malloc`'d buffer (typically 16-byte aligned) returns `-EINVAL`. Only buffers allocated with `posix_memalign` at the sector size granularity are accepted.
+
+The exact alignment requirement comes from the block device's logical sector size, not from page size (4 KiB). For a 512-byte-sector device, 512-byte alignment is sufficient. For a 4096-byte-sector device (4Kn), 4096-byte alignment is required.
+
+```
+check_alignment(dev, buf, count, offset):
+  align = dev.sector_size
+  if offset % align != 0:   return -EINVAL
+  if count % align != 0:     return -EINVAL
+  if (uintptr)buf % align != 0: return -EINVAL
+  return 0
+```
+
+## Synchronous I/O
+
+### Reading
+
+`etcfs_block_read` performs a synchronous O_DIRECT `pread` at the given byte offset. The buffer must already be allocated and sized for the requested number of bytes. Returns the number of bytes read, or a negated errno on failure.
+
+### Writing
+
+`etcfs_block_write` performs a synchronous O_DIRECT `pwrite`. Data is transferred directly from the user-supplied buffer to the block device, bypassing the kernel page cache. Returns the number of bytes written, or a negated errno on failure.
+
+### Error Handling
+
+The synchronous I/O functions return `ssize_t` — positive for success (number of bytes transferred), negative for errors (negated errno). Common errors:
+
+| Error | Cause |
+|---|---|
+| `-EBADF` | Device not open or invalid handle |
+| `-EINVAL` | Alignment violation (offset/length/buffer) |
+| `-EIO` | Block device I/O error (hardware failure, lost connection) |
+| `-ENOSPC` | Write beyond device capacity |
+| `-EFBIG` | Write beyond implementation limit |
+
+Partial reads and writes are possible but uncommon with O_DIRECT on raw block devices. The caller is responsible for handling partial results by retrying the remaining bytes.
+
+## Buffer Management
+
+`etcfs_block_alloc_buffer` allocates a buffer suitable for O_DIRECT I/O on the given device:
+
+```
+void* etcfs_block_alloc_buffer(dev, size)
+  align = dev.sector_size  (default 4096 if dev is NULL)
+  posix_memalign(&buf, align, size)
+  return buf
+```
+
+The alignment is set to the device's logical sector size. For a device with 512-byte sectors, the buffer is 512-byte aligned. For 4Kn devices, the buffer is 4096-byte aligned.
+
+The caller must free the buffer with `free()`. The buffer content is uninitialised — the caller must fill it before writing or be prepared to read into it.
+
+## Data Durability
+
+`etcfs_block_sync` provides data durability for previously written extents. It calls `sync_file_range` with the `SYNC_FILE_RANGE_WRITE` and `SYNC_FILE_RANGE_WAIT_AFTER` flags, which initiates writeback for the specified byte range and waits for it to complete.
+
+The sync is range-based rather than full-device. This allows the callers to fsync only the specific extents that were just written, avoiding the cost of flushing the entire device buffer.
+
+The sync is called as part of the data-then-metadata ordering protocol:
+
+1. Write data to the block device (O_DIRECT pwrite).
+2. Fsync the written extent range (sync_file_range).
+3. Append to the write-ahead log (WAL).
+4. Commit the extent to etcd.
+
+The fsync (step 2) guarantees that the data is durable on the block device before the metadata (step 4) is committed to etcd. If the node crashes between step 2 and step 4, the data is orphaned (on disk but not in etcd) but not lost — the WAL replay on restart discovers the orphan.
+
+## io_uring (Planned)
+
+The synchronous `pread`/`pwrite` interface is a Phase 5–6 initial implementation. Phase 7 will replace it with io_uring for:
+
+- **Batch submission.** Multiple I/O requests can be submitted in a single system call, reducing context-switch overhead.
+- **Asynchronous completion.** The FUSE daemon does not need to block a thread for each I/O operation. io_uring completions can be processed on a dedicated completion thread.
+- **Fixed buffers and files.** io_uring supports pre-registered buffers and file descriptors, further reducing per-I/O overhead.
+
+The planned interface extension:
+
+```
+// Submit a batch of I/O operations.
+// Returns a completion queue that delivers results asynchronously.
+io_uring* etcfs_block_io_submit(dev, operations[], count, completion_callback)
+
+// Wait for all submitted operations to complete.
+int etcfs_block_io_wait(uring, timeout)
+```
+
+The io_uring integration is deferred to Phase 7 because it requires changes to the worker pool model (the current IPC worker is a single-threaded dispatch loop; io_uring completions need to be integrated with the FUSE reply path).
+
+## Interaction with the Arena Allocator
+
+The block device I/O substrate does not know about arenas. It reads and writes at arbitrary byte offsets within the device capacity. The arena allocator is responsible for ensuring that:
+
+- Every read and write falls within the node's allocated arena range.
+- No two nodes write to the same disk offset (arena ranges do not overlap).
+- Freed blocks (from truncation) are returned to the arena free-list.
+
+The substrate enforces the device capacity limit but not the arena boundary. Arena boundary enforcement is the arena allocator's responsibility.
+
+## Interaction with the Write-Ahead Log
+
+The WAL sits between the block device I/O substrate and the metadata layer:
+
+1. The substrate writes data to the block device and fsyncs.
+2. Before committing the extent to etcd, the WAL records an uncommitted entry.
+3. The extent is committed to etcd.
+4. The WAL entry is marked committed.
+
+The WAL file path is independent of the block device path. It is a local filesystem file (e.g., `/var/lib/etcfuse/wal`), not a block device. The WAL does not use O_DIRECT — it is a small, append-only log of core metadata that benefits from the kernel page cache.
