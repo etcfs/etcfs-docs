@@ -19,13 +19,13 @@ The write FUSE operations that make the filesystem mutable: creation, deletion, 
 
 ## Operation Overview
 
-Each write operation in EtcFS follows the same async dispatch pattern as the read operations: the C handler builds a binary payload, submits it to the IPC worker, and returns immediately. The Go handler decodes the payload, calls the appropriate metadata store method, and returns a binary response. The C callback decodes the response and calls the kernel-facing `fuse_reply_*`.
+Each write operation in EtcFS follows the same synchronous IPC pattern as the read operations: the C handler builds a binary payload, sends it over the Unix socket, blocks until the Go backend responds, parses the response directly, and calls the kernel-facing `fuse_reply_*`.
 
 All namespace mutations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK, MKNOD) are implemented entirely in the metadata layer — they touch only etcd keys, never the block device. Only WRITE involves data that eventually reaches the block device (through the data engine), and in Phase 3 the data is cached in the Go daemon's memory with only the size update committed to etcd.
 
 | Operation | IPC Opcode | FUSE Reply | Metadata Calls | Touches Block Device |
 |---|---|---|---|---|
-| CREATE | 5 | `fuse_reply_entry` | `allocInode` + `AtomicCreateFile` | No |
+| CREATE | 5 | `fuse_reply_create` | `allocInode` + `AtomicCreateFile` | No |
 | MKDIR | 6 | `fuse_reply_entry` | `allocInode` + `AtomicCreateDir` | No |
 | UNLINK | 7 | `fuse_reply_err` | `AtomicUnlink` | No |
 | RMDIR | 8 | `fuse_reply_err` | `LookupDirent` + `ListDirents` + `AtomicUnlink` | No |

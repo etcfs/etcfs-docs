@@ -16,7 +16,7 @@ The read-only operations that make EtcFS mountable and navigable: LOOKUP, GETATT
 
 ## Operation Overview
 
-The read-only FUSE operations are the ones that allow applications to discover and navigate the filesystem without modifying it. Each operation is handled asynchronously: the C handler builds a binary payload, submits it to the IPC worker, and returns immediately. The callback invokes the appropriate `fuse_reply_*` when the Go backend responds.
+The read-only FUSE operations are the ones that allow applications to discover and navigate the filesystem without modifying it. Each operation is handled synchronously: the C handler builds a binary payload, sends it over the Unix socket, blocks until the Go backend responds, parses the response, and calls `fuse_reply_*` directly.
 
 | Operation | FUSE Callback | Etcd Operation | What It Does |
 |---|---|---|---|
@@ -60,7 +60,9 @@ The `entry_timeout` tells the kernel how long to cache the name-to-inode mapping
 
 ### Callback
 
-`cb_lookup` decodes the response, fills a `struct fuse_entry_param` with the inode number, attributes, and timeouts, and calls `fuse_reply_entry`.
+### Handler
+
+The handler (`ec_lookup`) decodes the response, fills a `struct fuse_entry_param` with the inode number, attributes, and timeouts, and calls `fuse_reply_entry`.
 
 ## Root Inode Handling
 
@@ -92,7 +94,7 @@ The `attr_timeout` tells the kernel how long to cache these attributes before is
 
 ### Callback
 
-`cb_getattr` decodes the attr blob, fills a `struct stat`, and calls `fuse_reply_attr`.
+The handler (`ec_getattr`) decodes the attr blob, fills a `struct stat`, and calls `fuse_reply_attr`.
 
 ## READDIR
 
@@ -127,7 +129,9 @@ The `offset` is a monotonically increasing cookie (1, 2, 3, ...) used by the ker
 
 ### Callback
 
-`cb_readdir` iterates over the entries, building a dirent buffer using `fuse_add_direntry`. The kernel expects a packed `dirent` struct with `d_ino`, `d_off`, `d_reclen`, `d_type`, and `d_name`. The callback calls `fuse_reply_buf` with the assembled buffer.
+### Callback
+
+The handler (`ec_readdir`) iterates over the entries, building a dirent buffer using `fuse_add_direntry`. The kernel expects a packed `dirent` struct with `d_ino`, `d_off`, `d_reclen`, `d_type`, and `d_name`. The handler calls `fuse_reply_buf` with the assembled buffer.
 
 ## READLINK
 
@@ -151,7 +155,7 @@ The Go backend reads the target from a separate key (`symlink:<ino>`), distinct 
 
 ### Callback
 
-`cb_readlink` extracts the target string (null-terminated in the response buffer) and calls `fuse_reply_readlink`.
+The handler (`ec_readlink`) extracts the target string (null-terminated in the response buffer) and calls `fuse_reply_readlink`.
 
 ## STATFS
 
@@ -169,7 +173,7 @@ STATFS does not query etcd. In the current implementation, the response is synth
 
 ### Callback
 
-`cb_statfs` fills a `struct statvfs` and calls `fuse_reply_statfs`.
+The handler (`ec_statfs`) fills a `struct statvfs` and calls `fuse_reply_statfs`.
 
 ## OPEN and OPENDIR
 

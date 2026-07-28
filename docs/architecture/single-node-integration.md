@@ -50,9 +50,9 @@ Each EtcFS node runs two OS processes that communicate over a Unix stream socket
 │  └──────────┬──────────────────────────────────────────────┘   │
 │             │                                                  │
 │  ┌──────────▼──────────────────────────────────────────────┐   │
-│  │ FUSE Session (multi-threaded, fuse_session_loop_mt)     │   │
+│  │ FUSE Session (single-threaded, fuse_session_loop)        │   │
 │  │ handlers: ec_lookup, ec_getattr, ec_create, ...         │   │
-│  │ each handler submits to IPC worker and returns          │   │
+│  │ each handler does synchronous IPC and calls fuse_reply   │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                  │
 │  Block Device (O_DIRECT fd, shared EBS Multi-Attach)            │
@@ -72,10 +72,10 @@ The Go binary owns all stateful subsystems: the etcd connection, the metadata ca
 - Handle one connection at a time in a goroutine (multiple connections from multiple C processes is not supported).
 
 **C daemon (etcfuse):**
-- Open the FUSE session: `fuse_session_new`, register the low-level op table, mount the filesystem, enter `fuse_session_loop_mt`.
+- Open the FUSE session: `fuse_session_new`, register the low-level op table, mount the filesystem, enter `fuse_session_loop`.
 - Open the block device: `etcfs_block_open`, query geometry (BLKSSZGET, BLKGETSIZE64), store the O_DIRECT fd.
 - Connect to the Go daemon's Unix socket.
-- Dispatch FUSE kernel upcalls through the IPC worker thread.
+- Make synchronous IPC calls for each FUSE operation.
 
 ## Startup Sequence
 
@@ -87,7 +87,7 @@ The daemon does nothing else until the C daemon connects. It does not create fil
 
 ### 2. C Daemon Start
 
-The C daemon reads environment variables for the mountpoint, IPC socket path, volume ID (for the block device), and node identifier. It connects to the Go daemon's Unix socket, creates the IPC worker thread (which owns the socket connection for the daemon's lifetime), optionally opens the block device (read-only fallback if the device is not available), builds the FUSE argument set, creates the session, mounts, and enters the event loop.
+The C daemon reads environment variables for the mountpoint, IPC socket path, volume ID (for the block device), and node identifier. It connects to the Go daemon's Unix socket, optionally opens the block device (read-only fallback if the device is not available), builds the FUSE argument set, creates the session, mounts, and enters the single-threaded event loop.
 
 ### 3. First FUSE Request
 
@@ -119,15 +119,14 @@ The heartbeat runs independently of the FUSE request loop. If etcd becomes unrea
 
 ## FUSE Session Lifecycle
 
-The C daemon creates a FUSE session with the low-level API (`fuse_lowlevel.h`) and the multi-threaded event loop (`fuse_session_loop_mt`). The session is configured with:
+The C daemon creates a FUSE session with the low-level API (`fuse_lowlevel.h`) and the single-threaded event loop (`fuse_session_loop`). The session is configured with:
 
-- **Max threads:** 10 worker threads (4 idle minimum).
-- **Clone FD:** Disabled — all threads share one `/dev/fuse` file descriptor.
+- **Event loop:** `fuse_session_loop` — single-threaded, processes one kernel upcall at a time.
 - **Cache timeouts:** `entry_timeout=1.0`, `attr_timeout=1.0`, `negative_timeout=0.0` (no negative caching).
 
-The event loop blocks until the session is unmounted. Each worker thread reads a FUSE operation from `/dev/fuse`, calls the registered handler (e.g., `ec_lookup`), and returns to the read loop. The handler submits the request to the IPC worker and returns — it does **not** wait for the response.
+The event loop blocks until the session is unmounted. Each kernel upcall calls the registered handler (e.g., `ec_lookup`). The handler does synchronous IPC with the Go backend (blocks on socket read/write) and calls `fuse_reply_*` on the same thread.
 
-When the session is unmounted (via `fusermount -u` or process exit), libfuse wakes the event loop with an error, and the daemon performs cleanup: session destroy, IPC worker destroy, socket close.
+When the session is unmounted (via `fusermount -u` or process exit), libfuse wakes the event loop with an error, and the daemon performs cleanup: session destroy, socket close.
 
 ## IPC Request-Response Loop
 
@@ -149,7 +148,7 @@ Each handler:
 3. Builds the response in a `buf` (a byte-slice builder with `w32`/`w64`/`wAttr` methods).
 4. Returns the response buffer.
 
-The response is written back to the Unix socket, the C IPC worker reads it, and the callback decodes it and calls `fuse_reply_*`.
+The response is written back to the Unix socket, the C daemon's `recv_full()` completes, and the handler decodes the response and calls `fuse_reply_*` directly.
 
 ## Crash Recovery Protocol
 
@@ -259,7 +258,7 @@ IPC Service:
     ... allocate and create ...
 ```
 
-When the self-fencing watchdog fires, the Go daemon's process exits (exit code 77). This closes the Unix socket connection. The C daemon's IPC worker detects the socket closure (read returns EOF) and stops processing requests. The FUSE session is still alive (the kernel hasn't unmounted it), but any subsequent FUSE operation that attempts an IPC call will fail with EIO.
+When the self-fencing watchdog fires, the Go daemon's process exits (exit code 77). This closes the Unix socket connection. The C daemon's next synchronous IPC call will fail with EIO, and the FUSE handler will respond to the kernel with an error. The FUSE session is still alive (the kernel hasn't unmounted it), but any subsequent FUSE operation that attempts an IPC call will fail with EIO.
 
 In the ideal scenario, the C daemon detects the IPC disconnection and unmounts the filesystem before the kernel receives EIOs. In practice, the process exit is so fast that there is no time for a graceful shutdown — the kernel gets EIO, applications see errors, and the system administrator must restart the daemon.
 
@@ -275,9 +274,9 @@ When the Go daemon receives SIGINT or SIGTERM:
 
 The C daemon must be stopped separately (via SIGINT, SIGTERM, or `fusermount -u`). When the FUSE session is unmounted:
 
-1. `fuse_session_loop_mt` returns with an error.
+1. `fuse_session_loop` returns with an error.
 2. The daemon calls `fuse_session_unmount` and `fuse_session_destroy`.
-3. The IPC worker is destroyed (drains pending requests, closes the socket).
+3. The socket is closed.
 4. The block device FD is closed.
 5. The daemon exits.
 

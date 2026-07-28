@@ -1,147 +1,138 @@
 # FUSE Request Dispatch
 
-The async IPC worker thread, request queuing, and the contract that prevents FUSE reader threads from ever blocking on network I/O.
+The synchronous IPC model used by every FUSE operation handler: how the C daemon sends a request to the Go backend, waits for the response, and calls `fuse_reply_*` — all on the same FUSE reader thread.
 
 ## Table of Contents
 
-- [Design Constraint](#design-constraint)
-- [Worker Thread Model](#worker-thread-model)
+- [Dispatch Model](#dispatch-model)
 - [Request Lifecycle](#request-lifecycle)
+- [Wire Format](#wire-format)
 - [Socket I/O](#socket-io)
-- [Callback Contract](#callback-contract)
-- [Queue Management](#queue-management)
+- [Error Handling](#error-handling)
 
-## Design Constraint
+## Dispatch Model
 
-A FUSE daemon must never block a FUSE reader thread on external I/O. The kernel dispatches FUSE requests to reader threads that call the registered operation handlers; if one of those handlers blocks for a network round-trip (e.g., waiting for an etcd transaction to commit), all other applications accessing the mount are stalled.
+The FUSE daemon uses a single-threaded event loop (`fuse_session_loop`). Each kernel upcall is processed by one handler at a time. The handler:
 
-The solution is an async dispatch model: every FUSE operation handler builds a request payload, enqueues it to a dedicated IPC worker thread, and returns immediately. The worker thread performs the socket I/O and invokes a response callback — which is where `fuse_reply_*` is called. Libfuse's `fuse_reply_*` functions are thread-safe, so they can be called from any pthread.
+1. Builds the request payload as a binary buffer.
+2. Sends the payload over the Unix socket to the Go backend.
+3. Blocks on `read()` until the response arrives.
+4. Parses the response.
+5. Calls `fuse_reply_*` on the same thread.
 
-## Worker Thread Model
-
-The IPC worker is a single dedicated pthread, not a thread pool. It owns exclusive access to the Unix socket connection — no mutex is needed for socket I/O. This has several advantages:
-
-- **No head-of-line blocking.** The worker serialises all requests on the socket. The Go backend processes one request per connection at a time in its goroutine, and the responses return in the same order as the requests were sent. This naturally provides FIFO ordering without explicit sequence numbers.
-- **No socket contention.** Only one thread writes to or reads from the socket. There are no partial writes or interleaved messages.
-- **Simple backpressure.** If the Go backend is slow (etcd under load), the worker thread blocks in `read()`, waiting for the response. This naturally throttles the C daemon's request rate without explicit flow control.
-
-The trade-off is throughput: a single socket provides less aggregate bandwidth than a connection pool. For a metadata-only IPC channel (no file data), this is acceptable — etcd latency (1–10ms) dominates, not socket bandwidth.
+There is no IPC worker thread, no request queue, no callback indirection. The socket is accessed synchronously from the single FUSE reader thread, so there is never concurrent socket access. This eliminates the need for `clone_fd`, worker thread synchronization, and callback dispatch infrastructure.
 
 ## Request Lifecycle
 
 ### 1. FUSE handler is invoked
 
-The kernel dispatches a VFS operation to the daemon. One of the registered handlers (e.g., `ec_lookup`) is called on a FUSE reader thread. The handler has access to the `fuse_req_t` handle and the operation parameters (parent inode, filename, etc.).
+The kernel dispatches a VFS operation to the daemon. One of the registered handlers (e.g., `ec_lookup`) is called on the FUSE event loop thread. The handler has access to the `fuse_req_t` handle, the operation parameters, and the `etcfuse_context` (which holds the Unix socket fd).
 
 ### 2. Handler builds a payload
 
-The handler serialises the operation parameters into a binary buffer. For LOOKUP, this is 12 + name_length bytes: a uint64 parent inode, a uint32 name length, and the name bytes. The handler allocates a heap copy of the payload (ownership is transferred to the worker).
+The handler serialises the operation parameters into a binary buffer. For LOOKUP, this is 12 + name_length bytes: a uint64 parent inode, a uint32 name length, and the name bytes.
 
-### 3. Request is enqueued
+### 3. Handler sends request and blocks
 
-`ipc_worker_submit` takes the `fuse_req_t`, opcode, payload, and response callback, and appends them to a linked-list queue. A pthread condition variable signals the worker thread that work is available. The handler returns immediately — it does **not** wait.
+The handler calls the `ipc_sync()` function:
 
-### 4. Worker thread processes the request
+```
+ipc_sync(fd, opcode, payload, plen, &resp, &rlen):
+  send_full(fd, header)     // 6-byte header: opcode + payload length
+  send_full(fd, payload)    // payload bytes
+  recv_full(fd, rhdr)       // 4-byte response length
+  recv_full(fd, resp)       // response bytes
+  return 0 on success
+```
 
-The worker thread wakes up, dequeues the request, and calls `do_ipc_exchange`:
-- Send the 6-byte header (opcode + payload length) over the socket.
-- Send the payload bytes.
-- Read the 4-byte response header (response length).
-- Read the response bytes.
+The handler blocks inside `recv_full()` until the Go backend has processed the request and sent the response. During this time, no other FUSE requests can be processed (single-threaded loop). This is acceptable because the typical metadata operation completes in 5–20ms (etcd round-trip).
 
-The worker blocks only during these send/receive calls. No other thread touches the socket.
+### 4. Response is parsed directly
 
-### 5. Callback is invoked
+The handler parses the response buffer inline (no callback). The first 4 bytes are always an int32 error code:
 
-The worker thread extracts the error code from the first 4 bytes of the response (every response starts with an int32 error code). It calls the callback with:
-- The original `fuse_req_t`
-- The error code (0 for success, negative errno for failure)
-- The response buffer (if any)
-- The user data pointer
+- If non-zero, the handler calls `fuse_reply_err(req, -error)` and returns.
+- If zero, the handler parses the operation-specific response fields (attr, entry, direntries, etc.) and calls the appropriate `fuse_reply_*`.
 
-The callback decodes the response and calls `fuse_reply_*`. For LOOKUP, this means parsing the attr blob, filling a `struct fuse_entry_param`, and calling `fuse_reply_entry`.
+### 5. fuse_reply_* is called on the same thread
 
-### 6. Resources are freed
+All `fuse_reply_entry`, `fuse_reply_create`, `fuse_reply_write`, etc. calls happen on the FUSE event loop thread — the same thread that received the kernel upcall. This avoids any threading issues with `/dev/fuse` fd ownership: the reply is always on the correct thread.
 
-The worker frees the payload (copied at enqueue time) and the request struct. The callback is responsible for freeing the response buffer.
+## Wire Format
+
+All messages are length-prefixed binary frames over the Unix stream socket:
+
+**Request:** `[u16:be opcode] [u32:be payload_len] [payload]`
+**Response:** `[u32:be payload_len] [payload]`
+
+Both sides use consistent byte order (big-endian). The opcode identifies the FUSE operation being performed. The payload is operation-specific — for LOOKUP it contains the parent inode and name; for GETATTR just the inode number.
+
+### Operation Codes
+
+| Code | Operation | Reply function |
+|---|---|---|
+| 1 | LOOKUP | `fuse_reply_entry` |
+| 2 | GETATTR | `fuse_reply_attr` |
+| 3 | READDIR | `fuse_reply_buf` (dirent entries) |
+| 4 | READLINK | `fuse_reply_readlink` |
+| 5 | CREATE | `fuse_reply_create` (new file + open) |
+| 6 | MKDIR | `fuse_reply_entry` (new directory) |
+| 7 | UNLINK | `fuse_reply_err` |
+| 8 | RMDIR | `fuse_reply_err` |
+| 9 | RENAME | `fuse_reply_err` |
+| 10 | SYMLINK | `fuse_reply_entry` |
+| 11 | LINK | `fuse_reply_entry` |
+| 12 | SETATTR | `fuse_reply_attr` |
+| 13 | OPEN | `fuse_reply_open` |
+| 14 | RELEASE | `fuse_reply_err` |
+| 15 | OPENDIR | `fuse_reply_open` |
+| 16 | RELEASEDIR | `fuse_reply_err` |
+| 17 | STATFS | `fuse_reply_statfs` |
+| 22 | READ | `fuse_reply_buf` |
+| 23 | WRITE | `fuse_reply_write` |
+| 24 | FSYNC | `fuse_reply_err` |
+| 25 | MKNOD | `fuse_reply_entry` |
+
+### Payload Formats (represented)
+
+Each operation has a fixed binary payload format on the wire. For example, a LOOKUP request:
+
+```
+[u64:parent_ino] [u32:name_length] [name_bytes...]
+```
+
+And the corresponding response:
+
+```
+[i32:error] [u64:ino] [attr: 72 bytes] [u32:entry_timeout] [u32:attr_timeout]
+```
+
+The `attr` field is a compact binary representation of the inode metadata: inode number, size, blocks, timestamps (seconds + nanoseconds), mode, nlink, uid, gid, rdev, and blksize — 72 bytes total.
 
 ## Socket I/O
 
 All socket operations are blocking `write()` and `read()` calls, wrapped in retry loops for `EINTR`:
 
 - `send_full(fd, buf, len)` — writes all `len` bytes, retrying on `EINTR` and partial writes. Returns -1 on any other error.
-
 - `recv_full(fd, buf, len)` — reads exactly `len` bytes, retrying on `EINTR` and short reads. Returns -1 on EOF or error.
 
 Both functions assume the socket is reliable (Unix stream socket, local machine). There is no message framing beyond the explicit length prefixes — the length fields in the headers tell the reader exactly how many bytes to expect.
 
-If the socket breaks (EOF, EPIPE, ECONNRESET), the worker thread reports the error via the callback (setting the error code to -EIO) and stops processing. The FUSE daemon must restart to re-establish the connection.
+If the socket breaks (EOF, EPIPE, ECONNRESET), the IPC function returns -1, the handler calls `fuse_reply_err(req, EIO)`, and the FUSE daemon continues running. The Go daemon must be restarted to re-establish the connection.
 
-## Callback Contract
+## Error Handling
 
-Response callbacks have a well-defined type signature and ownership contract:
+Error codes are carried in the first 4 bytes of every response. The common pattern in every handler:
 
-```c
-typedef void (*ipc_resp_cb)(fuse_req_t req, int32_t error, uint8_t *resp, uint32_t rlen, void *data);
+```
+uint32_t pos = 0;
+int32_t err = rb_i32(resp, &pos);
+if (err != 0) {
+    fuse_reply_err(req, -err);
+    free(resp);
+    return;
+}
+// parse and reply with success
 ```
 
-**`req`** — The FUSE request handle. The callback must call exactly one `fuse_reply_*` function on this handle.
-
-**`error`** — 0 for success, a negated errno for failure. If `error` is non-zero, the `resp` and `rlen` parameters are meaningless.
-
-**`resp`** — Dynamically allocated response buffer. The callback **takes ownership** and must free it. The response always starts with a 4-byte error code, followed by operation-specific data.
-
-**`rlen`** — The length of `resp` in bytes.
-
-**`data`** — Opaque user data passed at submission time. Typically unused (NULL), but provided for operations that need context beyond the response buffer (e.g., the CREATE handler passes the `struct fuse_file_info *` for `fuse_reply_create`).
-
-### Callback Types per Operation
-
-Most operations have dedicated callback functions that decode the specific response format:
-
-| Callback | Response format | Calls |
-|---|---|---|
-| `cb_lookup` | `[i32:error] [u64:ino] [attr] [u32:entry_timeout] [u32:attr_timeout]` | `fuse_reply_entry` |
-| `cb_getattr` | `[i32:error] [attr] [u32:attr_timeout]` | `fuse_reply_attr` |
-| `cb_readdir` | `[i32:error] [u32:count] [entries...]` | `fuse_reply_buf` |
-| `cb_readlink` | `[i32:error] [u32:target_len] [target]` | `fuse_reply_readlink` |
-| `cb_statfs` | `[i32:error] [u64×5 + u32×3:statvfs]` | `fuse_reply_statfs` |
-| `cb_error` | `[i32:error]` | `fuse_reply_err` |
-| `cb_create_entry` | Same as `cb_lookup` | `fuse_reply_entry` |
-| `cb_setattr` | Same as `cb_getattr` | `fuse_reply_attr` |
-| `cb_write` | `[i32:error] [u32:written]` | `fuse_reply_write` |
-
-## Queue Management
-
-The request queue is a singly-linked list with head and tail pointers for O(1) enqueue and dequeue. It is protected by a pthread mutex and condition variable.
-
-### Enqueue (FUSE thread calls)
-
-1. Lock the mutex.
-2. Append the request struct to the tail of the queue.
-3. Signal the condition variable (wakes the worker thread if it was sleeping).
-4. Unlock the mutex.
-
-Enqueue never blocks — the queue has no size limit. If the Go backend cannot keep up, the queue grows unboundedly. This is acceptable because:
-- The Go backend processes requests as fast as etcd can respond.
-- If etcd is unreachable, all operations fail quickly (EIO), keeping the queue drained.
-- The queue is bounded in practice by the application's request rate, not by the backend's capacity.
-
-### Dequeue (Worker thread calls)
-
-1. Lock the mutex.
-2. If the queue is empty and not shutting down, wait on the condition variable.
-3. Remove the head element from the queue.
-4. Unlock the mutex.
-5. Process the request.
-
-### Shutdown
-
-When `ipc_worker_destroy` is called:
-1. The worker sets a `stop` flag under the mutex.
-2. It signals the condition variable to wake the worker thread.
-3. The worker thread drains any remaining requests (processing each one — callbacks will fail with EIO since the socket is closed).
-4. The worker thread exits.
-5. The main thread calls `pthread_join` to wait for the worker to finish.
-
-After the worker exits, the socket is closed. No further requests are accepted — `ipc_worker_submit` returns an error.
+This structure ensures that every error path produces a valid FUSE reply — the kernel never hangs waiting for a response that was dropped.

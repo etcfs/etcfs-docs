@@ -149,7 +149,7 @@ io_uring* etcfs_block_io_submit(dev, operations[], count, completion_callback)
 int etcfs_block_io_wait(uring, timeout)
 ```
 
-The io_uring integration is deferred to Phase 7 because it requires changes to the worker pool model (the current IPC worker is a single-threaded dispatch loop; io_uring completions need to be integrated with the FUSE reply path).
+The io_uring integration is deferred to Phase 7 because it requires changes to the daemon's I/O model (the current synchronous IPC model would need to be extended to support asynchronous I/O completion).
 
 ## Interaction with the Arena Allocator
 
