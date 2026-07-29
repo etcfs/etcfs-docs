@@ -8,6 +8,7 @@ How EtcFS ensures that data written by one node is visible to reads from other n
 - [Write Protocol](#write-protocol)
 - [Read Protocol](#read-protocol)
 - [Per-Inode Locking](#per-inode-locking)
+- [Watch-Driven Cache Invalidation](#watch-driven-cache-invalidation)
 - [EBS Multi-Attach Propagation](#ebs-multi-attach-propagation)
 - [O_DIRECT and Kernel Page Cache](#odirect-and-kernel-page-cache)
 - [Cache Coherence Guarantees](#cache-coherence-guarantees)
@@ -129,6 +130,100 @@ Concurrent read + write:
 ### Keepalive Drain
 
 The lease-backed lock returns a keepalive channel. A goroutine drains this channel for the duration of the lock hold. When the lock is released (lease revoked), the keepalive stream terminates and the goroutine exits. The keepalive is purely to prevent the lease from expiring mid-operation — for short operations (write ~50ms, read ~10ms), the 2s TTL provides sufficient margin.
+
+## Watch-Driven Cache Invalidation
+
+The kernel VFS cache on each node can become stale when another node modifies the namespace (creates, deletes, or renames files). The per-inode lock prevents concurrent writes and stale reads at the data level, but the kernel's dentry and attribute caches can still produce stale results for namespace operations.
+
+Watch-driven cache invalidation solves this by having the Go daemon watch etcd for directory mutations and proactively telling the kernel to evict stale cache entries.
+
+### Architecture
+
+Each Go daemon establishes an etcd watch on the `dirent:` key prefix. When any node creates, deletes, or renames a directory entry, the etcd write commits to the Raft log. The watch fires on all other nodes' Go daemons.
+
+```
+Node A: CREATE /shared/hello.txt
+  → etcd commit: dirent:1/hello.txt → ino=42
+  → watch fires on Node B's Go daemon
+
+Node B's Go daemon:
+  ← receives watch event (PUT, key="dirent:1/hello.txt")
+  ← extracts parent=1, name="hello.txt"
+  ← sends [u32:type=1][u64:parent=1][name] to local C daemon
+
+Node B's C daemon:
+  ← receives notification on dedicated socket
+  ← calls fuse_lowlevel_notify_inval_entry(se, 1, "hello.txt", 10)
+  ← kernel evicts cached dentry for /hello.txt in root directory
+
+Next lookup on Node B: LOOKUP → IPC → etcd → fresh data
+```
+
+### Notification Channel
+
+The C daemon opens a second connection to the Go daemon on a dedicated Unix socket (`/tmp/etcfuse-notify.sock`). This connection is read-only from C's perspective — it receives one-way push messages from Go.
+
+A dedicated pthread in the C daemon (`notify_thread`) connects to this socket at startup and reads notification messages in a loop. The thread calls `fuse_lowlevel_notify_inval_entry` on the FUSE session handle when it receives an invalidation event.
+
+The Go daemon accepts notification connections on the `/tmp/etcfuse-notify.sock` listener. Each connection is stored as the active notification target. When a watch fires, Go writes a binary invalidation message:
+
+```
+[u32:be type=1][u64:be parent_ino][name bytes (variable)]
+```
+
+### Watch Setup
+
+The watch is a prefix watch on `dirent:` (all directory entries in the namespace). It uses etcd's list-then-watch pattern internally — the initial state is read, then a watch is established from the current revision onward. The watch delivers PUT and DELETE events for any `dirent:<parent>/<name>` key.
+
+When a watch event arrives:
+1. The key is parsed to extract the parent inode number and the entry name
+2. An `INVAL_ENTRY` notification is sent to the local C daemon via the notification socket
+3. The C daemon's notification thread calls `fuse_lowlevel_notify_inval_entry`
+4. The kernel evicts any cached dentry for that name in the parent directory
+
+### Invalidation Events
+
+| Event Type | Watch Fires On | Kernel Call | Effect |
+|---|---|---|---|
+| File created | `dirent:parent/name → PUT` | `inval_entry(parent, name)` | Evicts stale ENTRY or negative dentry |
+| File deleted | `dirent:parent/name → DELETE` | `inval_entry(parent, name)` | Evicts cached dentry, forces fresh lookup |
+| File renamed (old name) | `dirent:parent/old → DELETE` | `inval_entry(old_parent, old_name)` | Evicts old dentry |
+| File renamed (new name) | `dirent:parent/new → PUT` | `inval_entry(new_parent, new_name)` | Forces fresh lookup at new location |
+
+### Scope
+
+The watch-driven invalidation covers **all directory entry mutations** across all nodes. This includes:
+
+- `AtomicCreateFile` / `AtomicCreateDir` — new directory entry created
+- `AtomicUnlink` / `AtomicRmRf` — directory entry deleted
+- `AtomicRename` — old entry deleted, new entry created
+
+It does **not** cover:
+- **Inode attribute changes** (size, mode, timestamps) — these are handled by `attr_timeout` and the per-inode lock
+- **Data writes** — handled by O_DIRECT + locking (the extent is in etcd, the data is on the block device)
+- **Truncation** — the inode size is updated in etcd, but no `INVAL_INODE` is sent. A subsequent `fstat()` returns the cached size (up to `attr_timeout`). The next `read()` triggers a GETATTR which returns the new size, after which the read proceeds against the correct extent list.
+
+### Connection Lifecycle
+
+1. C daemon starts → connects to Go's notification socket → starts `notify_thread`
+2. Go daemon accepts the connection → stores it → sets up etcd watch
+3. Watch fires → Go sends notification → C calls `fuse_lowlevel_notify_inval_entry`
+4. C daemon shuts down → notification socket closes → Go removes the connection
+5. C daemon restarts → re-connects → Go accepts and stores the new connection
+
+If the notification connection fails (C daemon crashes and restarts), Go detects the closed socket and waits for a new connection. The watch continues to fire, but invalidation events are dropped until a new C daemon connects. This is safe — the worst case is that kernel caches are stale for up to `entry_timeout` seconds.
+
+### Verified Behaviour
+
+Tested on a 3-node cluster with EBS Multi-Attach:
+
+| Before Invalidation | After Invalidation |
+|---|---|
+| Cross-node directory writes fail (EIO) | Cross-node directory writes succeed |
+| Truncate visibility fails (stale size) | Truncate visibility succeeds |
+| Cross-node reads return empty | Cross-node reads return correct data |
+
+Both nodes log `notify: inval_entry` for every directory mutation received from etcd watches, confirming end-to-end delivery of invalidation events.
 
 ## EBS Multi-Attach Propagation
 
