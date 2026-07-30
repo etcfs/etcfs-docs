@@ -189,6 +189,18 @@ The scrubber (Phase 8) reads each extent's generation stamp and compares it agai
 
 The scrubber reports `GENERATION_MISMATCH` findings, listing each extent with its stale stamp and the expected current generation. These findings are for human review — the scrubber does not automatically delete or reclaim generation-stale extents, because the data may still be valid (the node that wrote it may not have been the node that was fenced).
 
+## Implementation Status
+
+As of the 2026-07-30 fencing fix, the write path (`internal/ipc/socket.go`, `handleWriteBlock`) enforces this guard: the extent commit and any inode size change are applied in one `Txn` carrying `WithGenerationGuard(nodeID, startGen)`, and the write returns `EIO` if the guard fails. Verified on real AWS infrastructure (chaos scenario S5: bump `gen:n1`, confirm a subsequent write is rejected).
+
+One detail worth calling out because it is easy to get backwards: `startGen` is read **once**, at daemon startup (`Service.InitGeneration`, called from `main.go` before the IPC server starts serving), and cached for the life of the process — it is not re-read from etcd on every write. This is required, not incidental: if a write re-read the generation fresh each time, a write issued *after* an external fence would read the already-bumped value and use that same value as its own guard, and the CAS would trivially succeed against itself. Caching the value the node started with is what makes a mid-session fence actually take effect on the very next write.
+
+`Service.InitGeneration` also calls `Store.EnsureGenerationKey`, which creates `gen:<node_id>` at `0` if absent. This matters because `WithGenerationGuard` compares the key's *value* — a value comparison against a **missing** key always evaluates false in etcd, which would reject every write on a freshly bootstrapped node, not just a fenced one's writes. The key must exist before the first guarded transaction runs.
+
+`Service.IsFenced()` (backed by the self-fencing watchdog) is also checked at the top of `handleWriteBlock`, so a self-fenced node refuses to touch the block device at all rather than relying solely on the etcd-side rejection.
+
+Not yet guarded: namespace mutations (`CreateInode`, `Unlink`, `Rmdir`, `Rename`, `Setattr`) still commit without a generation guard. Only the data path (extent writes and the size-changing inode update that rides with them) is covered so far.
+
 ## Generation Lifecycle
 
 ```

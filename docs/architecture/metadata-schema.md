@@ -45,6 +45,10 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 
 **Generation keys** are the fencing epoch counter. The fencing controller bumps this value via a CAS transaction after confirming a node has been successfully fenced. Every metadata mutation that modifies extents checks this generation before committing.
 
+### Reserved inode numbers
+
+Inode `0` is never valid — `DecodeUint64` returns `0` for a missing or malformed key, so `0` doubles as an implicit "not found" sentinel and must never be assigned to a real file. Inode `1` is `FUSE_ROOT_ID`, the root directory: the C daemon answers `getattr`/`lookup` for it locally, and `seed-etcd` writes the root directory record directly to `inode:1` before any node starts. The inode allocator (`metadata.FirstUsableIno`) therefore starts handing out numbers at `2`. Handing out `1` to a regular file overwrites the root inode record and makes every subsequent operation on the mount fail — this happened in practice (see the chaos test report) before the allocator's start value was corrected.
+
 ## Data Types
 
 ### InodeRecord
