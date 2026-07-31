@@ -191,7 +191,7 @@ The scrubber reports `GENERATION_MISMATCH` findings, listing each extent with it
 
 ## Implementation Status
 
-As of the 2026-07-30 fencing fix, the write path (`internal/ipc/socket.go`, `handleWriteBlock`) enforces this guard: the extent commit and any inode size change are applied in one `Txn` carrying `WithGenerationGuard(nodeID, startGen)`, and the write returns `EIO` if the guard fails. Verified on real AWS infrastructure (chaos scenario S5: bump `gen:n1`, confirm a subsequent write is rejected).
+As of the 2026-07-30 fencing fix, the write path (`internal/ipc/datapath.go`, `handleWriteBlock`) enforces this guard: the extent commit and any inode size change are applied in one `Txn` carrying `WithGenerationGuard(nodeID, startGen)`, and the write returns `EIO` if the guard fails. Verified on real AWS infrastructure (chaos scenario S5: bump `gen:n1`, confirm a subsequent write is rejected).
 
 One detail worth calling out because it is easy to get backwards: `startGen` is read **once**, at daemon startup (`Service.InitGeneration`, called from `main.go` before the IPC server starts serving), and cached for the life of the process — it is not re-read from etcd on every write. This is required, not incidental: if a write re-read the generation fresh each time, a write issued *after* an external fence would read the already-bumped value and use that same value as its own guard, and the CAS would trivially succeed against itself. Caching the value the node started with is what makes a mid-session fence actually take effect on the very next write.
 

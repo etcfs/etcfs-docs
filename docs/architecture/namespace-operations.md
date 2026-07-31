@@ -15,7 +15,7 @@ Inode lifecycle management, directory entry operations, and the atomic transacti
 
 ## Inode Lifecycle
 
-Every file and directory in EtcFS has an inode record stored at `inode:<ino>`. The inode record carries all POSIX metadata — mode, ownership, timestamps, size, link count — in a fixed-length 72-byte binary format. The extent list is stored separately in chunked keys (`extent:<ino>/<chunk>`) to stay under etcd's value size limit.
+Every file and directory in EtcFS has an inode record stored at `inode:<ino>`. The inode record carries all POSIX metadata — mode, ownership, timestamps, size, link count — in a fixed-length 72-byte binary format. The extent list is stored separately, one key per extent (`extent:<ino>/<chunk>`), to stay under etcd’s value size limit.
 
 ### Creation
 
@@ -108,21 +108,23 @@ The `ReadDir` FUSE operation uses this pagination to stream directory entries to
 
 ## Extent Maps
 
-Each inode's extent map is stored across one or more keys of the form `extent:<ino>/<chunk>`. Each chunk is a binary blob of up to 1 MiB, containing a sequence of 32-byte extent entries. Each entry encodes four 64-bit values:
+Each inode's extent map is stored as one key per extent, of the form `extent:<ino>/<chunk>`. The value is the text form `logical_off,disk_off,length,generation`:
 
 - **Logical offset** — the byte offset within the file where this extent begins
 - **Disk offset** — the byte offset on the shared block device
 - **Length** — the size of the extent in bytes
 - **Generation** — the fencing generation at the time the extent was written
 
-Chunks are appended sequentially. When a chunk reaches the 1 MiB threshold, a new chunk key is created. This cap keeps all values well under etcd's 1.5 MiB request limit.
+One extent per key keeps every value far under etcd's 1.5 MiB request limit without any chunk-packing logic, and lets a single extent be rewritten (truncate) or deleted (scrub) without touching its neighbours.
 
-`GetExtents` retrieves and concatenates all chunks for an inode, returning the full extent list. `AppendExtent` appends a new extent to the last chunk (or creates a new chunk if the last one is full).
+`pkg/metadata/extent.go` is the only place this format is written or parsed. `Store.GetExtents` returns an inode's extents **ordered by logical offset** — etcd returns keys lexicographically, so chunk 10 arrives before chunk 2 and key order is not file order. `Store.NextExtentChunk` returns one past the highest chunk in use, rather than a count, so that an extent deleted by truncate does not cause the next write to reuse a live chunk number.
 
 Extents are the bridge between the metadata layer (etcd) and the data layer (block device). The scrubber cross-references every extent against its owning inode and arena to detect collision or orphan anomalies.
 
 ## Inode Number Allocation
 
-Inode numbers are allocated from per-node reserved ranges to avoid a global hot key. The `inode_alloc_counter` key stores the cumulative counter. A node CAS-increments this counter to reserve a block of inode numbers (default 100,000 per reservation), then allocates from its local range without further etcd round-trips.
+Inode numbers come from a single `inode_alloc_counter` key, CAS-incremented once per allocation by `Store.NextCounter` (which also hands out arena IDs from `arena_alloc_log`). The CAS retries with backoff under contention, so two nodes never receive the same number.
 
-When a node's local range is exhausted, it reserves another block. The CAS prevents two nodes from reserving overlapping ranges. The reserved range is stored in `inode_range:<node_id>` for diagnostics.
+The counter has a floor of `FirstUsableIno` (2): 0 is never a valid inode and 1 is `FUSE_ROOT_ID`, the root directory the C daemon answers for locally.
+
+Per-node range reservation would remove the shared key from the path entirely, but it was measured as unnecessary at current contention and strands every number a node has reserved when it dies mid-range.
