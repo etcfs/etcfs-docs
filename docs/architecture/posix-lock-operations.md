@@ -30,12 +30,16 @@ Phase 3 provides a minimal lock implementation:
 - **SETLK** always succeeds, immediately granting the requested lock with no conflict detection.
 - **SETLKW** is not implemented; the kernel is not asked to block.
 
+Reporting no conflict is deliberate rather than merely convenient: the daemon does not track byte-range locks, so it could not honour a conflict it reported — SETLK would never be able to grant the lock afterwards and the caller would retry forever. Leaving both operations permissive keeps the kernel's own per-node lock bookkeeping authoritative, which is correct within a single node and unenforced across nodes.
+
+The `lock:<ino>` keys the read and write paths take are whole-inode leases scoped to one operation. They are not process-owned POSIX record locks and are not consulted by GETLK or SETLK.
+
 This simplification is sufficient for single-node workloads where lock contention is minimal. Multi-node lock correctness will be implemented in Phase 7.
 
 ### GETLK Payload
 
 ```
-[u64:ino] [u64:fh] [u64:start] [u64:len] [u32:type] [u32:pid]
+[u64:ino] [u64:start] [u64:len] [u32:type] [u32:pid]
 ```
 
 The `type` field is F_RDLCK (shared), F_WRLCK (exclusive), or F_UNLCK (query). The `start` and `len` define the byte range. `pid` identifies the owner for POSIX process-level lock semantics.
@@ -51,10 +55,10 @@ Always reports `type=F_UNLCK`, meaning the requested range is free.
 ### SETLK Payload
 
 ```
-[u64:ino] [u64:fh] [u64:start] [u64:len] [u32:type] [u32:pid]
+[u64:ino] [u64:start] [u64:len] [u32:type] [u32:pid] [u32:sleep]
 ```
 
-Same format as GETLK. The `type` field distinguishes acquire (F_RDLCK, F_WRLCK) from release (F_UNLCK).
+Same format as GETLK plus a `sleep` flag marking SETLKW. The `type` field distinguishes acquire (F_RDLCK, F_WRLCK) from release (F_UNLCK).
 
 ### SETLK Response (Phase 3)
 
