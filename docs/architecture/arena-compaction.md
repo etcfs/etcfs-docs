@@ -161,10 +161,17 @@ The `free_arena:<id>` key signals to other nodes that this arena is available fo
 
 ```
 markGlobalArenaAcquired(dstArenaID, nodeID):
-    Put("arena:<nodeID>", "id=<dstArenaID>")
+    Put("arena:<nodeID>", EncodeUint64(dstArenaID))
 ```
 
 The destination arena is recorded as owned by the node. A subsequent `NeedsCompaction` check on the node will include the destination arena (which now holds the compacted extents) in its utilization calculation.
+
+The value must be the same 8-byte big-endian encoding the allocator writes at
+`AcquireArena` and reads back at `Reconstruct` — an earlier version of this
+function wrote an ASCII `"id=%d"` string instead, which decoded via
+`DecodeUint64` (which reads the first 8 bytes of whatever it is given) to
+arena 0 on the next restart, handing the node an arena it did not own. See
+[Kleppmann's Stale-Write Hazard in EtcFS](kleppmann-stale-write-analysis.md#the-allocator-channel).
 
 ## Interaction with the Arena Allocator
 

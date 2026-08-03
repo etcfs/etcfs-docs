@@ -165,7 +165,7 @@ When a file is fully deleted (all hard links removed, nlink reaching zero), the 
 
 After an unclean shutdown, the arena allocator's local state (the in-memory bitmap) is lost. On restart:
 
-1. The node acquires its current arenas by reading the `arena:<node_id>` keys from etcd. Each key contains the arena ID, which maps to the disk range.
+1. The node acquires its current arena by reading **its own** `arena:<node_id>` key from etcd — never the other nodes' keys. The record is a bare 8-byte big-endian arena ID; anything else (missing key, wrong length) is treated as "no arena" rather than decoded, since a malformed record could otherwise resolve to a valid-looking but wrong ID.
 
 2. The node's local bitmap is rebuilt by scanning the extent keys in etcd. Every `extent:<ino>/<chunk>` entry that falls within the node's arena range is decoded, and the corresponding blocks are marked allocated.
 
@@ -175,4 +175,15 @@ After an unclean shutdown, the arena allocator's local state (the in-memory bitm
 
 The bitmap reconstruction from etcd is O(N) in the number of extents. For a completely full arena with 262,144 single-block extents, this is 262,144 extent reads — which takes a few seconds at typical etcd read rates.
 
-If the node has no arena keys in etcd (it was fenced and its arenas were reclaimed by other nodes), the allocator starts with zero arenas and acquires a new one on the first write request.
+If the node has no arena key in etcd (it was fenced and its arena was reclaimed by other nodes), the allocator starts with zero arenas and acquires a new one on the first write request.
+
+### Why "own key only" is not optional
+
+Step 1 reads exactly one key, not a prefix scan over all `arena:*` keys. Reading the whole prefix was the actual behaviour until it was fixed (see [Kleppmann's Stale-Write Hazard in EtcFS](kleppmann-stale-write-analysis.md#the-allocator-channel) for the full analysis): every node's arena would be pulled into the restarting node's free-list, and step 4's `Allocate` calls would then hand out disk offsets inside a range another node was actively writing to. Both writers hold valid leases and current fencing generations in that scenario, so the generation guard on the metadata commit has nothing to reject — the corruption is silent, and only the scrubber's `CheckExtentCollisions` catches it, after the fact.
+
+Two related defects fed the same bug and are fixed alongside it:
+
+- `AcquireArena` did not persist an ownership record at acquisition time, so a node had no durable claim on the range it was writing into until something else (membership leave, compaction) happened to write `arena:<node_id>` later.
+- The compactor encoded the ownership value as ASCII (`fmt.Sprintf("id=%d", arenaID)`) while everything else uses 8-byte big-endian, so a compaction-relocated arena decoded to ID 0 on the next restart.
+
+Regression coverage: `pkg/arena/allocator_integration_test.go` (real etcd, verified to fail without the fix and pass with it) and `scripts/test/chaos-arena-collision.sh` scenarios S8 (restart-adoption), S9 (concurrent cross-node writes, no offset collision), S10 (fenced writer leaves no torn result) — run against both docker and AWS.
