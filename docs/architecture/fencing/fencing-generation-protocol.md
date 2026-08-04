@@ -199,7 +199,18 @@ One detail worth calling out because it is easy to get backwards: `startGen` is 
 
 `Service.IsFenced()` (backed by the self-fencing watchdog) is also checked at the top of `handleWriteBlock`, so a self-fenced node refuses to touch the block device at all rather than relying solely on the etcd-side rejection.
 
-Not yet guarded: namespace mutations (`CreateInode`, `Unlink`, `Rmdir`, `Rename`, `Setattr`) still commit without a generation guard. Only the data path (extent writes and the size-changing inode update that rides with them) is covered so far.
+Namespace mutations are guarded as well, as of the namespace-guard change. Rather than adding the guard at each call site, `metadata.Store` carries an optional guard (`Store.SetGuard`, installed by `Service.InstallStoreGuard` at startup) that `Txn`, `Put`, `Delete` and `DeletePrefix` apply to every mutation. Opt-out is explicit and limited to three control-plane paths, each of which would otherwise be unable to function:
+
+- `EnsureGenerationKey` — creates the key the guard compares against.
+- `BumpGeneration` / `PutGeneration` — the fence itself; guarding a generation bump by the generation it changes would make fencing impossible.
+
+Guarding at the store rather than per call site is deliberate: the original gap was a guard helper that existed but had no caller in the request path, and an opt-in guard reproduces that failure mode the first time a new mutation path forgets to ask.
+
+`Put`, `Delete` and `DeletePrefix` are guarded because several handlers write inode records without going through `Txn` — `setattr` (truncate), `symlink` and `mknod` all did, and the truncate path deletes and rewrites extent keys the same way.
+
+A guard rejection surfaces as `metadata.ErrFenced` and is mapped to `EIO` by the IPC handlers (`errnoFor`). It must never be reported as the operation's ordinary failure code: a fenced create returning `EEXIST`, or a fenced unlink returning `ENOENT`, makes a fencing bug indistinguishable from ordinary contention. `Store.Txn` tells the two apart by re-reading the generation when a transaction fails, since a transaction can also fail on the caller's own comparisons.
+
+Verified by `pkg/metadata/guard_integration_test.go` (integration build tag, real etcd) and by `scripts/test/chaos-fencing-namespace.sh` against Docker and AWS.
 
 ### Scope of the guarantee
 
