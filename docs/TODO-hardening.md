@@ -115,23 +115,36 @@ through `Store`. `pkg/membership.Manager` is harness-only.
 ## 2. Concurrent multi-node scale-out
 
 `chaos-elastic.sh` adds nodes strictly one at a time, each fully healthy before the
-next (`add_node 4` then `add_node 5`). Simultaneous joins are never exercised, yet
+next (`add_node 4` then `add_node 5`). Simultaneous joins were never exercised, yet
 that is exactly what an autoscaling group does under a load spike.
 
 Contended on a concurrent join, per `README.md` § Sharding hot structures:
 
-- `inode_range` table — two nodes CAS the same key to claim ranges.
+- Inode allocation — corrected while implementing this: the README describes
+  per-node `inode_range` sharding, but the actual request path
+  (`Service.allocInode` → `Store.NextCounter`) is a single global CAS-retried
+  counter, not per-node ranges. `README.md`'s sharding description does not match
+  `internal/ipc/handlers.go:allocInode`; worth fixing separately. The concurrency
+  question is still real — does the CAS-retry loop stay correct when contended by
+  two nodes' daemons at once, not just concurrent goroutines in one process.
 - `arena:<node_id>` acquisition — two nodes racing for the free arena pool.
   `chaos-arena-collision.sh` and `TestElastic_ArenaPoolContention` cover pieces of
   this; neither runs during an actual join.
 - etcd `member add` back to back, before the first added member is healthy — this
   changes quorum size mid-join.
 
-- [ ] `chaos-elastic-concurrent.sh`: launch N=2,3 joins in parallel from a 3-node
-      baseline; assert every joiner reaches a healthy mount, arenas are disjoint, and
-      no inode number is issued twice.
+- [x] `chaos-elastic-concurrent.sh`: launch N=2 joins in parallel from a 3-node
+      baseline; assert both joiners reach a healthy mount, pre-join data is visible,
+      arenas are disjoint, 20 concurrent creates (10 per node) all land with no
+      collision, survivors stay unaffected, and scale-in is clean. Verified 9/9 on
+      both Docker and AWS. `add_node`/`remove_node` were extracted from
+      `chaos-elastic.sh` into `chaos-lib.sh` so both scripts share one
+      implementation instead of drifting.
+- [ ] N=3 concurrent joins not attempted — only two extra nodes exist in the
+      base topology (`n4`, `n5`); a third would need topology changes beyond this
+      pass.
 - [ ] Harness-level equivalent in `test/harness/elastic_test.go` (deterministic,
-      cheap to iterate) before spending AWS time.
+      cheap to iterate) still not done.
 
 ## 3. Fault injection during join/leave
 
