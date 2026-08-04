@@ -33,33 +33,41 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Architecture:
-      - FUSE Daemon Architecture: architecture/fuse-architecture.md
-      - FUSE Request Dispatch: architecture/fuse-request-dispatch.md
-      - FUSE Read Operations: architecture/fuse-read-operations.md
-      - FUSE Write Operations: architecture/fuse-write-operations.md
-      - FUSE Cache Management: architecture/fuse-cache-management.md
-      - Metadata Schema: architecture/metadata-schema.md
-      - Metadata Store: architecture/metadata-store.md
-      - Namespace Operations: architecture/namespace-operations.md
-      - POSIX Lock Operations: architecture/posix-lock-operations.md
-      - Concurrency Control: architecture/concurrency-control.md
-      - Block Device I/O Substrate: architecture/block-device-io.md
-      - Arena Allocator: architecture/arena-allocator.md
-      - Arena Compaction: architecture/arena-compaction.md
-      - Write-Ahead Log: architecture/write-ahead-log.md
-      - Write Ordering Invariants: architecture/write-ordering-invariants.md
-      - Cache Coherence and Data Consistency: architecture/cache-coherence.md
-      - Multi-Node Cache Coherence: architecture/multi-node-coherence.md
-      - Self-Fencing Watchdog: architecture/self-fencing-watchdog.md
-      - External Fencing Controller: architecture/external-fencing-controller.md
-      - Fencing Generation Protocol: architecture/fencing-generation-protocol.md
-      - Continuous Scrubber: architecture/continuous-scrubber.md
-      - Crash Recovery and Deterministic Replay: architecture/crash-recovery-determinism.md
-      - Deterministic Fault-Injection Simulator: architecture/deterministic-simulator.md
-      - Invariant Checkers: architecture/invariant-checkers.md
-      - Elastic Join and Leave: architecture/elastic-join-leave.md
-      - Single-Node Integration: architecture/single-node-integration.md
-      - "MockStore: In-Memory etcd Simulation": architecture/mock-store.md
+      - FUSE Layer:
+          - FUSE Daemon Architecture: architecture/fuse/fuse-architecture.md
+          - FUSE Request Dispatch: architecture/fuse/fuse-request-dispatch.md
+          - FUSE Read Operations: architecture/fuse/fuse-read-operations.md
+          - FUSE Write Operations: architecture/fuse/fuse-write-operations.md
+          - FUSE Cache Management: architecture/fuse/fuse-cache-management.md
+      - Metadata & Namespace:
+          - Metadata Schema: architecture/metadata/metadata-schema.md
+          - Metadata Store: architecture/metadata/metadata-store.md
+          - Namespace Operations: architecture/metadata/namespace-operations.md
+          - POSIX Lock Operations: architecture/metadata/posix-lock-operations.md
+          - Concurrency Control: architecture/metadata/concurrency-control.md
+      - Storage Substrate:
+          - Block Device I/O Substrate: architecture/storage/block-device-io.md
+          - Arena Allocator: architecture/storage/arena-allocator.md
+          - Arena Compaction: architecture/storage/arena-compaction.md
+          - Write-Ahead Log: architecture/storage/write-ahead-log.md
+          - Write Ordering Invariants: architecture/storage/write-ordering-invariants.md
+          - "Kleppmann's Stale-Write Hazard Analysis": architecture/storage/kleppmann-stale-write-analysis.md
+      - Consistency:
+          - Cache Coherence and Data Consistency: architecture/consistency/cache-coherence.md
+          - Multi-Node Cache Coherence: architecture/consistency/multi-node-coherence.md
+      - Fencing:
+          - Self-Fencing Watchdog: architecture/fencing/self-fencing-watchdog.md
+          - External Fencing Controller: architecture/fencing/external-fencing-controller.md
+          - Fencing Generation Protocol: architecture/fencing/fencing-generation-protocol.md
+      - Reliability:
+          - Continuous Scrubber: architecture/reliability/continuous-scrubber.md
+          - Crash Recovery and Deterministic Replay: architecture/reliability/crash-recovery-determinism.md
+          - Deterministic Fault-Injection Simulator: architecture/reliability/deterministic-simulator.md
+          - Invariant Checkers: architecture/reliability/invariant-checkers.md
+      - Cluster Operations:
+          - Elastic Join and Leave: architecture/cluster-ops/elastic-join-leave.md
+          - Single-Node Integration: architecture/cluster-ops/single-node-integration.md
+          - "MockStore: In-Memory etcd Simulation": architecture/cluster-ops/mock-store.md
   - Chaos Reports:
       - Fresh Cluster Per Scenario (2026-07-30): chaos-reports/2026-07-30-fresh-cluster-per-scenario.md
       - Single-Cluster and Fuzz (2026-07-31): chaos-reports/2026-07-31-single-cluster-and-fuzz.md

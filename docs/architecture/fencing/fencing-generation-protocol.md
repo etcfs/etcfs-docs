@@ -203,7 +203,7 @@ Not yet guarded: namespace mutations (`CreateInode`, `Unlink`, `Rmdir`, `Rename`
 
 ### Scope of the guarantee
 
-The generation guard rejects writes from a node that has been **fenced**. It is not, and cannot be, a defence against two *unfenced* nodes writing to the same disk offset — both would pass their guards. That case is prevented upstream, by arena ownership being disjoint, and it is the point at which Kleppmann's stale-write argument becomes reachable in this design. See [Kleppmann's Stale-Write Hazard in EtcFS](kleppmann-stale-write-analysis.md) for the full analysis, the allocator bug that made it reachable, and the invariants that keep it closed.
+The generation guard rejects writes from a node that has been **fenced**. It is not, and cannot be, a defence against two *unfenced* nodes writing to the same disk offset — both would pass their guards. That case is prevented upstream, by arena ownership being disjoint, and it is the point at which Kleppmann's stale-write argument becomes reachable in this design. See [Kleppmann's Stale-Write Hazard in EtcFS](../storage/kleppmann-stale-write-analysis.md) for the full analysis, the allocator bug that made it reachable, and the invariants that keep it closed.
 
 ## Generation Lifecycle
 
