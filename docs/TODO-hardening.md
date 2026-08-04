@@ -143,8 +143,15 @@ Contended on a concurrent join, per `README.md` § Sharding hot structures:
 - [ ] N=3 concurrent joins not attempted — only two extra nodes exist in the
       base topology (`n4`, `n5`); a third would need topology changes beyond this
       pass.
-- [ ] Harness-level equivalent in `test/harness/elastic_test.go` (deterministic,
-      cheap to iterate) still not done.
+- [x] Harness-level equivalent: `TestElastic_ConcurrentJoin` in
+      `test/harness/elastic_test.go`. Runs 5 nodes joining concurrently against
+      `MockStore`, asserting disjoint arenas and non-overlapping inode ranges;
+      milliseconds under `-race`, not the minutes a real Docker/AWS run takes.
+      Uses `ReserveInodeRange`, which CASes the same `inode_alloc_counter` key as
+      the real request path but with a looser retry budget (5 attempts, no
+      jitter, vs. `NextCounter`'s 20 + jitter) — proves the shared-counter
+      primitive never double-issues under concurrency, not `NextCounter`'s
+      specific retry tuning.
 
 ## 3. Fault injection during join/leave
 
@@ -179,10 +186,73 @@ Slow-leak classes cannot surface in 4 minutes:
       violation — a leak that never reaches OOM inside the window still fails.
 - [ ] Run against Docker first; AWS only once the sampling harness is proven.
 
+## 5. Inode allocation: doc/implementation mismatch
+
+Found while implementing item 2. `README.md` § Sharding hot structures and
+`docs/architecture/cluster-ops/elastic-join-leave.md` both describe inode numbers
+as allocated from per-node ranges: a node CASes a small `inode_range` table once,
+then hands out numbers locally until exhausted, mirroring how arena allocation
+already works. The code for this exists — `pkg/membership.Manager.ReserveInodeRange`
+and `.InodeRange` — but nothing in the daemon calls it. Its only callers are
+`test/harness/elastic_test.go`.
+
+What actually runs on every `create`/`mkdir`/`symlink`/`mknod`, on every node:
+
+```go
+// internal/ipc/handlers.go:523
+func (s *Service) allocInode(ctx context.Context) (uint64, error) {
+	return s.store.NextCounter(ctx, metadata.KeyInodeAllocCounter, metadata.FirstUsableIno)
+}
+```
+
+One global etcd key (`inode_alloc_counter`), CAS-retried on conflict, up to 20
+attempts with exponential backoff and jitter. The jitter and 20-attempt budget were
+themselves added because a documented near-miss — 16 concurrent callers once
+exhausted an 8-attempt budget with only 9 successes
+(`TestIntegration_CounterIsUniqueUnderConcurrency`, see the comment above
+`NextCounter` in `pkg/metadata/alloc.go`). The concurrent-scale-out chaos run
+(2026-08-04) only contended this with 2 nodes and it held, but that is not evidence
+it holds at higher node counts or heavier create-heavy load — the design has no
+per-node locality, so contention *grows* with node count rather than staying flat,
+unlike the arena path it's supposed to mirror.
+
+`docs/architecture/cluster-ops/elastic-join-leave.md` § Invariant checks also
+describes an fsck cross-check that validates every inode falls inside some node's
+reserved range. Grepped `pkg/fsck` and `pkg/scrub` — neither implements it. That
+check is documented but does not exist, consistent with no ranges ever being
+reserved in production.
+
+This needs a decision, not a mechanical fix — the two directions have opposite
+implications and picking wrong means throwing away work:
+
+- **Fix the docs to describe the global counter.** Cheap, honest, but locks in a
+  cluster-wide serialization point on every metadata-creating operation, forever.
+  Should come with deleting the unused `ReserveInodeRange`/`InodeRange`/`Manager`
+  code and the fsck-check description that depends on it — keeping unreachable
+  code that reads like it's live is its own hazard.
+- **Wire the daemon to the range design the docs already describe.** Removes the
+  per-create etcd round trip on the common path, matches the arena allocator's
+  existing pattern. Costs: a node that dies mid-range leaks the unused remainder
+  (harmless at 64 bits, but inode numbers become sparse/non-monotonic across
+  nodes — anything assuming density breaks), and range refill needs to go through
+  the fencing guard (natural since `ReserveInodeRange` already uses `Store.Txn`,
+  but needs verifying, not assuming).
+
+- [ ] Decide fix-the-doc vs. build-the-design — capacity/workload question, not a
+      code question. Global counter is fine at current scale (3-5 nodes, light
+      metadata churn); only matters if create-heavy workloads or many-node
+      clusters are actually expected.
+- [ ] If fixing the doc: delete the dead range-reservation code and the fsck-check
+      description, don't just relabel the doc.
+- [ ] If building the design: needs a chaos/harness scenario forcing range
+      exhaustion under real concurrent daemons (not just the existing
+      single-process harness test), and an explicit fencing-guard test on refill.
+
 ---
 
 ## Order
 
 1 first — it is a live correctness hole. Then 2 and 3, which share harness work
 (both need a scriptable mid-join fault point). 4 last: it is mostly wall-clock time
-and needs the metric sampling built anyway.
+and needs the metric sampling built anyway. 5 can happen any time — it's a decision
+plus either a deletion or a build, not blocked on anything else here.
