@@ -72,6 +72,7 @@ nav:
       - Fresh Cluster Per Scenario (2026-07-30): chaos-reports/2026-07-30-fresh-cluster-per-scenario.md
       - Single-Cluster and Fuzz (2026-07-31): chaos-reports/2026-07-31-single-cluster-and-fuzz.md
       - Elastic Scale-Out/In (2026-07-31): chaos-reports/2026-07-31-elastic-scale-out-in.md
+      - Namespace Fencing Guard (2026-08-04): chaos-reports/2026-08-04-namespace-fencing-guard.md
   - Research:
       - etcd/Raft Internals: etcd_raft_research.md
       - Cluster Filesystem Survey: research/cluster-fs-survey.md

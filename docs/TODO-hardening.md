@@ -1,6 +1,6 @@
 # Hardening TODO — fencing guard on namespace ops + untested fault patterns
 
-Two independent gaps, both recorded in [`README.md`](../README.md) § State. Item 1 is a
+Two independent gaps, both recorded in the top-level `README.md` § State. Item 1 is a
 correctness hole in the product; items 2–4 are coverage holes in the test tiers.
 
 Item 1 is the only one that can cause silent corruption today. Do it first.
