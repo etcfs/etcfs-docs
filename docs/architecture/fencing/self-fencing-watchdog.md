@@ -145,7 +145,7 @@ The self-fencing watchdog is faster and independent of external services. It doe
 
 In the worst case (the self-fencing watchdog fails to fire — e.g., the daemon is stuck in an infinite loop), the external fencing controller still fences the node once the membership lease expires. The generation guard on every etcd transaction is the ultimate backstop: even if neither layer fires correctly, the fenced node's metadata commits are rejected because its generation is stale.
 
-Note that the external fencing controller does not currently make any cloud API call — it bumps the generation directly on membership-lease expiry, with no volume detach and no dual confirmation. See [External Fencing Controller](external-fencing-controller.md) and `docs/TODO-hardening.md` § 7.
+External fencing is dual-confirmed when the daemon was started with `--ebs-volume-id`: the controller calls `ec2:DetachVolume`, polls `ec2:DescribeVolumes` until the attachment is actually gone, and only then bumps the generation. Without that flag (Docker, bare metal, or a node whose instance ID was never recorded) it falls back to bumping on lease expiry alone. See [External Fencing Controller](external-fencing-controller.md), `pkg/fencing/detach.go`, and the verification in `docs/chaos-reports/2026-08-05-external-fencing-detach.md`.
 
 ## Configuration
 
