@@ -396,41 +396,82 @@ coordination between application processes.
       startup log line — since a user relying on cross-node `flock` today gets no
       runtime signal that it's unenforced.
 
-## 7. External fencing doc/code mismatch: no cloud API, no dual confirmation
+## 7. External fencing doc/code mismatch: no cloud API, no dual confirmation — RESOLVED
 
 Found investigating TODO item 3. Several docs (`self-fencing-watchdog.md`,
-`concurrency-control.md`, and `README.md`) describe external fencing as: detect
+`concurrency-control.md`, and `README.md`) described external fencing as: detect
 membership-lease expiry, call a cloud API to detach the shared EBS volume from the
 dead instance, poll until dual-confirmed, and only then bump the fencing generation.
-Checked `pkg/fencing/controller.go` directly — none of that exists. Zero AWS SDK
-usage anywhere in `pkg/fencing`. The actual code bumps the generation the instant a
-membership key's lease expires, with no confirmation of anything beyond "the lease
-expired":
+`pkg/fencing/controller.go` did none of that — zero AWS SDK usage anywhere in
+`pkg/fencing`, generation bumped the instant a membership key's lease expired, no
+confirmation of anything beyond "the lease expired."
 
-```go
-currentGen, _ := c.store.GetGeneration(ctx, nodeID)
-newGen, _ := c.store.BumpGeneration(ctx, nodeID, currentGen)
-// no DetachVolume call, no polling, no dual confirmation
-```
+**Implemented rather than doc-corrected**, since detach-then-confirm is the
+correctly-designed behavior and this is the one item on this list where building
+it was clearly worth more than describing its absence.
 
-The controller's own doc comment is honest about this ("In production, the
-Controller is backed by AWS APIs... For local testing, the Controller bumps the
-generation directly") but there is no code branch implementing the AWS-backed
-version — it's described in a comment, never built. This means the actual
-external-fencing guarantee is weaker than documented: "single-signal fencing on
-lease expiry," not "dual-confirmed detachment." In practice this hasn't caused
-observed corruption (the generation guard is still the real backstop, see item 1),
-but the gap between doc and code is worth closing one way or the other.
+- [x] `pkg/fencing/detach.go`: `EBSDetacher` implements `ec2:DetachVolume` +
+      polled `ec2:DescribeVolumes` confirmation via `github.com/aws/aws-sdk-go-v2`.
+      `VolumeDetacher` interface, `ec2API` sub-interface for fakes — 7 unit tests
+      against a fake EC2 client, no network needed.
+- [x] `pkg/fencing/controller.go`: `SetDetacher` makes detach-then-confirm a
+      precondition of the generation bump, not a parallel action. A failed or
+      timed-out detach aborts the fence entirely rather than falling back to
+      bumping anyway — an unfenced node the cluster *believes* is fenced is worse
+      than one it knows it hasn't fenced. No detacher configured (Docker, bare
+      metal) falls back to the original single-signal behavior. 5 integration
+      tests against real etcd verify the ordering directly, including the
+      rolling-upgrade case (no instance ID recorded → no detach attempted, no
+      bump).
+- [x] `pkg/metadata.Membership` gained `SetInstanceID`/`InstanceIDFromMembership`:
+      the dying node's EC2 instance ID is recorded in its own membership value
+      (hand-rolled JSON) so a surviving controller can recover it from the
+      watch's `PrevKV` after the key is already gone — there is no other way to
+      ask a node for its own instance ID once it has expired.
+- [x] Permanent IAM role `etcfs-nodes` (`scripts/infra/fencing-iam.sh`,
+      idempotent, created once and reused — not per-cluster, not torn down).
+      Scoped to `DetachVolume`/`AttachVolume` on volume+instance ARNs and
+      `Describe{Volumes,VolumeStatus,Instances,Tags}` (unavoidably unscoped —
+      AWS has no resource-level permissions for these Describe actions).
+      `create-infra.sh` attaches it to every instance by default.
+- [x] `scripts/test/chaos-fencing-detach.sh`, AWS-only (no EBS Multi-Attach
+      volume to detach in Docker — that path stays single-signal there, already
+      covered by `chaos-elastic-fault-injection.sh` FJ2). **7/7 pass, third
+      attempt** — full findings including the two real bugs the first two runs
+      caught in `docs/chaos-reports/2026-08-05-external-fencing-detach.md`:
+      `LoadDefaultConfig` needs `WithEC2IMDSRegion()` explicitly (not automatic,
+      verified against SDK source), and a test-script bug where checking the
+      partitioned node's own generation via `etcdctl_on` (which always shells
+      through N1) hung on a node that can't reach Raft quorum — looked exactly
+      like "never bumped" when the daemon logs already proved otherwise.
+- [x] Docs corrected to describe the new real behavior:
+      `self-fencing-watchdog.md` (previously corrected to say "no cloud API,"
+      now genuinely wrong again in the other direction — fixed), and a false
+      code comment of my own in `controller.go` claiming a failed detach
+      "retries on the next watch event" — it doesn't; the watch is edge-triggered
+      on a DELETE that has already happened, so there's nothing left to
+      re-trigger on. Caught before it became a second doc/code mismatch of
+      exactly the kind this whole item exists to close.
 
-- [ ] Decide: implement the documented dual-confirmed EBS-detach flow, or correct
-      the docs (`self-fencing-watchdog.md`, `concurrency-control.md`, `README.md`)
-      to describe the actual single-signal behavior. Leaving the mismatch as-is
-      risks someone reasoning about safety from the docs' stronger claim.
-- [ ] If implementing: needs the AWS SDK, IAM permissions for `DetachVolume`/
-      `DescribeVolumes`, and a chaos scenario that kills a node's network *and*
-      verifies the detach+poll actually happens before the generation bumps —
-      distinct from the existing generation-bump scenarios, which never exercise
-      this path since it doesn't exist yet.
+### Found but not fixed (out of scope for this item)
+
+- **Two controllers can race to fence the same node.** Both survivors'
+  logs in the AWS run show independent, near-simultaneous fences of n1
+  (`generation=1 previous=0` and `generation=2 previous=1`). `activeFences` is
+  an in-memory per-process dedup map with no cross-node coordination. Not a
+  safety issue — `BumpGeneration`'s CAS serializes the two correctly — but
+  `DetachVolume` gets called twice (harmless, `alreadyDetached` treats the
+  second as success) and it's pure redundant work. No leader election exists
+  for "who fences whom."
+- **A failed/timed-out detach has no retry path.** The watch that triggers
+  `fenceNode` is edge-triggered on the membership key's DELETE event; once
+  that fires, the key is gone and nothing re-triggers it. A failed detach
+  therefore leaves the node in the limbo state `external-fencing-controller.md`
+  already documented ("remains in a limbo state until... an administrator
+  intervenes") — this was already an acknowledged design gap, not something
+  newly introduced, but it's now reachable code rather than a hypothetical.
+  A periodic reconciliation sweep (retry any node whose lease is expired but
+  generation was never bumped) would close it; not built here.
 
 ## 8. `RebalanceArena` is unguarded — landmine if it gets a production caller
 
