@@ -159,8 +159,9 @@ All chaos faults were injected on a stable cluster before this pass. The join/le
 window is when the membership set, quorum size, and arena ownership are all in flux —
 the most likely place for a fencing or allocator bug to hide.
 
-`scripts/test/chaos-elastic-fault-injection.sh` (FJ1–FJ4) covers all four, run on both
-Docker and AWS. Harness-level equivalents for FJ1 and FJ3 added to
+`scripts/test/chaos-elastic-fault-injection.sh` (FJ1–FJ4) covers all four.
+**14/14 pass on both Docker and AWS** after the fixes described under Follow-up
+below. Harness-level equivalents for FJ1 and FJ3 added to
 `test/harness/elastic_test.go` (`TestElastic_JoinInterruptedBeforeArena`,
 `TestElastic_GenerationBumpDuringGracefulLeave`) — FJ2 and FJ4 have no meaningful
 harness equivalent (they need a real watchdog process / real daemon crash).
@@ -170,31 +171,26 @@ harness equivalent (they need a real watchdog process / real daemon crash).
       acquisition is genuinely lazy (no arena held until first write) — matches the
       code (`AcquireArena` only called from `handleWriteBlock`).
 - [x] Partition the joining node from etcd mid-join; assert it self-fences rather
-      than mounting into a split view. **Found a real gap, confirmed by direct
-      investigation, not fixed (see instruction):** the self-fencing watchdog does
-      not fire under a genuine full network partition. `pkg/fencing.Watchdog.Run`
-      only checks `Membership.IsAlive()`, which is only set false when the etcd
+      than mounting into a split view. **Originally exposed a real product bug —
+      now fixed and passing on both environments.** The self-fencing watchdog did
+      not fire under a genuine full network partition: `pkg/fencing.Watchdog.Run`
+      gates on `Membership.IsAlive()`, which was only set false when the etcd
       client's lease `KeepAlive` channel closes — and under a hard Docker network
       disconnect (verified: empty network-attachment map), that channel never
       closes; the client just retries "Auto sync endpoints failed" forever. Waited
-      8+ minutes on Docker with zero self-fence. **The backstop still worked**:
-      `gen:n4` was correctly bumped by the *external* fencing controller within the
-      expected window, independent of node4's own client state, because the
-      membership key's lease expires server-side regardless of what the partitioned
-      node's client believes. **Separately**, a write attempt from the
-      already-fenced node did not fail fast — it hung indefinitely (killed after
-      7+ minutes with no response, on Docker). Whether `commitGuarded`'s CAS ever
-      returns a clean rejection under a *sustained* real partition is still an open
-      question — neither environment tested here demonstrated a clean reject, only
-      "hangs forever" (Docker, genuinely cut) or "succeeds" (AWS, see caveat below).
-      **AWS caveat**: the AWS run showed the write outright succeeding, but manual
-      investigation traced this to a test-methodology artifact, not a product bug —
-      AWS security groups are stateful and do not sever a node's *already-open*
-      connection to etcd on a group swap, only new connection attempts see the new
-      rules. A node whose daemon connection predates the "partition" can keep using
-      it. This same blind spot exists in the pre-existing `chaos-test.sh` S3
-      scenario, which also never attempts a write from the partitioned side. Treat
-      the Docker result for this scenario as the reliable one.
+      8+ minutes on Docker with zero self-fence. **The backstop still worked**
+      throughout: `gen:n4` was correctly bumped by the *external* fencing
+      controller, independent of node4's own client state, because the membership
+      key's lease expires server-side regardless of what the partitioned node's
+      client believes. A write from the already-fenced node also hung indefinitely
+      rather than failing fast. Both symptoms trace to the same root cause and both
+      are resolved — see Follow-up below. Two further confounders had to be
+      separated before the product bug was confirmed: an AWS test-harness issue
+      (stateful security groups never actually severing the connection) and a wrong
+      assertion in the scenario itself (checking FUSE mount presence, which the C
+      daemon holds after the Go daemon self-fences). This same SG blind spot exists
+      in the pre-existing `chaos-test.sh` S3
+      scenario, which also never attempts a write from the partitioned side.
 - [x] Bump the leaving node's generation during graceful removal; assert clean
       teardown, no orphaned arena, and no lock left held. **Clean on both Docker and
       AWS**, with one corrected expectation found while writing the test: arena
@@ -210,24 +206,51 @@ harness equivalent (they need a real watchdog process / real daemon crash).
       **Clean on both Docker and AWS.** The join completes despite the concurrent
       crash, and the killed survivor rejoins and recovers cleanly afterward.
 
-### Follow-up needed (not done in this pass)
+### Follow-up — resolved
 
-- [ ] The self-fencing watchdog gap (above) is real and independent of the AWS SG
-      caveat — confirmed under a genuine, total Docker network cut. Worth a
-      dedicated look at whether `Membership.IsAlive()` should also track an
-      explicit deadline since the last successful keepalive, rather than relying
-      solely on the client library's channel-close behavior.
-- [ ] Determine whether `commitGuarded` ever returns a clean rejection under a
-      *sustained* real partition, or whether the underlying etcd client call also
-      just blocks indefinitely there — neither test run in this pass demonstrated
-      a clean reject.
-- [ ] If AWS-based partition testing is needed again, the SG-swap technique needs a
-      way to also drop already-established connections (e.g., an explicit
-      connection-tracking flush, or NACL-based blocking instead of SG-based) —
-      otherwise any AWS scenario testing "does a partitioned node's own operation
-      fail" (not just "do survivors keep working") is unreliable. This affects the
-      pre-existing `chaos-test.sh` S3 scenario too, though S3 never attempted the
-      partitioned-node-side assertion that would have exposed it.
+- [x] **Self-fencing watchdog now fires under a real partition.**
+      `Membership.IsAlive()` returned the raw `alive` flag, which is only cleared
+      when the etcd client's lease `KeepAlive` channel closes — and under a total
+      partition that channel never closes, so nothing ever cleared it. It now also
+      requires the last successful keepalive to be within the lease TTL, which is
+      exactly when etcd expires the lease server-side, making the partition locally
+      detectable without depending on the client library surfacing it. Regression
+      test: `pkg/metadata/membership_test.go` (confirmed to fail without the fix).
+      Verified end to end on Docker: meta daemon exits 77 (the self-fence code)
+      ~20-30s after the cut, where before it ran indefinitely (8+ minutes observed).
+- [x] **The write-hang is resolved as a consequence.** A write from a fenced node
+      previously hung indefinitely (killed after 7+ minutes). With the watchdog
+      firing, the daemon is gone by then and the write fails fast instead
+      (measured rc=1, sub-second). The narrower question of what
+      `commitGuarded`'s etcd call does under a sustained partition *while the
+      daemon is still alive* is now largely moot in practice, since the daemon no
+      longer survives that long — but it was never directly answered, so it stays
+      recorded here rather than claimed as verified.
+- [x] **AWS partition technique fixed.** The SG-swap approach could not sever
+      already-established connections (AWS security groups are stateful and only
+      evaluate new connection attempts), so the partitioned node's daemon kept
+      using its pre-existing etcd connection. Replaced with iptables DROP rules on
+      the instance, which filter every packet regardless of connection state. Two
+      things were needed and are now handled: stock Amazon Linux 2023 ships
+      **neither** `iptables` nor `nft` (verified directly on a fresh AL2023
+      instance — this was the cause of the silent `ERR:1` failures), so the script
+      installs `iptables`/`iptables-nft` first; and the partition is now *verified*
+      to have taken effect before the scenario proceeds, rather than assumed.
+
+### Follow-up — still open
+
+- [ ] `scripts/test/chaos-test.sh`'s pre-existing S3 scenario still partitions via
+      the SG swap and therefore has the same blind spot. It has not surfaced as a
+      wrong result because S3 only asserts that *survivors* keep working, never
+      that the partitioned node's own operations are blocked — but any future
+      assertion added there on the partitioned side would be unreliable. Worth
+      porting S3 to the same iptables approach.
+- [ ] The self-fence latency is 2–3x the lease TTL, not the flat 2x that
+      `docs/architecture/fencing/self-fencing-watchdog.md` describes, because the
+      watchdog polls on a ticker of one TTL and can only notice on a tick boundary
+      (measured: 22.98s and ~30s on separate runs with TTL=10s). Either tighten the
+      poll interval or correct the doc — the current text understates the worst
+      case by a full TTL.
 
 ## 4. Long-duration fuzz
 
@@ -311,9 +334,135 @@ implications and picking wrong means throwing away work:
 
 ---
 
+## 6. POSIX fcntl/flock locks are unenforced across nodes
+
+Found while writing the system explainer (`temp.md`). Verified directly in
+`internal/ipc/handlers.go`:
+
+```go
+func (s *Service) handleGetlk(...) { ... b.w32(fUnlck) ... } // always reports free
+func (s *Service) handleSetlk(...) { return okResp(), nil }  // always succeeds
+```
+
+Two processes on different nodes calling `fcntl(fd, F_SETLK, ...)` on overlapping
+byte ranges both succeed unconditionally — neither is actually granted exclusivity
+against the other. This is separate from the internal `lock:<ino>` whole-inode lease
+the read/write data path uses (which does work); it's the application-visible POSIX
+advisory-lock API that's a no-op. The architecture doc
+(`docs/architecture/metadata/posix-lock-operations.md`) documents this as a
+deliberate "Phase 3" simplification deferred to "Phase 7," and confirms the
+deferral is still current — this isn't a regression, but it's a real, currently
+unfilled gap that matters if any workload relies on cross-node `flock`/`fcntl`
+coordination between application processes.
+
+- [ ] Decide whether Phase 7 (real byte-range lock tracking, per
+      `posix-lock-operations.md` § Full Lock Protocol (Planned)) is still the
+      intended direction, given the fencing-guard work done in items 1–3 already
+      touches adjacent code (`Store.Txn`, lock acquisition).
+- [ ] At minimum, make this limitation more visible than a doc footnote — e.g. a
+      startup log line — since a user relying on cross-node `flock` today gets no
+      runtime signal that it's unenforced.
+
+## 7. External fencing doc/code mismatch: no cloud API, no dual confirmation
+
+Found investigating TODO item 3. Several docs (`self-fencing-watchdog.md`,
+`concurrency-control.md`, and `README.md`) describe external fencing as: detect
+membership-lease expiry, call a cloud API to detach the shared EBS volume from the
+dead instance, poll until dual-confirmed, and only then bump the fencing generation.
+Checked `pkg/fencing/controller.go` directly — none of that exists. Zero AWS SDK
+usage anywhere in `pkg/fencing`. The actual code bumps the generation the instant a
+membership key's lease expires, with no confirmation of anything beyond "the lease
+expired":
+
+```go
+currentGen, _ := c.store.GetGeneration(ctx, nodeID)
+newGen, _ := c.store.BumpGeneration(ctx, nodeID, currentGen)
+// no DetachVolume call, no polling, no dual confirmation
+```
+
+The controller's own doc comment is honest about this ("In production, the
+Controller is backed by AWS APIs... For local testing, the Controller bumps the
+generation directly") but there is no code branch implementing the AWS-backed
+version — it's described in a comment, never built. This means the actual
+external-fencing guarantee is weaker than documented: "single-signal fencing on
+lease expiry," not "dual-confirmed detachment." In practice this hasn't caused
+observed corruption (the generation guard is still the real backstop, see item 1),
+but the gap between doc and code is worth closing one way or the other.
+
+- [ ] Decide: implement the documented dual-confirmed EBS-detach flow, or correct
+      the docs (`self-fencing-watchdog.md`, `concurrency-control.md`, `README.md`)
+      to describe the actual single-signal behavior. Leaving the mismatch as-is
+      risks someone reasoning about safety from the docs' stronger claim.
+- [ ] If implementing: needs the AWS SDK, IAM permissions for `DetachVolume`/
+      `DescribeVolumes`, and a chaos scenario that kills a node's network *and*
+      verifies the detach+poll actually happens before the generation bumps —
+      distinct from the existing generation-bump scenarios, which never exercise
+      this path since it doesn't exist yet.
+
+## 8. `RebalanceArena` is unguarded — landmine if it gets a production caller
+
+Documented in `kleppmann-stale-write-analysis.md` § Remaining Exposure, restated
+here so it's tracked as an action item, not just prose. `pkg/membership/
+membership.go`'s `RebalanceArena` deletes `arena:<from>` and writes `arena:<to>`
+with no generation guard, no lease check, and no drain of the source node's
+in-flight writes. It has zero production callers today (`pkg/membership.Manager`
+itself is harness-only per item 5's finding) — but if it ever gets one (e.g. a
+future load-balancing feature), it directly reopens the Kleppmann stale-write
+hazard: two nodes could both believe they own the same arena, and since both would
+be healthy and unfenced, the generation guard has nothing to reject.
+
+- [ ] If `RebalanceArena` is ever wired to a production path: add a generation
+      guard on both the delete and the put, and determine what "drain of in-flight
+      writes" actually requires given EBS provides no proof of quiescence (see
+      invariant 4 in the Kleppmann doc — this is the same open problem).
+- [ ] Until then: a comment at the top of `RebalanceArena` flagging it as
+      unsafe-for-production would be cheap insurance against someone wiring it up
+      without rereading the Kleppmann analysis first.
+
+## 9. Arena reclamation has no implementation — confirmed via two independent findings
+
+`free_arena:` keys are written (by `LeaveGraceful`'s `releaseArena`) but nothing
+ever reads or reuses them — confirmed both by the Kleppmann doc's own statement
+("Reuse is currently impossible... arena space leaks on graceful leave") and,
+independently, by TODO item 3's FJ3 chaos scenario: `pkg/metadata.Membership.Run()`
+(what production actually wires to SIGTERM) doesn't even call `releaseArena` — it
+only revokes the node's own lease-bound membership key. `arena:<node_id>` isn't
+lease-bound either. So in production, arena space leaks permanently on **every**
+node departure, graceful or not, not just the harness-only `LeaveGraceful` path
+that at least records the free-list entry.
+
+- [ ] Decide whether arena reclamation is worth building at all before it matters
+      operationally (long-running clusters with frequent node churn would
+      eventually exhaust the block device). If yes:
+- [ ] Wire actual arena release into `pkg/metadata.Membership`'s shutdown path
+      (currently only `pkg/membership.Manager`, harness-only, does this).
+- [ ] Any reclamation path must satisfy invariant 4 from the Kleppmann doc: an
+      arena may only return to the pool once the previous owner is *provably* done
+      with it, and since EBS gives no such proof, this can only be a time-bound
+      argument, never derived from etcd state alone. No current design for this
+      exists — it's the single largest remaining gap in the allocation story.
+
+## 10. Lock TTL documented inconsistently across two docs
+
+Found while writing the system explainer, not chased down further at the time —
+recorded here so it doesn't get lost. `cache-coherence.md` describes the read/write
+data-path lock as TTL=2s; `concurrency-control.md` describes the general lock model
+default as TTL=5s. Both could be independently correct if they describe different
+call sites with different configured TTLs, or one could simply be stale.
+
+- [ ] Read `AcquireLock`'s actual call sites (`internal/ipc/datapath.go` for the
+      read/write path) and confirm which TTL value is actually passed at each, then
+      correct whichever doc is wrong (or clarify that both are correct for
+      different paths).
+
+---
+
 ## Order
 
 1 first — it is a live correctness hole. Then 2 and 3, which share harness work
 (both need a scriptable mid-join fault point). 4 last: it is mostly wall-clock time
 and needs the metric sampling built anyway. 5 can happen any time — it's a decision
-plus either a deletion or a build, not blocked on anything else here.
+plus either a deletion or a build, not blocked on anything else here. 6, 7, 8, and 9
+are independent of each other and of 1–5; none block anything else in this file. 10
+is the cheapest item here — a single grep and a doc fix, worth doing opportunistically
+whenever someone is next in that file.

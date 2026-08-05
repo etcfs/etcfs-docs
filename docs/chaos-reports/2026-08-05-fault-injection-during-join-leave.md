@@ -1,6 +1,12 @@
 # Chaos Testing Report — Fault Injection During Join/Leave
 
-Date: 2026-08-05, commit (pending).
+Date: 2026-08-05.
+
+> **Update, same day.** Findings 1, 2, and 3 below have since been fixed and
+> re-verified — a real product bug in the self-fencing watchdog, plus a test-harness
+> bug in the AWS partition technique, plus a wrong assertion in this very scenario.
+> See [Resolution](#resolution) at the end. The findings are left as originally
+> written because the sequence in which they were untangled is the useful part.
 
 ## Summary
 
@@ -47,6 +53,29 @@ This is not a new gap the fencing design has — it's a gap in *this test's abil
 
 Found while writing FJ3, before running anything — checked against the code first rather than let the test assert something false. `pkg/metadata.Membership.Run()`'s shutdown path (what `cmd/etcfuse-meta/main.go` actually wires to SIGTERM) only revokes the node's own lease-bound membership key. It never touches `arena:<node_id>` — that key isn't lease-bound at all (a plain `Put`, see `pkg/arena/allocator.go`), and no code path anywhere deletes it on departure, graceful or not. This matches the already-documented limitation in `kleppmann-stale-write-analysis.md` § Remaining Exposure ("arena space leaks on graceful leave") — not a new discovery, but the test was corrected to assert the arena record is *unchanged* by a graceful leave rather than *released*, which would have failed for reasons unrelated to the fencing generation bump being tested.
 
+## Resolution
+
+Three of the four findings were fixed after the initial run. Untangling them took several iterations because two independent bugs and one wrong assertion were producing the same symptom.
+
+**Finding 1 (product bug) — fixed.** `Membership.IsAlive()` now requires the last successful keepalive to be within the lease TTL, not just that the `alive` flag was never cleared. The lease TTL is the correct threshold because it is exactly when etcd expires the lease server-side; the client renews at roughly TTL/3, so a healthy node keeps ~3x margin and ordinary jitter cannot trip it. Regression test in `pkg/metadata/membership_test.go`, confirmed to fail against the old implementation. Directly verified on a partitioned Docker node: meta daemon exits 77 with `dead_for=22.98s`, where previously it ran indefinitely.
+
+**Finding 2 (write hang) — resolved as a consequence.** With the watchdog firing, the daemon is gone before a write can hang on it, and the probe now fails in under a second (rc=1) rather than blocking past 7 minutes. The narrower question — what `commitGuarded`'s etcd call does under a sustained partition while the daemon is *still alive* — was never directly answered and is recorded as still-open rather than claimed as verified.
+
+**Finding 3 (AWS test-harness bug) — fixed.** Partitioning now uses iptables DROP rules rather than a security-group swap. Two things were required, both verified on a throwaway AL2023 instance rather than assumed: stock Amazon Linux 2023 ships **neither** `iptables` nor `nft` (this was the cause of a silent `ERR:1` on the first iptables attempt — `runcmd` discards stderr, so the reason was invisible until stderr capture was added), so the script installs `iptables`/`iptables-nft` first; and the partition is now *verified* to have taken effect before the scenario proceeds instead of being assumed. That verification step is what caught the failure rather than letting it read as a product bug a second time.
+
+**A wrong assertion in this scenario, worth recording separately.** Even after the watchdog fix, FJ2 kept reporting the self-fence as failed. The check was `is /mnt/etcfuse still in /proc/mounts` — but self-fencing is `os.Exit(77)` in the *Go meta daemon*, while the *C FUSE daemon* is a separate process that keeps the mount listed after its peer dies. Measured directly: meta exits 77 at t+20s while the mount is still present at t+41s and beyond. Operations on that mount do correctly fail, but mount presence was simply never a test of whether the fence fired. The assertion now watches the meta daemon and checks for exit code 77 specifically. This is a good illustration of why a failing chaos assertion has to be traced to a mechanism before it is believed — the first two runs of this scenario were reporting a real bug, the next two were reporting a bad test.
+
+**Finding 4 (arena release) — unchanged**, still a real gap, recorded in `docs/TODO-hardening.md` § 9.
+
+### Post-fix results
+
+| Environment | Pass | Fail |
+|---|---|---|
+| Docker | 14/14 | 0 |
+| AWS | 14/14 | 0 |
+
+On AWS the partition verification reports `probe=rc=124` — curl timing out rather than returning an HTTP status, which is what a genuine packet-level drop looks like, versus the `probe=200rc=0` (etcd answering normally) seen when the security-group swap silently failed to partition anything. The self-fence fired ~15s after the cut on AWS and ~30s on Docker; both are within the 2–3x TTL window the watchdog's polling granularity allows.
+
 ## Reproduction
 
 ```
@@ -54,4 +83,4 @@ Found while writing FJ3, before running anything — checked against the code fi
 ./scripts/test/chaos-elastic-fault-injection.sh aws    [FJ1|FJ2|FJ3|FJ4|all]
 ```
 
-FJ2 alone takes several minutes (25s self-fence-margin wait + a bounded 20s write probe + cleanup). Per instruction, no source code was modified as a result of this investigation — findings 1, 2, and 4 are real, reproducible, and recorded in `docs/TODO-hardening.md` § 3 for follow-up.
+FJ2 waits for the self-fence rather than sleeping a fixed interval: the watchdog polls on a one-TTL ticker and fires on the first tick past 2x TTL, so the fence lands 2–3x TTL after the last keepalive depending on tick phase (measured 22.98s and ~30s on separate runs at TTL=10s). A fixed 25s wait raced that and produced a flake; polling removes it and returns as soon as the fence fires.
