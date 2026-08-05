@@ -237,20 +237,37 @@ harness equivalent (they need a real watchdog process / real daemon crash).
       installs `iptables`/`iptables-nft` first; and the partition is now *verified*
       to have taken effect before the scenario proceeds, rather than assumed.
 
+- [x] **S3 ported to iptables.** `scripts/test/chaos-test.sh`'s S3 scenario used
+      the same SG-swap technique and so was testing something weaker than it
+      claimed — it never severed established connections. It had not produced a
+      *wrong* result only because it asserts survivors keep working and that N1
+      recovers, never that the partitioned node's own operations were blocked.
+      Now uses iptables, installs `iptables`/`iptables-nft` first (stock AL2023
+      has neither), captures stderr rather than discarding it via `runcmd`, and
+      verifies the cut took effect before proceeding. Its comment claiming N1
+      "self-fenced during the partition" is also corrected: that was an
+      assumption, false on both counts before this work — the connection was
+      never cut, and even under a genuine cut the watchdog did not fire until
+      `IsAlive()` gained the deadline check.
+- [x] **Self-fence latency documented correctly.**
+      `docs/architecture/fencing/self-fencing-watchdog.md` claimed a flat 2× TTL
+      in five places; actual is 2–3× because the watchdog only evaluates on a
+      poll tick (measured 22.98s and ~30s at TTL=10s, differing by nothing but
+      tick phase). Corrected rather than tightening the poll interval — the
+      generation guard is what bounds the damage, so a shorter poll only narrows
+      an already-covered window. Two adjacent false claims in the same doc were
+      fixed while there, both verified against the code: the watchdog does **not**
+      close the block device FD or remount read-only (`trigger()` sets a flag,
+      closes a channel, logs, and calls `os.Exit(77)` — process exit is what
+      releases the descriptor), and the fence margin is **not** configurable
+      (`NewWatchdog` takes no margin parameter; the `2 *` is inline in `Run`).
+      The package doc comment on `pkg/fencing/watchdog.go` made the same
+      overclaims and was corrected too.
+
 ### Follow-up — still open
 
-- [ ] `scripts/test/chaos-test.sh`'s pre-existing S3 scenario still partitions via
-      the SG swap and therefore has the same blind spot. It has not surfaced as a
-      wrong result because S3 only asserts that *survivors* keep working, never
-      that the partitioned node's own operations are blocked — but any future
-      assertion added there on the partitioned side would be unreliable. Worth
-      porting S3 to the same iptables approach.
-- [ ] The self-fence latency is 2–3x the lease TTL, not the flat 2x that
-      `docs/architecture/fencing/self-fencing-watchdog.md` describes, because the
-      watchdog polls on a ticker of one TTL and can only notice on a tick boundary
-      (measured: 22.98s and ~30s on separate runs with TTL=10s). Either tighten the
-      poll interval or correct the doc — the current text understates the worst
-      case by a full TTL.
+See § 11 for the unbounded-context issue that the write-hang investigation
+turned up; it is the substantive remainder of this item.
 
 ## 4. Long-duration fuzz
 
