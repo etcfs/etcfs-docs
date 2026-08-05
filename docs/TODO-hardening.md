@@ -155,18 +155,79 @@ Contended on a concurrent join, per `README.md` § Sharding hot structures:
 
 ## 3. Fault injection during join/leave
 
-All chaos faults are injected on a stable cluster. The join/leave window is when the
-membership set, quorum size, and arena ownership are all in flux — the most likely
-place for a fencing or allocator bug to hide.
+All chaos faults were injected on a stable cluster before this pass. The join/leave
+window is when the membership set, quorum size, and arena ownership are all in flux —
+the most likely place for a fencing or allocator bug to hide.
 
-- [ ] Kill the joining node's daemons mid-join, after `etcd member add` but before
-      the FUSE mount comes up. Assert the cluster stays writable and the half-joined
-      member does not hold an arena.
-- [ ] Partition the joining node from etcd mid-join; assert it self-fences rather
-      than mounting into a split view.
-- [ ] Bump the leaving node's generation during graceful removal; assert clean
-      teardown, no orphaned arena, and no lock left held.
-- [ ] Kill a *surviving* node while a different node is mid-join (quorum stress).
+`scripts/test/chaos-elastic-fault-injection.sh` (FJ1–FJ4) covers all four, run on both
+Docker and AWS. Harness-level equivalents for FJ1 and FJ3 added to
+`test/harness/elastic_test.go` (`TestElastic_JoinInterruptedBeforeArena`,
+`TestElastic_GenerationBumpDuringGracefulLeave`) — FJ2 and FJ4 have no meaningful
+harness equivalent (they need a real watchdog process / real daemon crash).
+
+- [x] Kill the joining node's daemons mid-join, after `etcd member add` but before
+      the FUSE mount comes up. **Clean on both Docker and AWS.** Confirms arena
+      acquisition is genuinely lazy (no arena held until first write) — matches the
+      code (`AcquireArena` only called from `handleWriteBlock`).
+- [x] Partition the joining node from etcd mid-join; assert it self-fences rather
+      than mounting into a split view. **Found a real gap, confirmed by direct
+      investigation, not fixed (see instruction):** the self-fencing watchdog does
+      not fire under a genuine full network partition. `pkg/fencing.Watchdog.Run`
+      only checks `Membership.IsAlive()`, which is only set false when the etcd
+      client's lease `KeepAlive` channel closes — and under a hard Docker network
+      disconnect (verified: empty network-attachment map), that channel never
+      closes; the client just retries "Auto sync endpoints failed" forever. Waited
+      8+ minutes on Docker with zero self-fence. **The backstop still worked**:
+      `gen:n4` was correctly bumped by the *external* fencing controller within the
+      expected window, independent of node4's own client state, because the
+      membership key's lease expires server-side regardless of what the partitioned
+      node's client believes. **Separately**, a write attempt from the
+      already-fenced node did not fail fast — it hung indefinitely (killed after
+      7+ minutes with no response, on Docker). Whether `commitGuarded`'s CAS ever
+      returns a clean rejection under a *sustained* real partition is still an open
+      question — neither environment tested here demonstrated a clean reject, only
+      "hangs forever" (Docker, genuinely cut) or "succeeds" (AWS, see caveat below).
+      **AWS caveat**: the AWS run showed the write outright succeeding, but manual
+      investigation traced this to a test-methodology artifact, not a product bug —
+      AWS security groups are stateful and do not sever a node's *already-open*
+      connection to etcd on a group swap, only new connection attempts see the new
+      rules. A node whose daemon connection predates the "partition" can keep using
+      it. This same blind spot exists in the pre-existing `chaos-test.sh` S3
+      scenario, which also never attempts a write from the partitioned side. Treat
+      the Docker result for this scenario as the reliable one.
+- [x] Bump the leaving node's generation during graceful removal; assert clean
+      teardown, no orphaned arena, and no lock left held. **Clean on both Docker and
+      AWS**, with one corrected expectation found while writing the test: arena
+      release on leave has **no production implementation at all** —
+      `pkg/metadata.Membership.Run()`'s shutdown path (what `cmd/etcfuse-meta`
+      actually wires up) only revokes the node's own lease-bound membership key; it
+      never touches `arena:<node_id>`, which isn't lease-bound either. This matches
+      the already-documented gap in `kleppmann-stale-write-analysis.md` § Remaining
+      Exposure ("arena space leaks on graceful leave") — not something this
+      scenario newly broke. The test correctly asserts the arena is *unchanged*, not
+      released.
+- [x] Kill a *surviving* node while a different node is mid-join (quorum stress).
+      **Clean on both Docker and AWS.** The join completes despite the concurrent
+      crash, and the killed survivor rejoins and recovers cleanly afterward.
+
+### Follow-up needed (not done in this pass)
+
+- [ ] The self-fencing watchdog gap (above) is real and independent of the AWS SG
+      caveat — confirmed under a genuine, total Docker network cut. Worth a
+      dedicated look at whether `Membership.IsAlive()` should also track an
+      explicit deadline since the last successful keepalive, rather than relying
+      solely on the client library's channel-close behavior.
+- [ ] Determine whether `commitGuarded` ever returns a clean rejection under a
+      *sustained* real partition, or whether the underlying etcd client call also
+      just blocks indefinitely there — neither test run in this pass demonstrated
+      a clean reject.
+- [ ] If AWS-based partition testing is needed again, the SG-swap technique needs a
+      way to also drop already-established connections (e.g., an explicit
+      connection-tracking flush, or NACL-based blocking instead of SG-based) —
+      otherwise any AWS scenario testing "does a partitioned node's own operation
+      fail" (not just "do survivors keep working") is unreliable. This affects the
+      pre-existing `chaos-test.sh` S3 scenario too, though S3 never attempted the
+      partitioned-node-side assertion that would have exposed it.
 
 ## 4. Long-duration fuzz
 
