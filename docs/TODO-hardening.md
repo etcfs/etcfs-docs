@@ -455,6 +455,56 @@ call sites with different configured TTLs, or one could simply be stale.
       correct whichever doc is wrong (or clarify that both are correct for
       different paths).
 
+## 11. FUSE handlers run with an unbounded context
+
+Traced while correcting a wrong attribution in the item 3 chaos report. `dispatch`
+(`internal/ipc/socket.go:226`) creates `ctx := context.Background()` for every FUSE
+operation and hands it to every handler. It carries no deadline, so any etcd call
+reached with it blocks for as long as the etcd client will retry — indefinitely,
+under a partition.
+
+This is what actually caused the 7+ minute write hang recorded in that report. The
+hang was originally attributed to `commitGuarded`, which was wrong:
+`commitGuarded` goes through `retryEtcd`, which discards the caller's context and
+substitutes a fresh `context.WithTimeout(2s)` per attempt (3 attempts + backoff,
+~6s ceiling). The write never reached it — `handleWriteBlock` acquires the inode
+lock first (`datapath.go:97` vs. the commit at `:176`), and that path is not
+insulated.
+
+Two gaps, both carrying the unbounded context:
+
+- **`lockInode`** (`retry.go:80`) is the one etcd path using the bare
+  `retry(...)` helper with the *caller's* context rather than `retryEtcd`'s
+  bounded one. It is the first etcd operation in both the read and write paths,
+  so it is precisely where a partitioned node's I/O stalls — before any
+  generation guard is consulted.
+- **35 direct `s.store.*(ctx, …)` calls** — 28 in `handlers.go`, 7 in
+  `datapath.go` — pass the unbounded context straight through with no retry or
+  timeout wrapper at all.
+
+The self-fencing fix (item 3) bounds the observable symptom only because the
+daemon now exits at 2–3× TTL and takes the blocked request with it. The
+underlying hazard is untouched: a FUSE request can still block for the whole
+self-fence window, and during a stall too brief to trip the watchdog — a leader
+election, a transient network blip — it blocks for as long as that stall lasts,
+with nothing to bound it.
+
+- [ ] Decide the deadline policy per operation class before changing anything.
+      Metadata reads (LOOKUP/GETATTR) want a short deadline and a fast EIO;
+      lock acquisition arguably wants to wait longer than one etcd round trip
+      but not forever; the data path already has `retryEtcd`'s 2s×3. A single
+      blanket timeout on `dispatch` would be the smallest diff but is probably
+      wrong for at least one of those.
+- [ ] Convert `lockInode` to `retryEtcd` (or give it an explicit bounded
+      context) — it is the highest-value single fix, being first on both hot
+      paths.
+- [ ] Audit the 35 unwrapped `s.store.*(ctx, …)` call sites; they are the long
+      tail of the same problem.
+- [ ] Add a chaos assertion that a FUSE operation on a partitioned node returns
+      within a bounded time *without* relying on the daemon being killed — the
+      current FJ2 write probe passes only because self-fencing removes the
+      daemon, so it would not catch a regression here.
+
 ---
 
 ## Order
@@ -466,3 +516,10 @@ plus either a deletion or a build, not blocked on anything else here. 6, 7, 8, a
 are independent of each other and of 1–5; none block anything else in this file. 10
 is the cheapest item here — a single grep and a doc fix, worth doing opportunistically
 whenever someone is next in that file.
+
+11 is the highest-value remaining item. Items 1 and 3 fixed the two ways a fenced
+node could damage shared state; 11 is the remaining way a *healthy* cluster can
+stall — an unbounded FUSE request during any etcd hiccup, whether or not fencing is
+ever involved. It is currently masked by self-fencing rather than fixed, so it only
+shows up when the stall is too short to trip the watchdog, which is also the case
+least likely to be noticed in testing.

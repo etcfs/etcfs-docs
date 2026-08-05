@@ -2,11 +2,14 @@
 
 Date: 2026-08-05.
 
-> **Update, same day.** Findings 1, 2, and 3 below have since been fixed and
-> re-verified — a real product bug in the self-fencing watchdog, plus a test-harness
-> bug in the AWS partition technique, plus a wrong assertion in this very scenario.
-> See [Resolution](#resolution) at the end. The findings are left as originally
-> written because the sequence in which they were untangled is the useful part.
+> **Update, same day.** Findings 1 and 3 have been fixed and re-verified (a real
+> product bug in the self-fencing watchdog; a test-harness bug in the AWS partition
+> technique), along with a wrong assertion in this scenario itself. Finding 2's
+> *symptom* is resolved but its stated cause turned out to be wrong — tracing it
+> produced finding 5, which is a separate open issue. See
+> [Resolution](#resolution). The original findings are left as written, with
+> corrections marked inline, because the order in which they were untangled is the
+> useful part: two of the four were not what they first appeared to be.
 
 ## Summary
 
@@ -39,6 +42,8 @@ Separate from finding 1. With `gen:n4` already confirmed bumped, a write attempt
 
 Whether `commitGuarded`'s generation-guarded CAS transaction ever returns a clean rejection under a *sustained* real partition is an open question this pass didn't resolve — the underlying etcd client call may simply block the same way the health-check calls did, rather than failing fast with a bounded retry budget. This wasn't traced further into the client library; recorded as a follow-up.
 
+> **Correction (traced afterwards).** The attribution above is wrong: the hang was never in `commitGuarded`, and could not have been. `commitGuarded` routes through `retryEtcd`, which gives every attempt its own `context.WithTimeout(2s)` — 3 attempts plus backoff, ~6s worst case. The write never reached it. `handleWriteBlock` acquires the inode lock first (`datapath.go:97`, versus the commit at `:176`), and `lockInode` is the one etcd path that uses the bare `retry(...)` helper with the *caller's* context rather than `retryEtcd`'s bounded one. That caller's context is `context.Background()`, created unconditionally in `dispatch` (`socket.go:226`) for every FUSE operation — no deadline. So `AcquireLock` → `GrantLease` issued a gRPC call with no deadline, and the etcd client retried it forever. See finding 5.
+
 ### 3. The AWS run's apparent "fencing failed" result is a test-methodology artifact, not a product bug
 
 The AWS run showed something that looked worse than Docker's hang: the write reportedly *succeeded* and became visible on survivors. Investigated separately (a second, isolated AWS cluster, single-scenario reproduction) before accepting this as real, because it directly contradicted the generation-guard code verified earlier in this session.
@@ -53,13 +58,26 @@ This is not a new gap the fencing design has — it's a gap in *this test's abil
 
 Found while writing FJ3, before running anything — checked against the code first rather than let the test assert something false. `pkg/metadata.Membership.Run()`'s shutdown path (what `cmd/etcfuse-meta/main.go` actually wires to SIGTERM) only revokes the node's own lease-bound membership key. It never touches `arena:<node_id>` — that key isn't lease-bound at all (a plain `Put`, see `pkg/arena/allocator.go`), and no code path anywhere deletes it on departure, graceful or not. This matches the already-documented limitation in `kleppmann-stale-write-analysis.md` § Remaining Exposure ("arena space leaks on graceful leave") — not a new discovery, but the test was corrected to assert the arena record is *unchanged* by a graceful leave rather than *released*, which would have failed for reasons unrelated to the fencing generation bump being tested.
 
+### 5. FUSE handlers run with an unbounded context (the actual cause of finding 2)
+
+Traced after the fact, while re-checking the finding-2 attribution. `dispatch` (`internal/ipc/socket.go:226`) creates `ctx := context.Background()` for every FUSE operation and passes it to every handler. It carries no deadline, so any etcd call reached with it can block for as long as the etcd client is willing to retry — which, under a partition, is indefinitely.
+
+Most of the data path is insulated from this by `retryEtcd`, which discards the caller's context and substitutes a fresh `context.WithTimeout(2s)` per attempt. Two things are not:
+
+- **`lockInode`** (`retry.go:80`) uses the bare `retry(...)` helper with the caller's context instead of `retryEtcd`. It is the first etcd operation in both the read and write paths (`datapath.go:97` and `:240`), so it is exactly where a partitioned node's I/O stalls — before any generation guard is consulted.
+- **35 direct `s.store.*(ctx, …)` calls** across `handlers.go` (28) and `datapath.go` (7) pass the unbounded context straight through with no retry or timeout wrapper at all.
+
+The self-fencing fix bounds the *observable* symptom, because the daemon now exits at 2–3× TTL and takes the blocked request with it. It does not fix the underlying issue: a FUSE request can still block for the full self-fence window, and during a transient stall that never trips the watchdog (a leader election, a brief network blip) it can block for as long as that stall lasts. Recorded in `docs/TODO-hardening.md` § 11 rather than fixed here — deciding the right deadline per operation class is a design question, not a mechanical change.
+
 ## Resolution
 
 Three of the four findings were fixed after the initial run. Untangling them took several iterations because two independent bugs and one wrong assertion were producing the same symptom.
 
 **Finding 1 (product bug) — fixed.** `Membership.IsAlive()` now requires the last successful keepalive to be within the lease TTL, not just that the `alive` flag was never cleared. The lease TTL is the correct threshold because it is exactly when etcd expires the lease server-side; the client renews at roughly TTL/3, so a healthy node keeps ~3x margin and ordinary jitter cannot trip it. Regression test in `pkg/metadata/membership_test.go`, confirmed to fail against the old implementation. Directly verified on a partitioned Docker node: meta daemon exits 77 with `dead_for=22.98s`, where previously it ran indefinitely.
 
-**Finding 2 (write hang) — resolved as a consequence.** With the watchdog firing, the daemon is gone before a write can hang on it, and the probe now fails in under a second (rc=1) rather than blocking past 7 minutes. The narrower question — what `commitGuarded`'s etcd call does under a sustained partition while the daemon is *still alive* — was never directly answered and is recorded as still-open rather than claimed as verified.
+**Finding 2 (write hang) — symptom resolved, root cause still open.** With the watchdog firing, the daemon is gone before a write can hang on it, and the probe now fails in under a second (rc=1) rather than blocking past 7 minutes. But the original explanation in finding 2 was wrong, and tracing it produced finding 5: the hang was in `lockInode`'s unbounded-context `GrantLease`, not in `commitGuarded`, which the write never reached. The self-fence bounds the symptom by killing the process; the unbounded context that allows a FUSE request to block indefinitely is untouched and is now tracked in `docs/TODO-hardening.md` § 11.
+
+What `commitGuarded` itself does under a sustained partition remains genuinely untested — not because it might hang (it is bounded to ~6s by `retryEtcd`) but because no run ever reached it in that state, so whether it returns `ErrFenced` or a plain timeout error is unknown.
 
 **Finding 3 (AWS test-harness bug) — fixed.** Partitioning now uses iptables DROP rules rather than a security-group swap. Two things were required, both verified on a throwaway AL2023 instance rather than assumed: stock Amazon Linux 2023 ships **neither** `iptables` nor `nft` (this was the cause of a silent `ERR:1` on the first iptables attempt — `runcmd` discards stderr, so the reason was invisible until stderr capture was added), so the script installs `iptables`/`iptables-nft` first; and the partition is now *verified* to have taken effect before the scenario proceeds instead of being assumed. That verification step is what caught the failure rather than letting it read as a product bug a second time.
 
