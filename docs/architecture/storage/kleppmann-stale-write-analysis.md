@@ -22,14 +22,37 @@ The standard remedy is a fencing token: a monotonically increasing number handed
 
 On a traditional SAN the resource does enforce it. SCSI-3 Persistent Reservations let the array itself reject a write whose reservation key has been preempted, so a partitioned node's I/O is discarded at the disk regardless of what that node believes.
 
-EBS Multi-Attach offers no equivalent. There is no mechanism to attach a token to a raw block write and have the service reject it when the token is stale. Every attached instance can write every sector at any time. Whatever fencing EtcFS performs is therefore, by construction, performed somewhere other than the resource — and Kleppmann's argument applies with full force to any design that assumes otherwise.
+> **Correction, 2026-08-05:** the claim that follows — that EBS Multi-Attach
+> has no equivalent — is out of date. Multi-Attach `io2` volumes support the
+> full NVMe reservation command set (Register/Acquire/Release/Report,
+> including Write Exclusive – All Registrants) since 2023-09-18. This *is*
+> a resource-side fencing token, spiked and confirmed working against a real
+> io2 volume: a preempted node's `O_DIRECT` write fails synchronously at
+> `write()` with `EBADE`, zero bytes reaching the device, while other
+> registrants keep writing. See `docs/TODO-hardening.md` § 9 for the spike
+> detail and what adopting it would change. The rest of this document was
+> written before that finding and its analysis has not yet been revised to
+> account for it — the "already neutralises via unreachability" argument
+> below is still accurate for the *current, unmodified* implementation
+> (nothing in the code has changed yet), but it describes a workaround for a
+> problem that has a real, direct fix available. Treat everything below as
+> "true of the code as it stands today," not as "the best available design."
 
-Two consequences follow, and both are true of EtcFS today:
+EBS Multi-Attach's raw block interface offers no equivalent *by default* —
+in the running system today, there is no mechanism attached to a raw block
+write that rejects it when the writer's token is stale. Every attached
+instance can write every sector at any time. Whatever fencing EtcFS
+currently performs is, by construction, performed somewhere other than the
+resource — and Kleppmann's argument applies with full force to the design as
+it stands, even though the correction above means it no longer has to.
+
+Two consequences follow, and both are true of EtcFS's *current* fencing path
+(pre-`pkg/nvmeresv`):
 
 - **Self-fencing is advisory.** The watchdog (`pkg/fencing/watchdog.go`) calls `os.Exit(77)` when its lease is beyond the grace period. Process death does not cancel writes already handed to the kernel or in flight to EBS.
-- **External fencing does not touch the data path.** The controller (`pkg/fencing/controller.go`) bumps `gen:<node_id>` in etcd on membership expiry. It does not call `DetachVolume`, and even if it did, that call is asynchronous with no documented hard bound on when residual I/O ceases.
+- **External fencing confirms detach before bumping the generation, but detach itself is not synchronous.** The controller (`pkg/fencing/controller.go`) calls `DetachVolume` and polls until confirmed before bumping `gen:<node_id>` — but `DetachVolume` is asynchronous with no documented hard bound on when residual I/O ceases, which is why the poll-then-confirm step exists at all. A synchronous, device-enforced preempt (§ 9) would remove the need for that polling window entirely.
 
-So EtcFS cannot prevent a fenced node from putting bytes on the volume. Any safety claim has to survive that fact rather than assume it away.
+So, as implemented today, EtcFS cannot prevent a fenced node from putting bytes on the volume before a detach is confirmed. Everything below is the argument for why that's survivable anyway — not a claim that it's the only option going forward.
 
 ## What EtcFS Already Neutralises
 
@@ -94,7 +117,7 @@ Note that arena ID 0 is valid — the counter starts there — so a present reco
 
 Closing the allocator channel does not close the class. The following remain, ordered by how directly they can produce two owners of one range:
 
-**`RebalanceArena` transfers ownership with no guard.** `pkg/membership/membership.go` deletes `arena:<from>` and writes `arena:<to>` with no generation guard, no lease, and no drain of the source node's in-flight writes. It has only test callers today. If it acquires a production caller, it is a direct reintroduction of the hazard — and the one place where a grace period genuinely would be required, because the source node may have writes in flight to a range that now belongs to someone else.
+**`RebalanceArena` now requires the source to be fenced.** `pkg/membership/membership.go`'s `RebalanceArena` used to delete `arena:<from>` and write `arena:<to>` as two unguarded calls with no generation check. It now refuses to move an arena away from a node whose fencing generation is still 0, and performs the move as a single atomic `Txn`. This closes the case of moving an arena away from a *live, healthy* node — the one this section originally flagged as unclosable by any guard. It does **not** close invariant 4 below: a generation bump is a real signal (the source can no longer commit metadata), but it is not proof the source's kernel has stopped issuing writes to the block device — the grace-period argument that invariant demands still has no implementation. `RebalanceArena` still has only test callers; see `docs/TODO-hardening.md` § 8 for whether it should ever get a production one.
 
 **`free_arena:` is written but never consumed.** Reuse is currently impossible, which is why arena space leaks on graceful leave. Any future reclamation path must treat a freed arena as unsafe to reissue until the previous owner is known to have no in-flight I/O to it — which, per the first section, cannot be established from etcd state alone.
 

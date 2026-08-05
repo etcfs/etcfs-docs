@@ -67,7 +67,7 @@ Most of the data path is insulated from this by `retryEtcd`, which discards the 
 - **`lockInode`** (`retry.go:80`) uses the bare `retry(...)` helper with the caller's context instead of `retryEtcd`. It is the first etcd operation in both the read and write paths (`datapath.go:97` and `:240`), so it is exactly where a partitioned node's I/O stalls — before any generation guard is consulted.
 - **35 direct `s.store.*(ctx, …)` calls** across `handlers.go` (28) and `datapath.go` (7) pass the unbounded context straight through with no retry or timeout wrapper at all.
 
-The self-fencing fix bounds the *observable* symptom, because the daemon now exits at 2–3× TTL and takes the blocked request with it. It does not fix the underlying issue: a FUSE request can still block for the full self-fence window, and during a transient stall that never trips the watchdog (a leader election, a brief network blip) it can block for as long as that stall lasts. Recorded in `docs/TODO-hardening.md` § 11 rather than fixed here — deciding the right deadline per operation class is a design question, not a mechanical change.
+The self-fencing fix bounds the *observable* symptom, because the daemon now exits at 2–3× TTL and takes the blocked request with it. It does not fix the underlying issue: a FUSE request can still block for the full self-fence window, and during a transient stall that never trips the watchdog (a leader election, a brief network blip) it can block for as long as that stall lasts. Recorded in `docs/TODO-hardening.md` § 7 rather than fixed here — deciding the right deadline per operation class is a design question, not a mechanical change.
 
 ## Resolution
 
@@ -75,7 +75,7 @@ Three of the four findings were fixed after the initial run. Untangling them too
 
 **Finding 1 (product bug) — fixed.** `Membership.IsAlive()` now requires the last successful keepalive to be within the lease TTL, not just that the `alive` flag was never cleared. The lease TTL is the correct threshold because it is exactly when etcd expires the lease server-side; the client renews at roughly TTL/3, so a healthy node keeps ~3x margin and ordinary jitter cannot trip it. Regression test in `pkg/metadata/membership_test.go`, confirmed to fail against the old implementation. Directly verified on a partitioned Docker node: meta daemon exits 77 with `dead_for=22.98s`, where previously it ran indefinitely.
 
-**Finding 2 (write hang) — symptom resolved, root cause still open.** With the watchdog firing, the daemon is gone before a write can hang on it, and the probe now fails in under a second (rc=1) rather than blocking past 7 minutes. But the original explanation in finding 2 was wrong, and tracing it produced finding 5: the hang was in `lockInode`'s unbounded-context `GrantLease`, not in `commitGuarded`, which the write never reached. The self-fence bounds the symptom by killing the process; the unbounded context that allows a FUSE request to block indefinitely is untouched and is now tracked in `docs/TODO-hardening.md` § 11.
+**Finding 2 (write hang) — symptom resolved, root cause still open.** With the watchdog firing, the daemon is gone before a write can hang on it, and the probe now fails in under a second (rc=1) rather than blocking past 7 minutes. But the original explanation in finding 2 was wrong, and tracing it produced finding 5: the hang was in `lockInode`'s unbounded-context `GrantLease`, not in `commitGuarded`, which the write never reached. The self-fence bounds the symptom by killing the process; the unbounded context that allows a FUSE request to block indefinitely is untouched and is now tracked in `docs/TODO-hardening.md` § 7.
 
 What `commitGuarded` itself does under a sustained partition remains genuinely untested — not because it might hang (it is bounded to ~6s by `retryEtcd`) but because no run ever reached it in that state, so whether it returns `ErrFenced` or a plain timeout error is unknown.
 
@@ -83,7 +83,7 @@ What `commitGuarded` itself does under a sustained partition remains genuinely u
 
 **A wrong assertion in this scenario, worth recording separately.** Even after the watchdog fix, FJ2 kept reporting the self-fence as failed. The check was `is /mnt/etcfuse still in /proc/mounts` — but self-fencing is `os.Exit(77)` in the *Go meta daemon*, while the *C FUSE daemon* is a separate process that keeps the mount listed after its peer dies. Measured directly: meta exits 77 at t+20s while the mount is still present at t+41s and beyond. Operations on that mount do correctly fail, but mount presence was simply never a test of whether the fence fired. The assertion now watches the meta daemon and checks for exit code 77 specifically. This is a good illustration of why a failing chaos assertion has to be traced to a mechanism before it is believed — the first two runs of this scenario were reporting a real bug, the next two were reporting a bad test.
 
-**Finding 4 (arena release) — unchanged**, still a real gap, recorded in `docs/TODO-hardening.md` § 9.
+**Finding 4 (arena release) — unchanged**, still a real gap, recorded in `docs/TODO-hardening.md` § 6.
 
 ### Post-fix results
 

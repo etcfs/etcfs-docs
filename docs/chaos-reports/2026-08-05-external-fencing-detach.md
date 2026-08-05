@@ -4,7 +4,7 @@ Date: 2026-08-05.
 
 ## Summary
 
-TODO-hardening.md item 7 documented a doc/code mismatch: several docs described external fencing as detach-then-confirm-then-bump, but `pkg/fencing/controller.go` bumped the generation on lease expiry alone, with zero AWS SDK usage anywhere in the package. This implements the documented behavior for real: `ec2:DetachVolume` + polled `ec2:DescribeVolumes` confirmation, generation bumped only once the detach is confirmed. Falls back to the previous single-signal behavior when no detacher is configured (Docker, bare metal, or a node with no instance ID recorded).
+Several docs described external fencing as detach-then-confirm-then-bump, but `pkg/fencing/controller.go` bumped the generation on lease expiry alone, with zero AWS SDK usage anywhere in the package. This implements the documented behavior for real: `ec2:DetachVolume` + polled `ec2:DescribeVolumes` confirmation, generation bumped only once the detach is confirmed. Falls back to the previous single-signal behavior when no detacher is configured (Docker, bare metal, or a node with no instance ID recorded).
 
 New permanent IAM role `etcfs-nodes` (created once via `scripts/infra/fencing-iam.sh`, reused by every cluster `create-infra.sh` provisions — not per-run, not torn down) grants exactly what a node needs: `DetachVolume`/`AttachVolume` scoped to volume+instance ARNs, and `Describe{Volumes,VolumeStatus,Instances,Tags}` (unavoidably unscoped — AWS does not support resource-level permissions for these Describe actions).
 

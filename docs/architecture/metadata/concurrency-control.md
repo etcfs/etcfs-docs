@@ -33,14 +33,14 @@ This design eliminates directory-level lock contention entirely. The only serial
 
 In both cases, if the CAS comparison fails, the lock acquisition fails with `ErrConflict`. The caller can retry (with backoff) or report the conflict to the application.
 
-The lock is bound to an etcd lease with a configurable TTL (default 5 seconds). The method returns a keepalive channel that the holder must continuously consume. A separate goroutine drains this channel; as long as the goroutine is running and the etcd connection is healthy, the lock stays held.
+The lock is bound to an etcd lease. The production data path (`internal/ipc/datapath.go`, both the read and write handlers) calls this with a fixed 2-second TTL (`inodeLockTTL` in `internal/ipc/retry.go`) — not a configurable default; every caller of `AcquireLock` in the running system passes the same constant. The method returns a keepalive channel that the holder must continuously consume. A separate goroutine drains this channel; as long as the goroutine is running and the etcd connection is healthy, the lock stays held.
 
 ## Lease-Backed Expiry
 
 This is the core safety mechanism. When the lock-holding node crashes or is partitioned from etcd:
 
 1. The keepalive goroutine stops consuming (or cannot reach etcd).
-2. After the lease TTL expires (5 seconds), etcd automatically deletes the `lock:<ino>` key.
+2. After the lease TTL expires (2 seconds), etcd automatically deletes the `lock:<ino>` key.
 3. Any other node watching the lock key receives a DELETE event.
 4. The watching node can then attempt to acquire the lock.
 
@@ -50,7 +50,7 @@ The lease mechanism is fundamentally safer than a "release on crash" protocol be
 
 `ReleaseLock` explicitly revokes the lease backing the lock. Etcd deletes the lock key immediately. Any watchers receive a DELETE event. This is used for clean lock release during normal operation (close(), munlock(), process exit).
 
-There is no explicit "unlock" key operation — the lease revocation is sufficient. The lease TTL provides an upper bound on how long a lock can remain held after a crash (5 seconds + 2× margin for the self-fencing watchdog, default ~10 seconds).
+There is no explicit "unlock" key operation — the lease revocation is sufficient. The lock's own TTL (2 seconds) provides an upper bound on how long the lock itself can remain held after a crash. That is a different figure from the self-fencing watchdog's window: the watchdog gates on the node's *membership* lease (`gen:<node>`/`membership:<node>`, TTL configured separately via `--lease-ttl`, default 10 seconds — see `internal/config/config.go`) and fires at 2–3× that TTL, not the lock TTL. The two leases are independent and not proportional to each other; conflating them here previously understated the actual self-fence window by describing it as derived from the lock's 5-second TTL, a value that was itself wrong.
 
 ## Lock Watching
 
