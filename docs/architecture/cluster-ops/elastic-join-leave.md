@@ -7,7 +7,7 @@ The protocol by which nodes join and leave the EtcFS cluster without disrupting 
 - [Cluster Membership Model](#cluster-membership-model)
 - [Join Protocol](#join-protocol)
 - [Arena Acquisition on Join](#arena-acquisition-on-join)
-- [Inode Range Reservation](#inode-range-reservation)
+- [Inode allocation](#inode-allocation)
 - [Graceful Leave](#graceful-leave)
 - [Ungraceful Leave](#ungraceful-leave)
 - [Arena Rebalancing](#arena-rebalancing)
@@ -19,12 +19,9 @@ The protocol by which nodes join and leave the EtcFS cluster without disrupting 
 
 A node's membership in the EtcFS cluster is represented by a `membership:<node_id>` key in etcd. The key exists while the node is alive and participating. The fencing controller watches all membership keys and fences any node whose key expires.
 
-Each node requires two resources to operate:
+Each node requires one resource to operate: **an arena** — a 1 GiB contiguous disk range for block allocation, acquired from a global pool via a CAS transaction. It is acquired lazily, on the node's first write, not at join time.
 
-1. **An arena** — a 1 GiB contiguous disk range for block allocation.
-2. **An inode range** — a contiguous block of inode numbers for file creation.
-
-Both resources are acquired from global pools via CAS transactions. A node that has not acquired either resource is not fully functional — it can read the namespace but cannot create or modify files.
+Inode numbers are **not** a per-node resource. They are drawn one at a time from a single global counter (`inode_alloc_counter`) on every file creation. See [Inode allocation](#inode-allocation).
 
 ## Join Protocol
 
@@ -72,35 +69,52 @@ The CAS on the counter ensures at-most-once allocation per arena ID. If two node
 
 The arena's disk range is computed from the arena ID: `DiskStart = ID * ArenaSizeBytes`, `DiskEnd = (ID + 1) * ArenaSizeBytes`. The new node's block allocations are confined to this range until it acquires additional arenas.
 
-## Inode Range Reservation
+## Inode allocation
 
-`ReserveInodeRange` reserves a contiguous block of inode numbers for the node. The protocol uses the same CAS pattern as arena acquisition, but on the `inode_alloc_counter` key:
+There is no per-node inode range. Every file creation calls `Service.allocInode`
+(`internal/ipc/handlers.go`), which does a single CAS-retried increment of the
+global `inode_alloc_counter` key:
 
 ```
-ReserveInodeRange(nodeID, base, count):
-  key = "inode_alloc_counter"
-  for attempt in 0..4:
+NextCounter(key="inode_alloc_counter", floor=FirstUsableIno):
+  for attempt in 0..19:
     current = Get(key) ?? 0
-    next = current + count
-    if current == 0:
-      cmp = CreateRevision(key) == 0
-    else:
-      cmp = Value(key) == EncodeUint64(current)
+    reserved = max(current, floor)
     Txn:
-      If cmp:
-        Put(key, EncodeUint64(next))
-        Put("inode_range:<nodeID>", "{base+current},{base+next-1}")
-        return success
+      If (key unchanged since the read):
+        Put(key, reserved+1)
+        return reserved
       Else:
-        retry
-  return EIO
+        sleep(backoff + jitter); retry
+  return error
 ```
 
-The node's inode range is `[base + current, base + next - 1]`. The `base` parameter is typically 0 (the global counter starts from 0), but can be set to a non-zero value for cluster-specific partitioning schemes.
+The `floor` is `FirstUsableIno = 2`, and it is load-bearing rather than cosmetic:
+inode 0 is not a valid inode and inode 1 is `FUSE_ROOT_ID`, the root directory
+that `seed-etcd` writes and the C daemon answers for locally. Handing out inode 1
+overwrites the root inode record and makes the entire mount return `EIO` — this
+was a real defect, found and fixed on 2026-07-30 (see
+[the chaos report](../../chaos-reports/2026-07-30-fresh-cluster-per-scenario.md)).
 
-When a node's current inode range is exhausted (all numbers have been assigned), the node calls `ReserveInodeRange` again to reserve a new block. There is no limit on how many blocks a node can reserve — the global 64-bit counter supports up to 2^64 total inode numbers, which is sufficient for any practical filesystem.
+The retry budget (20 attempts, exponential backoff *with jitter*) is also
+deliberate. Without jitter, callers that lose a race tend to restart in lockstep
+and collide again on the same tick; 16 concurrent callers once exhausted an
+8-attempt budget with only 9 successes. See the comment on `NextCounter` in
+`pkg/metadata/alloc.go`.
 
-The reserved range is stored in `inode_range:<node_id>` for diagnostic purposes. The `InodeRange` query returns the lower and upper bounds of the most recent reservation.
+**Cost and scaling.** This is one etcd round trip per file creation, from every
+node, against one key. Unlike arena allocation it does not shard, so contention
+grows with node count. That is an accepted tradeoff at current scale, not an
+oversight — but it is the structure most likely to need reworking first if
+metadata-creation throughput becomes a target. A per-node-range scheme mirroring
+the arena allocator is the obvious direction; see
+[Possible future extensions](#possible-future-extensions) below.
+
+An earlier iteration of this document described exactly that range-based scheme
+as though it were implemented. It was not: `ReserveInodeRange`/`InodeRange`
+existed in `pkg/membership` but had no caller outside the test harness, and
+`pkg/membership.Manager` itself is never constructed in production. That dead
+code has been removed rather than left to read as live.
 
 ## Graceful Leave
 
@@ -184,12 +198,12 @@ The membership subsystem interacts with fencing at three points:
 
 ## Interaction with the Scrubber
 
-The scrubber cross-checks extents against all nodes' arenas and inode ranges:
+The scrubber cross-checks extents against all nodes' arenas:
 
 - **Arena cross-check.** An extent's `disk_off` must fall within some node's arena range. If an extent references a disk range that no arena claims, the scrubber reports a range violation.
 
-- **Inode range cross-check.** An inode number must fall within some node's reserved inode range. If an inode number was never reserved (no `inode_range:<node_id>` key contains that range), the inode may have been created by a node whose range was exhausted — this is expected if the node reserved additional ranges, but if no range covers it, the inode is outside the intended allocation scheme.
-
 - **Orphan detection on arena release.** When an arena is released (node leaves, arena rebalanced), the scrubber checks that all extents within that arena either belong to valid inodes or are properly orphaned. An arena whose extents are not properly referenced by inodes is a candidate for reclamation.
+
+There is deliberately no inode cross-check. An earlier version of this document described one — "an inode number must fall within some node's reserved inode range" — but it was never implemented in `pkg/fsck` or `pkg/scrub`, and it could not be: no per-node inode ranges exist to check against. With a single global counter, the only invariant available is that inode numbers are unique and ≥ `FirstUsableIno`, which the allocator's CAS already guarantees at issue time. If per-node ranges are ever adopted, this check becomes both meaningful and worth building.
 
 The scrubber does not prevent nodes from joining or leaving — it only verifies that the metadata remains consistent after the fact.
