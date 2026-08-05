@@ -75,6 +75,7 @@ nav:
       - Namespace Fencing Guard (2026-08-04): chaos-reports/2026-08-04-namespace-fencing-guard.md
       - Concurrent Scale-Out (2026-08-04): chaos-reports/2026-08-04-concurrent-scale-out.md
       - Fault Injection During Join/Leave (2026-08-05): chaos-reports/2026-08-05-fault-injection-during-join-leave.md
+      - Dual-Confirmed External Fencing (2026-08-05): chaos-reports/2026-08-05-external-fencing-detach.md
   - Research:
       - etcd/Raft Internals: etcd_raft_research.md
       - Cluster Filesystem Survey: research/cluster-fs-survey.md
