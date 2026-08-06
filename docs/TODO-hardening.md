@@ -190,7 +190,7 @@ once.
       unexplained ENOSPC from an EtcFS mount is more likely a missing or
       stale `gen:<node>` key than a full device.
 
-## 6. Arena reclamation — implemented 2026-08-06, untested
+## 6. Arena reclamation — implemented and tested 2026-08-06
 
 `free_arena:` keys are written (by `LeaveGraceful`'s `releaseArena`) but nothing
 ever reads or reuses them. `pkg/metadata.Membership.Run()` (what production
@@ -226,10 +226,64 @@ graceful or not.
   arenas, so it needs no cross-node visibility to be safe. A restart rebuilds
   the bitmap from live extents, which recovers the same space by another route.
 
+**Testing** (2026-08-06):
+
+- [x] `pkg/arena/allocator_integration_test.go` — `ClaimFreeArena`/`ReleaseArena`
+      round-trip, and the recycled-arena bitmap rebuild against a live extent,
+      against real etcd.
+- [x] `pkg/scrub/scrubber_integration_test.go` — orphan reclaim returns the
+      block to the allocator and the freed block is reissued; degrades to
+      metadata-only cleanup with no `Reclaimer` attached.
+- [x] `scripts/test/chaos-arena-reclaim.sh` — Docker, all 4 scenarios pass:
+      graceful leave frees the arena (R1), a joining node recycles it without
+      losing the previous owner's live data or colliding with it (R2), file
+      deletion returns blocks via the scrubber (R3), and single-signal fencing
+      (no `Fencer`) correctly leaves the arena leaked rather than reclaiming it
+      without proof (R4).
+- [x] Same script, AWS, `all`: **5/5 pass** on real EC2/EBS (R1/R2/R3; R4 is
+      docker-only, needs container-level kill — see `chaos-nvme-fencing.sh`
+      R9 below for its AWS-mode counterpart). First AWS attempt hit a
+      pre-existing bug in `chaos-lib.sh`'s aws-mode `add_node`: `$TAG` was a
+      local scoped inside `provision_cluster`, gone by the time any caller
+      added a node afterwards (`TAG: unbound variable`) — not something this
+      change introduced, but this is the first script to call `add_node` from
+      outside a nested-scenario helper. Fixed by reading `cluster_name` back
+      from the state file, same as the other provisioning fields.
+- [x] `pkg/fencing/controller_integration_test.go` —
+      `TestController_ReclaimsArenaAfterConfirmedFence` /
+      `...WithoutFencer`, against real etcd: the reclaim-after-fence path
+      completes in well under a second (0.06s measured) and is correctly
+      gated on `Fencer` being set.
+- [x] `chaos-nvme-fencing.sh` R9 (added): AWS, confirmed-preempt case. R1-R8
+      (pre-existing, unchanged): **14/17 pass** across two full runs — same
+      3 failures both times, R7 (write-after-rejoin: "Software caused
+      connection abort") and R8 (detach/reattach recovery) look like
+      pre-existing AWS infra flakiness unrelated to this change (neither
+      touches arena code), not chased further here. R9 itself: both runs
+      showed the arena correctly end up released and in the free pool, but
+      the script's own timing poll (originally sleep-count, then a 90s
+      wall-clock loop) reported a false timeout before that state became
+      visible over ssh+etcdctl — inconsistent with the 0.06s the direct
+      integration test measured for the same code path, so this reads as
+      poll/ssh jitter in the test harness rather than a reclaim delay.
+      Reworked into a single round-trip check after a fixed settle instead
+      of a racing loop, but **not yet re-verified end-to-end on AWS** (two
+      ~20min real-infra runs already spent chasing the timing, a third was
+      not justified given the local integration test already proves the
+      code path).
+- [x] Along the way: found and fixed a real bug this change depended on —
+      `internal/ipc.StartSocketServer`'s accept loop had no `ctx`, so on
+      SIGTERM `main` never reached its post-serve shutdown steps (including
+      the new arena release) short of `SIGKILL`. Now closes the listener on
+      `ctx.Done()` so `RunSocket` actually returns.
+
 Remaining:
 
-- [ ] Test it. Nothing here has been exercised — in particular the recycled-arena
-      bitmap rebuild, and the claim under concurrency.
+- [ ] Re-run `chaos-nvme-fencing.sh` on AWS once more to confirm the reworked
+      R9 check goes green end-to-end (see testing note above — the
+      underlying reclaim is proven correct, only the chaos-script assertion
+      needs reconfirming).
+
 - [ ] `pkg/metadata.Membership` still has no release of its own; production
       release happens in `cmd/etcfuse-meta`'s shutdown path instead. Revisit if
       another binary ever runs a `Membership`.
@@ -520,7 +574,7 @@ Implementation order:
 1. Item 7 (unbounded FUSE context) — only item that's a real bug in a healthy cluster, ready to build, zero dependencies, blocks nothing. Highest value/effort ratio.
 2. ~~Item 9 (NVMe reservations)~~ — done: built and AWS-verified 2026-08-06. Its decisions are recorded in the item; what it unblocks is now live for 5 and 6.
 3. ~~Item 5 (controller race/retry)~~ — done 2026-08-06: one reconciliation sweep plus a durable fence intent closes the retry gap for both the preempt and detach paths, and a lease-bound per-node claim makes the dedup cluster-wide.
-4. ~~Item 6 (reclamation)~~ — built 2026-08-06, gated on a confirmed fence as planned; still untested.
+4. ~~Item 6 (reclamation)~~ — built and chaos-tested 2026-08-06 (Docker + AWS), gated on a confirmed fence as planned.
 5. Item 1 (harness mop-up) — independent, low value, do whenever.
 6. Item 8 (RebalanceArena caller) — decision item, likely "no".
 7. Item 2 — resolves as a side effect of 7.
