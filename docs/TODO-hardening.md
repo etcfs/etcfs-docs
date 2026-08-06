@@ -248,58 +248,73 @@ graceful or not.
       added a node afterwards (`TAG: unbound variable`) — not something this
       change introduced, but this is the first script to call `add_node` from
       outside a nested-scenario helper. Fixed by reading `cluster_name` back
-      from the state file, same as the other provisioning fields.
+      from the state file, same as the other provisioning fields. Reconfirmed
+      5/5 in a final rerun after the `chaos-lib.sh` fixes below landed.
 - [x] `pkg/fencing/controller_integration_test.go` —
       `TestController_ReclaimsArenaAfterConfirmedFence` /
       `...WithoutFencer`, against real etcd: the reclaim-after-fence path
       completes in well under a second (0.06s measured) and is correctly
       gated on `Fencer` being set.
-- [x] `chaos-nvme-fencing.sh` R9 (added): AWS, confirmed-preempt case. R1-R8
-      (pre-existing) scored 14/17 across two runs, same 3 failures both
-      times — root-caused, not just retried past:
-      - **R7** (write-after-rejoin: "Software caused connection abort"):
-        `chaos-lib.sh`'s `restart_daemons` never killed the previous
+- [x] `chaos-nvme-fencing.sh` R9 (added), plus R1-R8 (pre-existing):
+      **17/17 pass on AWS**, confirmed in a clean final run after
+      root-causing and fixing every failure seen along the way (five AWS
+      runs total for this scenario; none of the fixes below were accepted on
+      a guess — each was confirmed either by a clean subsequent run or, for
+      R9, a fast deterministic local check):
+      - **R7** (write-after-rejoin: "Software caused connection abort", then
+        after the first fix, mount timeout): two separate bugs stacked here.
+        (1) `chaos-lib.sh`'s `restart_daemons` never killed the previous
         `etcfuse-meta`/`etcfuse` processes or unmounted before starting new
-        ones. n1 in this scenario is only network-partitioned (iptables),
+        ones — n1 in this scenario is only network-partitioned (iptables),
         never killed, so its old daemons are still alive when
-        `restart_daemons` runs: a second pair starts on top of the
-        still-mounted FUSE mountpoint, the readiness check (`mountpoint -q`)
-        is satisfied by the stale old mount, and the kernel FUSE session ends
-        up bound to an orphaned connection. Fixed: `restart_daemons` now
-        kills stale daemons and lazily unmounts first, matching the pattern
-        `provision_cluster`'s own initial-boot block already used.
+        `restart_daemons` runs, a second pair starts on top of the
+        still-mounted FUSE mountpoint, `mountpoint -q` is satisfied by the
+        stale old mount, and the kernel FUSE session ends up bound to an
+        orphaned connection. Fixed by killing stale daemons and unmounting
+        first. (2) With that fixed, captured full meta.log/fuse.log on the
+        next failure and found the real timing bug: n1's own etcd needs time
+        to rejoin raft and ride out a leader election right after the
+        partition heals (~15s of `DeadlineExceeded`/leader-changed retries,
+        observed directly), but the socket-wait loop only waited 10s and
+        then started the FUSE client **unconditionally** — `etcfuse` has no
+        retry on a failed connect (production relies on systemd's
+        `Restart=on-failure` for that; confirmed present in
+        `setup-compute.sh`'s unit, so this is a raw-nohup-harness-only gap,
+        not a production one), so it connected to a socket that didn't exist
+        yet and exited for good. Fixed by gating the FUSE-client start on the
+        socket actually existing (40s budget) instead of starting it
+        regardless.
       - **R8** (detach/reattach recovery): every AWS chaos script hardcoded
         `--block-device=/dev/nvme1n1`, but AWS Nitro's guest-side NVMe
-        enumeration is not stable across a detach/reattach — confirmed this
-        is a real gap, not just a test artifact, and filed as **item 10**
-        with the production-code half. Chaos-script half fixed here:
+        enumeration is not stable across a detach/reattach. Confirmed this
+        **is** a real gap and not just a test artifact — `pkg/blockio.Open`
+        takes a literal path with no re-resolution either — and filed the
+        production-code half as **item 10**. Chaos-script half fixed here:
         `restart_daemons` now resolves the device by EBS serial before
-        restarting, reusing the matching logic `scripts/infra/state.sh`
-        already had (`detect_ebs_dev`) but that nothing called.
-      - Both fixes are in `chaos-lib.sh`/`chaos-test.sh` only; **not yet
-        re-run end-to-end on AWS** to confirm 17/17 (three ~15-20min
-        real-infra runs already spent on this item; re-verifying is the
-        immediate next step, not a "maybe").
-      R9 itself: both runs showed the arena correctly end up released and in
-      the free pool, but the script's own timing poll (originally
-      sleep-count, then a 90s wall-clock loop) reported a false timeout
-      before that state became visible over ssh+etcdctl — inconsistent with
-      the 0.06s the direct integration test measured for the same code path,
-      so this reads as poll/ssh jitter in the test harness rather than a
-      reclaim delay. Reworked into a single round-trip check after a fixed
-      settle instead of a racing loop; needs the same re-run to confirm.
+        restarting, reusing matching logic `scripts/infra/state.sh` already
+        had (`detect_ebs_dev`) but that nothing called.
+      - **R9** itself: two runs showed the arena correctly end up released
+        and in the free pool, but the script's own timing poll (originally
+        sleep-count, then a 90s wall-clock loop) reported a false timeout
+        before that state became visible over ssh+etcdctl — inconsistent
+        with the 0.06s a direct local integration test measured for the same
+        code path. Reworked into a single round-trip check after a fixed
+        settle; passed cleanly (~11s) once R7/R8 stopped disrupting the run.
+      - Also found and fixed, unrelated to any specific R#: `destroy-infra.sh`
+        only terminates instances present in the state file's
+        `compute_instance_ids`, which is fixed at `create-infra.sh` time and
+        never updated when `add_node` launches more — any scenario that adds
+        a node and doesn't explicitly remove it before teardown leaks it,
+        still billing. Caught two live leaks this way (one from this run,
+        one from an earlier session) and terminated them manually. Fixed
+        with a tag-based sweep (`ClusterName`) so teardown catches every
+        instance belonging to the cluster, not just the ones on the original
+        list.
 - [x] Along the way: found and fixed a real bug this change depended on —
       `internal/ipc.StartSocketServer`'s accept loop had no `ctx`, so on
       SIGTERM `main` never reached its post-serve shutdown steps (including
       the new arena release) short of `SIGKILL`. Now closes the listener on
       `ctx.Done()` so `RunSocket` actually returns.
-
-Remaining:
-
-- [ ] Re-run `chaos-nvme-fencing.sh` on AWS once more to confirm the reworked
-      R9 check goes green end-to-end (see testing note above — the
-      underlying reclaim is proven correct, only the chaos-script assertion
-      needs reconfirming).
 
 - [ ] `pkg/metadata.Membership` still has no release of its own; production
       release happens in `cmd/etcfuse-meta`'s shutdown path instead. Revisit if
