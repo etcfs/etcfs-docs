@@ -255,22 +255,39 @@ graceful or not.
       completes in well under a second (0.06s measured) and is correctly
       gated on `Fencer` being set.
 - [x] `chaos-nvme-fencing.sh` R9 (added): AWS, confirmed-preempt case. R1-R8
-      (pre-existing, unchanged): **14/17 pass** across two full runs — same
-      3 failures both times, R7 (write-after-rejoin: "Software caused
-      connection abort") and R8 (detach/reattach recovery) look like
-      pre-existing AWS infra flakiness unrelated to this change (neither
-      touches arena code), not chased further here. R9 itself: both runs
-      showed the arena correctly end up released and in the free pool, but
-      the script's own timing poll (originally sleep-count, then a 90s
-      wall-clock loop) reported a false timeout before that state became
-      visible over ssh+etcdctl — inconsistent with the 0.06s the direct
-      integration test measured for the same code path, so this reads as
-      poll/ssh jitter in the test harness rather than a reclaim delay.
-      Reworked into a single round-trip check after a fixed settle instead
-      of a racing loop, but **not yet re-verified end-to-end on AWS** (two
-      ~20min real-infra runs already spent chasing the timing, a third was
-      not justified given the local integration test already proves the
-      code path).
+      (pre-existing) scored 14/17 across two runs, same 3 failures both
+      times — root-caused, not just retried past:
+      - **R7** (write-after-rejoin: "Software caused connection abort"):
+        `chaos-lib.sh`'s `restart_daemons` never killed the previous
+        `etcfuse-meta`/`etcfuse` processes or unmounted before starting new
+        ones. n1 in this scenario is only network-partitioned (iptables),
+        never killed, so its old daemons are still alive when
+        `restart_daemons` runs: a second pair starts on top of the
+        still-mounted FUSE mountpoint, the readiness check (`mountpoint -q`)
+        is satisfied by the stale old mount, and the kernel FUSE session ends
+        up bound to an orphaned connection. Fixed: `restart_daemons` now
+        kills stale daemons and lazily unmounts first, matching the pattern
+        `provision_cluster`'s own initial-boot block already used.
+      - **R8** (detach/reattach recovery): every AWS chaos script hardcoded
+        `--block-device=/dev/nvme1n1`, but AWS Nitro's guest-side NVMe
+        enumeration is not stable across a detach/reattach — confirmed this
+        is a real gap, not just a test artifact, and filed as **item 10**
+        with the production-code half. Chaos-script half fixed here:
+        `restart_daemons` now resolves the device by EBS serial before
+        restarting, reusing the matching logic `scripts/infra/state.sh`
+        already had (`detect_ebs_dev`) but that nothing called.
+      - Both fixes are in `chaos-lib.sh`/`chaos-test.sh` only; **not yet
+        re-run end-to-end on AWS** to confirm 17/17 (three ~15-20min
+        real-infra runs already spent on this item; re-verifying is the
+        immediate next step, not a "maybe").
+      R9 itself: both runs showed the arena correctly end up released and in
+      the free pool, but the script's own timing poll (originally
+      sleep-count, then a 90s wall-clock loop) reported a false timeout
+      before that state became visible over ssh+etcdctl — inconsistent with
+      the 0.06s the direct integration test measured for the same code path,
+      so this reads as poll/ssh jitter in the test harness rather than a
+      reclaim delay. Reworked into a single round-trip check after a fixed
+      settle instead of a racing loop; needs the same re-run to confirm.
 - [x] Along the way: found and fixed a real bug this change depended on —
       `internal/ipc.StartSocketServer`'s accept loop had no `ctx`, so on
       SIGTERM `main` never reached its post-serve shutdown steps (including
@@ -564,6 +581,50 @@ t3.medium, 2026-08-05, infra fully torn down after):**
       watch, not from the severance mechanism. A reconciliation sweep would
       close it for both implementations at once, which is an argument for
       solving it in item 5 rather than duplicating it here.
+
+## 10. `--block-device` path is not stable across an EBS detach/reattach cycle
+
+Found root-causing an AWS chaos-test failure in item 6/9's R8 scenario
+(`chaos-nvme-fencing.sh`, detach `n3`'s volume, reattach, restart, confirm
+recovery) — not a test artifact, a real operational gap.
+
+`cmd/etcfuse-meta --block-device=<path>` takes a literal device path with no
+re-resolution. On AWS Nitro instances, the guest kernel's NVMe device
+enumeration for an EBS volume (`/dev/nvme1n1`, `/dev/nvme2n1`, ...) is
+assigned at attach time and is **not guaranteed to repeat** across a
+detach/reattach — `--device /dev/sdf` in the EC2 API is a request, not a
+promise about the guest-visible NVMe name. A node whose volume is detached
+and reattached (which is literally what `EBSDetacher` fencing does, see item
+9/`pkg/fencing/detach.go`) can come back to find the shared volume at a
+different `/dev/nvmeNn1` than the flag it was started with, and
+`pkg/blockio.Open` has no fallback — it opens exactly the path given or
+fails.
+
+The fix already exists once, just not wired anywhere reachable:
+`scripts/infra/state.sh`'s `detect_ebs_dev` matches the volume by its EBS
+serial (stable across attach cycles, read via `lsblk -o NAME,SERIAL`) instead
+of assuming a fixed path — but nothing calls it. `docs/architecture/storage/
+block-device-io.md` documents the same serial-probing idea for volume-ID-based
+opens, but only in `pkg/block` (the C library), which the same doc states is
+"currently unused."
+
+Chaos-script side of this (root cause of R8 failing 2/2 AWS runs on
+2026-08-06) fixed separately: `scripts/test/chaos-lib.sh`'s `restart_daemons`
+now resolves the device by serial before restarting (`resolve_block_device`),
+falling back to the old fixed-path guesses only if that fails. This item is
+the production-code half that fix does not cover.
+
+- [ ] Decide where resolution belongs: `internal/config` resolving
+      `--block-device` before passing it to `blockio.Open`, or a new
+      `--volume-id` flag that always resolves (matching what
+      `block-device-io.md` already describes for the unused C path), rather
+      than accepting either a path or an ID ambiguously.
+- [ ] Whichever the daemon does at every restart, not only after a fence: a
+      node's own device path can drift even without a fencing event, if
+      anything else in the AZ churns NVMe attachment order on that host.
+- [ ] `scripts/infra/setup-compute.sh` and `add-compute-node.sh` also
+      hardcode `/dev/nvme1n1` in their systemd unit templates — same gap for
+      any node that survives past its first boot's attachment.
 
 ---
 
