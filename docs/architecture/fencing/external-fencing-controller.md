@@ -218,13 +218,7 @@ This is the mechanism that prevents a node from acquiring a lock while the old h
 
 ## Integration with Arena Reclamation
 
-Similarly, when a fenced node's generation is bumped, other nodes can reclaim its arenas:
-
-1. The arena allocator on another node sees that the fenced node's arenas are available (the `arena:<node_id>` key has no lease heartbeat — but since arenas are not lease-backed, this depends on the membership key deletion).
-
-2. Before reclaiming, the reclaiming node checks that the fenced node's generation has been bumped — confirming the fence is complete.
-
-3. The arena key is deleted from the fenced node and a new arena key is created for the reclaiming node. The actual disk blocks are unchanged — the arena is just a lease of ownership over a disk range.
+The controller releases a fenced node's arena immediately after the generation bump, but only when a `Fencer` confirmed the severance — see [Arena Allocator § Arena Release](../storage/arena-allocator.md#arena-release) for the mechanism (`Store.ReleaseArena`, `free_arena:<arena_id>`, `ClaimFreeArena`). In single-signal mode (no `Fencer` configured) the controller does not release the arena: a lease expiry alone is not proof the node has stopped writing, so nothing satisfies invariant 4 of [Kleppmann's Stale-Write Hazard](../storage/kleppmann-stale-write-analysis.md) — the arena leaks deliberately rather than being handed to a node that might still be writing into it.
 
 ## Integration with the Self-Fencing Watchdog
 

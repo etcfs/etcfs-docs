@@ -9,6 +9,7 @@ The block allocation engine that divides the shared raw block device into arenas
 - [Bitmap Free-List](#bitmap-free-list)
 - [Arena Acquisition](#arena-acquisition)
 - [Block Allocation](#block-allocation)
+- [Arena Release](#arena-release)
 - [Block Deallocation](#block-deallocation)
 - [Crash Recovery Integration](#crash-recovery-integration)
 
@@ -161,6 +162,21 @@ The `size` parameter is the size of the data being written (not the chunk size).
 
 The block size (4096 bytes) matches the O_DIRECT sector alignment requirement for the common case (4096-byte-sector devices). For 512-byte-sector devices, the 4096-byte block is a super-set of the sector size, and all allocations are automatically sector-aligned.
 
+## Arena Release
+
+An arena is not just allocated, it must eventually be given back — otherwise every node departure, graceful or not, leaks that node's arena space permanently. `Store.ReleaseArena(ctx, nodeID)` moves a node's `arena:<node_id>` record into `free_arena:<arena_id>` in one transaction, CAS-guarded on the record's current value so a release racing on stale state cannot free an arena the node was given afterwards. `ClaimFreeArena` (above) is the other half of the same round trip.
+
+Release is wired in two places, gated on different proofs of quiescence:
+
+- **Graceful departure.** `Membership.Leave(ctx, store)` releases the arena, then revokes the membership lease — in that order, so the arena record is already gone by the time the membership key's deletion could wake a fencing controller. `cmd/etcfuse-meta` calls `Leave` after its IPC server has stopped, not from the context-cancellation path that starts shutdown: the IPC server having stopped is what proves no further write can be issued from this node, and that proof only exists once shutdown is further along than "cancel received."
+- **Confirmed fence.** `pkg/fencing.Controller` releases a fenced node's arena after the generation bump, but only when a `Fencer` confirmed the severance (NVMe preempt or EBS detach — see [External Fencing Controller](../fencing/external-fencing-controller.md)). Single-signal mode (no `Fencer` configured, e.g. plain Docker) leaves the arena leaked deliberately: a lease expiry alone is not proof the node has stopped writing, so there is nothing to satisfy invariant 4 of [Kleppmann's Stale-Write Hazard](kleppmann-stale-write-analysis.md) with.
+
+Reclamation is in-memory and per-node: the free list above lives in each allocator's own bitmap, and a node only ever reads its own `arena:<node_id>` key (never a prefix scan, see below), so there is no mechanism today for a node to reclaim ranges inside *another* node's still-owned arena. A durable, cluster-visible free list would be needed for that; not built, because a restart's bitmap reconstruction (below) already recovers the same space by another route, and no deployment has needed cross-node range reclaim yet.
+
+### Free After Deletion
+
+Deleting a file returns its blocks the same way: the scrubber's orphan-extent pass (`pkg/scrub`) calls `Allocator.Free(diskOff, length)` after deleting the dangling `extent:<ino>/<chunk>` key — delete first, so the blocks stop being reachable through metadata before the range can be reissued. This is wired through the optional `scrub.Reclaimer` interface, so the scrubber degrades to metadata-only cleanup when no allocator is attached. The strategy is incremental (update the live bitmap directly, evaluated against periodic-rebuild and append-only alternatives) precisely because the free list is already in-memory and per-arena-owning-process — `Free` ignores ranges outside the calling node's own arenas, so no cross-node visibility is required for it to be safe.
+
 ## Block Deallocation
 
 When a file is truncated or deleted, the freed blocks are returned to the arena free-list via `Free(diskOff, size)`:
@@ -179,9 +195,7 @@ Free(diskOff, size):
 
 The free operation is a local bitmap update — no etcd communication. The freed blocks become available for immediate reuse by subsequent `Allocate` calls from the same node. Blocks freed by a truncation are not visible to other nodes until the truncate's metadata commit (which removes the extents from the inode's extent list) is complete. This is the metadata-then-data ordering invariant: the extent removal in etcd happens before the free-list update.
 
-### Free After Deletion
-
-When a file is fully deleted (all hard links removed, nlink reaching zero), the `AtomicUnlink` operation deletes the inode and its extent keys. The `Free` operation on the blocks is called after the extent keys are gone. If the node crashes between the extent deletion and the free-list update, the blocks are "leaked" — still marked allocated in the arena bitmap but not referenced by any inode. The scrubber detects these on the next pass and reclaims them.
+When a file is fully deleted (all hard links removed, nlink reaching zero), the `AtomicUnlink` operation deletes the inode and its extent keys, but calls no `Free` itself — that only happens once the scrubber's orphan pass confirms the extent keys are gone (see [Arena Release § Free After Deletion](#free-after-deletion) above). If the node crashes between the extent deletion and the scrubber's pass, the blocks stay marked allocated in the bitmap until the scrubber's next run.
 
 ## Crash Recovery Integration
 
