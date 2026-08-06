@@ -54,6 +54,8 @@ The controller runs as a background goroutine within the Go daemon (etcfuse-meta
 │                                                │
 │  fenceNode:                                    │
 │    claim fence_claim:<node> (CAS + lease)      │
+│    from the sweep? re-check the intent still   │
+│      exists — the snapshot may have aged       │
 │    sever device access, bump generation        │
 │    delete fence_pending:<node>                 │
 └────────────────────────────────────────────────┘
@@ -106,7 +108,20 @@ defer store.ReleaseFenceClaim(leaseID)
 
 The claim is cluster-wide, not per-process: the same node's expiry is observed by every survivor, so an in-memory dedup map would collapse only the duplicates originating within one controller. A duplicate fence was never corrupting — both `Fencer` implementations are idempotent (a second preempt of an unregistered key still leaves it absent, and `EBSDetacher` treats an already-detached volume as success) and the generation CAS serialises the bumps — but it is wasted work against a cloud API or a device during an incident, and it made the logs read as two independent fences of the same node.
 
-### 2. Read Current Generation
+### 2. Re-check the Intent (sweep path only)
+
+```
+if the caller is the reconciliation sweep:
+    if fence_pending:<node_id> is gone:
+        log: "fence already completed by another controller, nothing owed"
+        return
+```
+
+Winning the claim proves no one else is fencing this node *now*; it does not prove the fence is still owed. The sweep chooses what to fence from a `ListFenceIntents` snapshot, and that snapshot ages while the call waits on a contended claim: two sweeps can list the same intent, the first completes the fence and releases its claim, and the second then wins the now-free claim holding a view of the world from before any of that happened. Without this step it replays the whole fence — a second real preempt or detach against the device, and a second generation bump. Observed on Docker with three controllers on 2026-08-06.
+
+The watch path skips the check. It acts on a single DELETE event it observed itself rather than a snapshot, so it has nothing stale to guard against; and making it conditional on the intent would mean an intent that failed to record silently disables fencing for that node, which trades a duplicate for a miss.
+
+### 3. Read Current Generation
 
 ```
 currentGen, err = store.GetGeneration(ctx, nodeID)
@@ -114,7 +129,7 @@ currentGen, err = store.GetGeneration(ctx, nodeID)
 
 Reads the `gen:<node_id>` key from etcd. If the key does not exist (never fenced), generation is 0, which is the initial state. This is also the start of the CAS sequence for the bump.
 
-### 3. External Confirmation
+### 4. External Confirmation
 
 The controller calls `Fencer.Fence(ctx, nodeID, instanceID)` and proceeds to the generation bump only if it returns nil. Note the ordering: severing device access is a *precondition* of the bump, not a parallel action, because the bump is what tells peers they may reclaim the node's arenas and locks.
 
@@ -125,7 +140,7 @@ Under NVMe reservations the step is:
 
 Under the EBS fallback it is the detach-then-poll sequence described above. Either way, a fence that cannot be confirmed aborts without bumping: a node the cluster believes is fenced, but is not, is more dangerous than one it knows it failed to fence. The abort leaves `fence_pending:<node_id>` in place, so the reconciliation sweep retries the attempt rather than abandoning it.
 
-### 4. Bump Generation
+### 5. Bump Generation
 
 ```
 newGen, err = store.BumpGeneration(ctx, nodeID, currentGen)
@@ -133,7 +148,7 @@ newGen, err = store.BumpGeneration(ctx, nodeID, currentGen)
 
 The CAS bump atomically transitions the generation from `currentGen` to `currentGen + 1`. If another controller replica has already bumped the generation (race condition), the CAS fails and the controller re-reads the new generation and logs a warning — the fence was already performed by another replica, and the dedup check ensures no duplicate recovery actions.
 
-### 5. Cleanup
+### 6. Cleanup
 
 ```
 delete fence_pending:<node_id>

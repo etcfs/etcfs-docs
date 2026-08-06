@@ -127,10 +127,10 @@ once.
       properties hold: the sweep completes an orphaned intent unprompted
       (R1), and it drops an intent for a node that re-registered without
       touching its generation (R2).
-- [ ] **Found by that run, not yet fixed:** `Controller.reconcile` has a
-      TOCTOU distinct from the race this item already closed. It lists
-      `fence_pending` once per sweep tick, then acts on that snapshot
-      per-entry without re-checking the entry is still pending once it wins
+- [x] **Found by that run, fixed the same day:** `Controller.reconcile` had a
+      TOCTOU distinct from the race this item already closed. It listed
+      `fence_pending` once per sweep tick, then acted on that snapshot
+      per-entry without re-checking the entry was still pending once it won
       the claim. Reproduced on docker (3 controllers): a long-lived intent
       visible across a sweep tick can be listed by two controllers before
       either clears it; the first claims and completes the fence
@@ -145,9 +145,16 @@ once.
       CAS only ever increases) — costs a redundant real `Fence()` call per
       straggler (an extra EC2 API round trip or NVMe preempt), not
       correctness. The watch path is unaffected: it fires once per DELETE
-      event, so there is no repeated List() to go stale. Fix, when picked
-      up: re-verify the intent still exists (or re-read current generation)
-      *after* winning the claim in `reconcile`, before calling `fenceNode`.
+      event, so there is no repeated List() to go stale.
+      **Fixed:** `fenceNode` now takes a `fromSweep` flag and, on the sweep
+      path only, re-reads `fence_pending:<node>` *after* winning the claim,
+      returning without fencing if the intent is gone. The watch path stays
+      unguarded deliberately — it observes its own DELETE rather than a
+      snapshot, and gating it on the intent would let a failed
+      `RecordFenceIntent` silently disable fencing, trading a benign
+      duplicate for a miss. Coverage:
+      `TestController_SweepSkipsFenceCompletedWhileWaitingForClaim` and
+      `TestController_WatchPathFencesWithoutARecordedIntent`.
 - [ ] The docker chaos script's baseline write (R3/R4, killing a real node)
       was flaky on the dev host this was validated on — deterministic
       "no space left on device" from the FUSE mount on some runs, absent from
