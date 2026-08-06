@@ -77,9 +77,31 @@ The scan is a simple linear scan with a single counter. It resets the counter to
 
 ## Arena Acquisition
 
-When a node needs more disk space (its current arena is full, or it has no arenas at startup), it acquires a new arena from the global pool. The acquisition is a CAS transaction on the `arena_alloc_log` key.
+When a node needs more disk space (its current arena is full, or it has no arenas at startup), it acquires an arena from the global pool. It first tries to claim an arena that has already been returned to the free pool, and only extends the device with a brand-new arena when the pool is empty.
 
-### Protocol
+### Claiming a Freed Arena
+
+```
+ClaimFreeArena():
+  for each key in GetPrefix("free_arena:"):
+    Txn:
+      If CreateRevision(key) != 0:
+        Delete(key)             // the delete *is* the claim
+        return arenaID(key), claimed
+      Else:
+        try the next candidate  // another node claimed it first
+  return not-claimed
+```
+
+The delete is conditioned on the key still existing, so when several nodes reach for the same freed arena exactly one wins and the losers move on. A plain read-then-delete would hand the same arena to two nodes, which is the one outcome the arena scheme exists to prevent.
+
+A freed arena is not necessarily an empty one. The compactor releases an arena only after evacuating it, but an arena released by a departing or fenced node still holds whatever extents its files have. A node that claims a recycled arena therefore rebuilds the arena's bitmap from the live extents in etcd (the same scan `Reconstruct` performs at startup) before allocating from it; a brand-new arena, which no node has ever owned, starts from an all-zero bitmap.
+
+A failed claim is not fatal — the allocator falls through to a new arena, which costs device space but always works. Surfacing an etcd hiccup here as an I/O error on the write that triggered the acquisition would be a worse trade.
+
+### Allocating a New Arena
+
+When the free pool is empty, the allocation is a CAS transaction on the `arena_alloc_log` key.
 
 ```
 AcquireArena(nodeID):
