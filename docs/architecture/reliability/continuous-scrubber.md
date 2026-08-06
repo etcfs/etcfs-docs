@@ -81,7 +81,7 @@ The scrubber runs as a background goroutine within the Go daemon (etcfuse-meta).
 3. Look up the inode key `inode:<ino>`.
 4. If the inode key does not exist (Get returns nil), the extent is orphaned.
 
-**Resolution:** Automatic. Orphaned extents are safe to reclaim — no inode references them, so no file can read their data. The scrubber marks the extent's blocks as free in the arena free-list and deletes the extent key. The reclaim is deferred by a configurable grace period (default 60 seconds) to handle the case where the inode was created by a concurrent transaction that has not yet committed.
+**Resolution:** Automatic. Orphaned extents are safe to reclaim — no inode references them, so no file can read their data. The scrubber deletes the extent key and then returns its blocks to the arena free-list. Both steps run in the same pass that detected the orphan; there is no grace period, because an inode and its first extent are created in a single transaction, so a partially visible create cannot produce a transient orphan.
 
 **Likely causes:**
 - Crash between extent commit and inode creation in an atomic create (should not happen with the single-transaction `AtomicCreateFile`, but possible with non-atomic operations like the current SYMLINK implementation).
@@ -192,15 +192,14 @@ The `Type` determines the severity:
 
 The only anomaly that the scrubber auto-remediates (in the current implementation) is orphan extents.
 
-Remediation protocol for orphans:
-1. The orphan is logged with `AutoFix: true`.
-2. In a future pass, after the grace period (configurable, default 60 seconds, to allow concurrent transactions to complete), the scrubber:
-   - Reads the orphan's extent value to get the `disk_off` and `length`.
-   - Calls `arena.Allocator.Free(disk_off, length)` to return the blocks to the free-list.
-   - Deletes the `extent:<ino>/<chunk>` key from etcd.
-   - Logs the remediation action.
+Remediation protocol for orphans, in the same pass that detects them:
+1. The orphan is logged with `AutoFix: true`, carrying the `disk_off` and `length` decoded from the extent's value.
+2. The `extent:<ino>/<chunk>` key is deleted from etcd. This comes first: the blocks must stop being reachable through metadata before they can be handed to another allocation, or a reader resolving the extent could land on data that has already been overwritten. A failed delete skips the reclaim, leaving both the key and its blocks for the next pass.
+3. `arena.Allocator.Free(disk_off, length)` returns the blocks to the free-list.
 
-If the inode that owns the orphaned extent was deleted but the extent keys were left behind, the blocks are leaked — the free-list shows them allocated, but no inode references them. The scrubber's orphan detection + remediation closes this leak.
+The free-list is per-process and in-memory, so step 3 only reclaims ranges inside arenas *this* node owns; `Free` ignores anything else. A range in another node's arena stays allocated until that node's own scrubber reaches it, or until the arena is compacted. The reclaim is also not durable — a restart rebuilds the bitmap from the live extents in etcd, which no longer include the deleted file's, so the space returns that way instead.
+
+This is what makes file deletion actually return disk space. `AtomicUnlink` removes the dirent and, at `nlink == 0`, the inode record, but never touches the file's extent keys; without the reclaim step the blocks stay marked allocated with nothing referencing them, and space leaks on every deletion.
 
 ## Alerting Integration
 

@@ -190,7 +190,7 @@ once.
       unexplained ENOSPC from an EtcFS mount is more likely a missing or
       stale `gen:<node>` key than a full device.
 
-## 6. Arena reclamation has no implementation
+## 6. Arena reclamation — implemented 2026-08-06, untested
 
 `free_arena:` keys are written (by `LeaveGraceful`'s `releaseArena`) but nothing
 ever reads or reuses them. `pkg/metadata.Membership.Run()` (what production
@@ -199,7 +199,47 @@ node's own lease-bound membership key. `arena:<node_id>` isn't lease-bound eithe
 So in production, arena space leaks permanently on **every** node departure,
 graceful or not.
 
-- [ ] Decide whether arena reclamation is worth building at all before it matters
+**What was built** (code only; no test or chaos run has exercised it yet):
+
+- `Store.ReleaseArena` moves a node's `arena:<node_id>` record into
+  `free_arena:<arena_id>` in one transaction, CAS-guarded on the record's
+  current value so a release racing on stale state cannot free an arena the
+  node was given afterwards.
+- `Store.ClaimFreeArena` takes an arena out of the pool; the conditional
+  delete *is* the claim, so concurrent claimants cannot both win the same
+  arena. `pkg/arena.Allocator` prefers a claimed arena over bumping
+  `arena_alloc_log`, which is what makes a freed arena's space reachable again.
+- A recycled arena is not assumed empty: the allocator rebuilds its bitmap
+  from the live extents in etcd before allocating, so an arena released with a
+  departed node's files still in it cannot be overwritten by its next owner.
+- Release is wired in two places: `cmd/etcfuse-meta` releases this node's arena
+  after the IPC server stops (a node that serves nothing is its own proof of
+  quiescence), and `pkg/fencing.Controller` releases a fenced node's arena
+  after the generation bump — but **only** when a `Fencer` confirmed the
+  severance. Single-signal mode still leaks, deliberately: invariant 4 has no
+  proof to stand on there.
+- The scrubber's orphan pass now calls `Allocator.Free(disk_off, length)` after
+  deleting the dangling extent key (delete first, so the blocks stop being
+  reachable through metadata before they can be reissued). The **incremental**
+  strategy was chosen over periodic-rebuild and append-only: the free list is
+  in-memory and per-process, and `Free` ignores ranges outside this node's own
+  arenas, so it needs no cross-node visibility to be safe. A restart rebuilds
+  the bitmap from live extents, which recovers the same space by another route.
+
+Remaining:
+
+- [ ] Test it. Nothing here has been exercised — in particular the recycled-arena
+      bitmap rebuild, and the claim under concurrency.
+- [ ] `pkg/metadata.Membership` still has no release of its own; production
+      release happens in `cmd/etcfuse-meta`'s shutdown path instead. Revisit if
+      another binary ever runs a `Membership`.
+- [ ] Reclamation stays in-memory per node. A durable, cluster-visible free
+      list is still unbuilt, and is what a node would need to reclaim ranges
+      inside *another* node's arena.
+
+Original notes below.
+
+- [x] Decide whether arena reclamation is worth building at all before it matters
       operationally (long-running clusters with frequent node churn would
       eventually exhaust the block device). If yes:
 - [ ] Wire actual arena release into `pkg/metadata.Membership`'s shutdown path
@@ -480,7 +520,7 @@ Implementation order:
 1. Item 7 (unbounded FUSE context) — only item that's a real bug in a healthy cluster, ready to build, zero dependencies, blocks nothing. Highest value/effort ratio.
 2. ~~Item 9 (NVMe reservations)~~ — done: built and AWS-verified 2026-08-06. Its decisions are recorded in the item; what it unblocks is now live for 5 and 6.
 3. ~~Item 5 (controller race/retry)~~ — done 2026-08-06: one reconciliation sweep plus a durable fence intent closes the retry gap for both the preempt and detach paths, and a lease-bound per-node claim makes the dedup cluster-wide.
-4. Item 6 (reclamation) — 9's confirmed preempt is the quiescence proof invariant 4 demanded, so no grace-period machinery is needed on a reservation-enabled cluster. Gate the trigger on that proof rather than assuming it.
+4. ~~Item 6 (reclamation)~~ — built 2026-08-06, gated on a confirmed fence as planned; still untested.
 5. Item 1 (harness mop-up) — independent, low value, do whenever.
 6. Item 8 (RebalanceArena caller) — decision item, likely "no".
 7. Item 2 — resolves as a side effect of 7.
