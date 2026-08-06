@@ -147,7 +147,19 @@ The purpose of separating the two methods is to model the fencing controller's b
 3. The controller reads the current generation and bumps it via CAS.
 4. Other nodes can now reclaim the crashed node's locks and arenas.
 
-The `LeaveUngraceful` method in the harness simulates this by cleaning up the crashed node's resources (the simulation does not wait for lease TTL). In production, the resources are reclaimed by the fencing controller and arena reclamation protocol.
+The `LeaveUngraceful` method in the harness simulates this by cleaning up the crashed node's resources (the simulation does not wait for lease TTL).
+
+## Arena Reclamation in Production
+
+The `LeaveGraceful`/`LeaveUngraceful` pair above is the test harness (`pkg/membership.Manager`). Production releases arenas in two places instead:
+
+- **Graceful shutdown** (`cmd/etcfuse-meta`): after the IPC server has stopped, the node returns its own arena to the free pool with `Store.ReleaseArena`. A departing node is its own proof of quiescence — no further write can be issued once it is no longer serving FUSE requests.
+
+- **After a confirmed fence** (`pkg/fencing.Controller`): once `Fencer.Fence` has confirmed the node's device access is severed and the generation has been bumped, the controller releases the fenced node's arena. The confirmed severance is what satisfies invariant 4 of [Kleppmann's stale-write analysis](../storage/kleppmann-stale-write-analysis.md) — the device is already rejecting the node's writes, so the range can be reissued immediately, with no grace period.
+
+  In single-signal mode (no `Fencer` configured — Docker, or a cluster started without `--nvme-reservations` or `--ebs-volume-id`) the arena is **not** reclaimed. There is no proof of severance there: the fenced node's metadata mutations are rejected, but its kernel may still be issuing writes to the raw device, and handing its arena to a live node would put both of them in the same range. Leaking the arena is the correct trade.
+
+Released arenas are picked up by the next node that needs space; see [Arena Allocator](../storage/arena-allocator.md#claiming-a-freed-arena).
 
 ## Arena Rebalancing
 
