@@ -5,7 +5,7 @@ Why the classic "distributed lock does not protect shared storage" argument appl
 ## Table of Contents
 
 - [The Argument](#the-argument)
-- [Why EBS Cannot Enforce Fencing](#why-ebs-cannot-enforce-fencing)
+- [How the Device Enforces Fencing](#how-the-device-enforces-fencing)
 - [What EtcFS Already Neutralises](#what-etcfs-already-neutralises)
 - [Where the Hazard Actually Applies](#where-the-hazard-actually-applies)
 - [The Allocator Channel](#the-allocator-channel)
@@ -18,41 +18,23 @@ Kleppmann's objection to lock services as a safety mechanism for shared storage 
 
 The standard remedy is a fencing token: a monotonically increasing number handed out with the lock, carried on every write, and **validated by the storage service**, which rejects any write bearing a token older than the highest it has seen. The essential property is that the rejection happens at the resource, not at the client.
 
-## Why EBS Cannot Enforce Fencing
+## How the Device Enforces Fencing
 
 On a traditional SAN the resource does enforce it. SCSI-3 Persistent Reservations let the array itself reject a write whose reservation key has been preempted, so a partitioned node's I/O is discarded at the disk regardless of what that node believes.
 
-> **Correction, 2026-08-05:** the claim that follows — that EBS Multi-Attach
-> has no equivalent — is out of date. Multi-Attach `io2` volumes support the
-> full NVMe reservation command set (Register/Acquire/Release/Report,
-> including Write Exclusive – All Registrants) since 2023-09-18. This *is*
-> a resource-side fencing token, spiked and confirmed working against a real
-> io2 volume: a preempted node's `O_DIRECT` write fails synchronously at
-> `write()` with `EBADE`, zero bytes reaching the device, while other
-> registrants keep writing. See `docs/TODO-hardening.md` § 9 for the spike
-> detail and what adopting it would change. The rest of this document was
-> written before that finding and its analysis has not yet been revised to
-> account for it — the "already neutralises via unreachability" argument
-> below is still accurate for the *current, unmodified* implementation
-> (nothing in the code has changed yet), but it describes a workaround for a
-> problem that has a real, direct fix available. Treat everything below as
-> "true of the code as it stands today," not as "the best available design."
+EBS Multi-Attach `io2` volumes have the NVMe equivalent, and EtcFS now uses it. Since 2023-09-18 those volumes support the full NVMe reservation command set — Register, Acquire, Release, Report — including **Write Exclusive – All Registrants**, the reservation type built for this exact shape of problem: every registered host may write concurrently, and any registrant may eject another individually.
 
-EBS Multi-Attach's raw block interface offers no equivalent *by default* —
-in the running system today, there is no mechanism attached to a raw block
-write that rejects it when the writer's token is stale. Every attached
-instance can write every sector at any time. Whatever fencing EtcFS
-currently performs is, by construction, performed somewhere other than the
-resource — and Kleppmann's argument applies with full force to the design as
-it stands, even though the correction above means it no longer has to.
+`pkg/nvmeresv` issues those commands directly, as NVMe passthrough ioctls (there is no AWS API for them, and no Go dependency covers them). At startup each node registers a key derived from its node ID and acquires the shared reservation. When `pkg/fencing/nvme.go`'s `NVMeFencer` preempts an expired node's key, that node's next write fails **synchronously at `write()`** with `EBADE`, zero bytes reaching the device, while every other registrant keeps writing. Confirmed against a real io2 Multi-Attach volume before the code was written, and asserted end to end by `scripts/test/chaos-nvme-fencing.sh`.
 
-Two consequences follow, and both are true of EtcFS's *current* fencing path
-(pre-`pkg/nvmeresv`):
+This is a fencing token validated at the resource, in Kleppmann's sense — not an approximation of one. Two things follow for the rest of this document:
+
+- **The classic hazard is closed on the data path when reservations are enabled.** A delayed writer whose key has been preempted cannot put bytes on the volume at all, no matter how long it was paused between its lease check and its write.
+- **The unreachability argument below is no longer the only line of defence, but it is still load-bearing.** Reservations require `--nvme-reservations` and a device that supports them; on `gp3`, on loopback devices, and in Docker the controller falls back to EBS detach or to single-signal fencing, and there the argument below is exactly what keeps the system safe. It also remains the reason a *failed* preempt is survivable rather than catastrophic.
+
+Where reservations are unavailable, the two weaker properties hold instead:
 
 - **Self-fencing is advisory.** The watchdog (`pkg/fencing/watchdog.go`) calls `os.Exit(77)` when its lease is beyond the grace period. Process death does not cancel writes already handed to the kernel or in flight to EBS.
-- **External fencing confirms detach before bumping the generation, but detach itself is not synchronous.** The controller (`pkg/fencing/controller.go`) calls `DetachVolume` and polls until confirmed before bumping `gen:<node_id>` — but `DetachVolume` is asynchronous with no documented hard bound on when residual I/O ceases, which is why the poll-then-confirm step exists at all. A synchronous, device-enforced preempt (§ 9) would remove the need for that polling window entirely.
-
-So, as implemented today, EtcFS cannot prevent a fenced node from putting bytes on the volume before a detach is confirmed. Everything below is the argument for why that's survivable anyway — not a claim that it's the only option going forward.
+- **Detach is confirmed but not synchronous.** The controller calls `DetachVolume` and polls until confirmed before bumping `gen:<node_id>` — but `DetachVolume` is asynchronous with no documented hard bound on when residual I/O ceases, which is why the poll-then-confirm step exists at all.
 
 ## What EtcFS Already Neutralises
 
@@ -117,9 +99,9 @@ Note that arena ID 0 is valid — the counter starts there — so a present reco
 
 Closing the allocator channel does not close the class. The following remain, ordered by how directly they can produce two owners of one range:
 
-**`RebalanceArena` now requires the source to be fenced.** `pkg/membership/membership.go`'s `RebalanceArena` used to delete `arena:<from>` and write `arena:<to>` as two unguarded calls with no generation check. It now refuses to move an arena away from a node whose fencing generation is still 0, and performs the move as a single atomic `Txn`. This closes the case of moving an arena away from a *live, healthy* node — the one this section originally flagged as unclosable by any guard. It does **not** close invariant 4 below: a generation bump is a real signal (the source can no longer commit metadata), but it is not proof the source's kernel has stopped issuing writes to the block device — the grace-period argument that invariant demands still has no implementation. `RebalanceArena` still has only test callers; see `docs/TODO-hardening.md` § 8 for whether it should ever get a production one.
+**`RebalanceArena` now requires the source to be fenced.** `pkg/membership/membership.go`'s `RebalanceArena` used to delete `arena:<from>` and write `arena:<to>` as two unguarded calls with no generation check. It now refuses to move an arena away from a node whose fencing generation is still 0, and performs the move as a single atomic `Txn`. This closes the case of moving an arena away from a *live, healthy* node — the one this section originally flagged as unclosable by any guard. It does **not** by itself close invariant 4 below: a generation bump is a real signal (the source can no longer commit metadata), but it is not proof the source's kernel has stopped issuing writes to the block device. On a reservation-enabled cluster the preempt that precedes the bump is that proof; elsewhere the grace-period argument that invariant demands still has no implementation. `RebalanceArena` still has only test callers; see `docs/TODO-hardening.md` § 8 for whether it should ever get a production one.
 
-**`free_arena:` is written but never consumed.** Reuse is currently impossible, which is why arena space leaks on graceful leave. Any future reclamation path must treat a freed arena as unsafe to reissue until the previous owner is known to have no in-flight I/O to it — which, per the first section, cannot be established from etcd state alone.
+**`free_arena:` is written but never consumed.** Reuse is currently impossible, which is why arena space leaks on graceful leave. Any future reclamation path must treat a freed arena as unsafe to reissue until the previous owner is known to have no in-flight I/O to it. On a reservation-enabled cluster a confirmed preempt establishes exactly that; without one it cannot be established from etcd state alone.
 
 **Reads do not validate the generation stamp.** Extents carry `Gen` (`writeGeneration`, stamped at commit time) and the scrubber cross-checks it offline in `CheckGenerationConsistency`, but `handleRead` ignores it. Inline validation would turn a class of "wrong bytes returned" into "read error", which is the correct direction for a filesystem. The stamping half of an epoch-validation scheme exists; the checking half does not.
 
@@ -132,6 +114,6 @@ Any future change to allocation, compaction, or elastic membership must preserve
 1. **Disjoint ownership.** At any instant, at most one node's free-list contains a given arena. Not "at most one node is writing" — at most one node *believes it may* write.
 2. **Recovery reads only own records.** A node reconstructing state must never widen its claim based on cluster-wide scans. Recovery may only narrow or confirm.
 3. **Reachability requires a guarded commit.** Bytes become part of a file only via a generation-guarded etcd transaction. No path may publish an extent outside `commitGuarded`.
-4. **Reissue requires quiescence.** An arena may return to the pool only when the previous owner provably has no in-flight I/O to it — and since EBS provides no such proof, this must come from a bound on elapsed time, not from etcd state.
+4. **Reissue requires quiescence.** An arena may return to the pool only when the previous owner provably has no in-flight I/O to it. A confirmed reservation preempt *is* that proof: the device rejects the preempted node's writes from that moment on, so an arena may be reissued immediately after the fence, with no elapsed-time argument. Where reservations are unavailable, the proof is unavailable too, and reissue would still need a clock-bound argument.
 
-Invariant 4 is the one with no current implementation, because nothing reuses arenas yet. It is where a grace period or a clock-bound argument would have to be made, and it is the honest boundary of the system's present safety claim.
+Invariant 4 has no *caller* yet — nothing reuses arenas (see `docs/TODO-hardening.md` § 6) — but on a reservation-enabled cluster it is no longer an open design question. Sizing a grace period correctly is the problem that preempt removes.

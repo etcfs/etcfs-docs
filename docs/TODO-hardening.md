@@ -255,17 +255,16 @@ What it costs, beyond the function itself (already built):
       them wrong is expensive to unwind once a balancer is running against
       production traffic.
 
-## 9. Replace advisory fencing with NVMe reservations (device-enforced)
+## 9. Replace advisory fencing with NVMe reservations (device-enforced) — implemented, unverified on AWS
 
-`docs/architecture/storage/kleppmann-stale-write-analysis.md` has stated since
-its first version that "EBS Multi-Attach offers no equivalent" to SCSI-3
-Persistent Reservations — that no mechanism exists to have the storage itself
-reject a stale writer's I/O. That premise is out of date: Multi-Attach `io2`
-volumes have supported the full NVMe reservation command set (Register /
-Acquire / Release / Report) since 2023-09-18, including **Write Exclusive –
-All Registrants**, the type built for exactly this shape of problem —
-multiple hosts write concurrently, and a specific host can be individually
-ejected.
+`docs/architecture/storage/kleppmann-stale-write-analysis.md` stated until
+2026-08-06 that "EBS Multi-Attach offers no equivalent" to SCSI-3 Persistent
+Reservations — that no mechanism exists to have the storage itself reject a
+stale writer's I/O. That premise was out of date: Multi-Attach `io2` volumes
+have supported the full NVMe reservation command set (Register / Acquire /
+Release / Report) since 2023-09-18, including **Write Exclusive – All
+Registrants**, the type built for exactly this shape of problem — multiple
+hosts write concurrently, and a specific host can be individually ejected.
 
 **Spiked and confirmed against a real io2 Multi-Attach volume (2×
 t3.medium, 2026-08-05, infra fully torn down after):**
@@ -281,58 +280,55 @@ t3.medium, 2026-08-05, infra fully torn down after):**
   `write()`** with `EBADE` ("Invalid exchange") — zero bytes reached the
   device. The non-preempted node kept writing successfully throughout.
 
-This is a real fencing token enforced at the resource, exactly the remedy
-Kleppmann's argument calls for — not an approximation of one. It would let
-EtcFS replace the current advisory scheme (self-fencing `os.Exit`, async
-`DetachVolume`, and the etcd-side generation guard as the actual backstop)
-with something that rejects a fenced node's writes at the device itself,
-synchronously, no polling or grace period required.
+**What landed (2026-08-06):**
 
-**What adopting it would touch:**
+- `pkg/nvmeresv` — Register / Acquire / Preempt / Release / Report over the
+  raw NVMe passthrough ioctl, no `nvme-cli` shell-out, in the same style as
+  `pkg/blockio/device.go`. Reservation keys are *derived* from the node ID
+  (FNV-1a 64, `KeyForNode`) rather than assigned, so any survivor can compute
+  the key of the node it must fence without a registry, and a preempted node
+  reuses its key on rejoin. Unit tests assert the command encoding against a
+  fake, the layer where a wrong cdw10 bit means fencing silently does nothing.
+- `pkg/fencing`'s `VolumeDetacher` generalised to `Fencer`
+  (`Fence(ctx, nodeID, instanceID)`), with two implementations: `NVMeFencer`
+  (preempt, then confirm via report) and the existing `EBSDetacher` (detach,
+  then confirm via poll) as the fallback for devices without reservation
+  support. `fenceNode` no longer knows which mechanism it is driving.
+- `--nvme-reservations` (requires `--block-device`), taking precedence over
+  `--ebs-volume-id`. `scripts/test/chaos-lib.sh` honours
+  `ETCFS_FENCE_MODE=nvme`.
+- `scripts/test/chaos-nvme-fencing.sh` — AWS chaos scenario R1–R8:
+  registration at startup, WEAR with concurrent writers, preempt of a
+  partitioned node, the preempted node's raw `O_DIRECT` write rejected by the
+  device, generation bump after the confirmed preempt, survivors unaffected,
+  re-registration on restart, and reservation state across a detach/reattach
+  cycle.
 
-- **New code, not a patch.** Reservation commands are NVMe I/O-command-set
-  ioctls, not an AWS SDK call — no existing Go dependency covers this.
-  Consistent with the codebase's existing style (`pkg/blockio/device.go`
-  already does raw `ioctl`/`unsafe.Pointer` for `BLKSSZGET` etc.), this would
-  be a new `pkg/nvmeresv` package built the same way, not a wrapper around
-  `nvme-cli` (shelling out works for a spike, not for production).
-- **`pkg/fencing/controller.go`'s `fenceNode` simplifies.** The current
-  detach-then-poll-then-bump sequence exists because `DetachVolume` is async
-  with no bound on when I/O actually stops. Preempt is synchronous — it
-  collapses to preempt-then-bump, no polling.
-- **The self-fencing watchdog's role changes** from "the only thing
-  preventing corruption" to a resource-cleanup measure; the device becomes
-  the actual safety mechanism. Its doc framing needs to change to match, not
-  just its code.
-- **Invariant 4 (`kleppmann-stale-write-analysis.md` § Invariants to
-  Preserve) stops being an open design question.** Reclamation (items 6's
-  arena- and extent-level gaps) currently has no implementation because
-  nothing can prove a fenced node's I/O has stopped. A confirmed preempt is
-  that proof — reclaim becomes safe immediately after, no grace-period math
-  needed. This is the biggest single payoff of this item.
-- **`kleppmann-stale-write-analysis.md` needs a real rewrite**, not a
-  footnote — its "Why EBS Cannot Enforce Fencing" section is the document's
-  load-bearing premise and is now wrong for `io2`. Held off on rewriting
-  that document's conclusions until this item's implementation is decided,
-  rather than rewriting the safety story ahead of the code that would make
-  it true — see inline note added there.
+**Resolved decisions:**
 
-- [ ] Decide whether to build this before building the reclamation
-      grace-period machinery in item 6 — if this lands, the grace-period
-      approach it would otherwise need for reclamation is unnecessary work.
-- [ ] Confirm reservation state survives what the current chaos scripts
-      already exercise: node restart, `iptables` partition, EBS
-      detach/reattach. Not yet tested — the spike only covered clean
-      register/acquire/preempt.
-- [ ] Decide registration-key lifecycle on rejoin (reuse key after a
-      preempt, or mint fresh).
-- [ ] Build `pkg/nvmeresv` (register/acquire/preempt/report over raw ioctl)
-      with unit tests against a fake, same pattern as
-      `pkg/fencing/detach_test.go`'s `fakeEC2`.
-- [ ] Wire it into `pkg/fencing/controller.go`, decide whether `DetachVolume`
-      is kept as a fallback/secondary signal or removed outright.
-- [ ] Chaos-test on real AWS (this cannot be exercised on Docker loopback
-      devices — no NVMe reservation support there).
+- *Registration-key lifecycle on rejoin*: reuse the derived key. Safe because
+  the key is not what separates epochs — the fencing generation is. A
+  preempted node must restart to regain device access, and a restart re-reads
+  its generation.
+- *`DetachVolume` kept as a fallback*, not removed: `gp3` volumes and
+  loopback devices support no reservations, and the detach path is already
+  verified on AWS.
+
+- [ ] Run `scripts/test/chaos-nvme-fencing.sh` on real AWS. Written but **not
+      yet executed** — every claim about this on real hardware beyond the
+      2026-08-05 spike is currently unverified. R8 (detach/reattach) in
+      particular encodes an expectation, not an observation: registration is
+      per-controller, so a detach should drop it, but that has not been
+      confirmed.
+- [ ] Decide whether the self-fencing watchdog's grace period can be relaxed
+      once the device is the enforcing layer — it no longer has to win a race
+      it used to be the only entrant in.
+- [ ] Item 6 (reclamation) can now be built without grace-period machinery on
+      a reservation-enabled cluster: a confirmed preempt is the quiescence
+      proof invariant 4 demanded. Nothing consumes `free_arena:` yet.
+- [ ] Fold item 5 (controller retry/limbo) into this path: a failed preempt
+      leaves the same limbo a failed detach did, and there is still no
+      reconciliation sweep to retry it.
 
 ---
 

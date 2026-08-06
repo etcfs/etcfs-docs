@@ -25,7 +25,12 @@ The controller exists because self-fencing alone is insufficient:
 - The self-fencing watchdog may fail to fire (process stuck, kernel unresponsive).
 - A node may crash without self-fencing (instant power loss, kernel panic).
 
-The external fencing controller must **confirm** that the node is truly isolated before allowing other nodes to reclaim its state. This confirmation comes from an external authority — in production, the AWS EC2 API's `DetachVolume` with force-sure and `DescribeVolumes` polling. In the simulation harness, the confirmation is implicit (the node's membership key deletion is sufficient to trigger the generation bump).
+The external fencing controller must **confirm** that the node is truly isolated before allowing other nodes to reclaim its state. That confirmation comes from outside etcd, through one of two implementations of the `Fencer` interface (`pkg/fencing/detach.go`):
+
+- **NVMe reservations (`pkg/fencing/nvme.go`, preferred).** A survivor preempts the expired node's reservation key on the shared namespace. The device itself then rejects that node's writes, synchronously — its next `write()` fails with `EBADE` and no bytes reach the volume. Enabled with `--nvme-reservations`, which requires `--block-device` and a device supporting the reservation command set (an EBS `io2` Multi-Attach volume does; `gp3` and loopback devices do not).
+- **EBS detach (`pkg/fencing/detach.go`, fallback).** The controller calls `ec2:DetachVolume` with `Force=true` and polls `ec2:DescribeVolumes` until the attachment is gone. Enabled with `--ebs-volume-id`. Detachment is asynchronous, which is why the poll exists; the preempt path needs no equivalent wait.
+
+With neither flag the controller degrades to single-signal fencing — bumping the generation on lease expiry alone. That is correct for Docker and single-host testing, where there is no shared device to cut off, but it stops a node publishing metadata without stopping it writing bytes.
 
 ## Controller Architecture
 
@@ -90,16 +95,16 @@ currentGen, err = store.GetGeneration(ctx, nodeID)
 
 Reads the `gen:<node_id>` key from etcd. If the key does not exist (never fenced), generation is 0, which is the initial state. This is also the start of the CAS sequence for the bump.
 
-### 3. External Confirmation (Production Only)
+### 3. External Confirmation
 
-In the production deployment on AWS, this is where the controller would:
+The controller calls `Fencer.Fence(ctx, nodeID, instanceID)` and proceeds to the generation bump only if it returns nil. Note the ordering: severing device access is a *precondition* of the bump, not a parallel action, because the bump is what tells peers they may reclaim the node's arenas and locks.
 
-1. Call `ec2:DetachVolume(VolumeId=shared_ebs_volume, InstanceId=fenced_node, Force=true)`.
-2. Poll `ec2:DescribeVolumes(VolumeId=shared_ebs_volume)` until the attachment `State=detached`.
-3. Optionally call `ec2:DescribeInstances(InstanceId=fenced_node)` to confirm the instance is `stopped` or `terminated`.
-4. Only proceed to the generation bump if all confirmations pass.
+Under NVMe reservations the step is:
 
-In the current implementation, the external confirmation step is a placeholder. The generation bump proceeds immediately after the membership DELETE detection.
+1. Preempt the expired node's reservation key, derived from its node ID (`nvmeresv.KeyForNode`, FNV-1a 64). Deriving rather than assigning means any survivor can compute the key without a registry.
+2. Re-read the reservation report and confirm the key is no longer registered. A preempt that reports success while the registration survives is treated as a failed fence.
+
+Under the EBS fallback it is the detach-then-poll sequence described above. Either way, a fence that cannot be confirmed aborts without bumping: a node the cluster believes is fenced, but is not, is more dangerous than one it knows it failed to fence. This does not retry — see the limbo state described below.
 
 ### 4. Bump Generation
 
@@ -126,13 +131,13 @@ The two confirmations are:
 
 1. **etcd membership key deletion.** The `membership:<node_id>` key is gone, meaning the node's lease expired and etcd has no record of a live node. This is a distributed-consensus confirmation — the etcd Raft cluster agrees that the node's lease has expired.
 
-2. **Cloud API confirmation (production).** The AWS EC2 API confirms that the shared EBS volume is detached from the instance (`DescribeVolumes` returns `State=detached`). This is an infrastructure-layer confirmation that the node has no access to the block device.
+2. **Device or cloud-API confirmation.** Either the reservation report confirms the node's key is no longer registered (NVMe path), or the EC2 API confirms the shared volume is detached from the instance (`DescribeVolumes` no longer lists the attachment). Both are confirmations that the node cannot reach the block device; the reservation report is the stronger of the two, because the enforcement and the evidence come from the same device rather than from a control plane describing an asynchronous operation.
 
 The generation bump is NOT performed until both confirmations are received. If only one confirmation arrives (e.g., the membership key is deleted but the volume detach API times out), the controller alerts but does not bump. The node remains in a limbo state until the second confirmation arrives or an administrator intervenes.
 
 ### Simulation Mode
 
-In the test harness, dual confirmation is simplified: the membership key deletion alone is sufficient to trigger the generation bump. The external API calls are impossible in the deterministic mock environment. The full dual-confirmation protocol is tested in the Phase 5 checkpoint suite that runs on real AWS infrastructure.
+In the test harness, dual confirmation is simplified: the membership key deletion alone is sufficient to trigger the generation bump, since a Docker loopback device supports neither reservations nor detachment. Both real paths are exercised against AWS: `scripts/test/chaos-fencing-detach.sh` for the EBS fallback, and `scripts/test/chaos-nvme-fencing.sh` for reservation preempt, which additionally asserts that a preempted node's raw `O_DIRECT` write is rejected by the device itself.
 
 ## Generation Bump
 
