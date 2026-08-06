@@ -123,10 +123,28 @@ once.
       the retry path yet, since no existing scenario can make a fence fail
       without also killing the controller.
 - [x] Chaos coverage added: `scripts/test/chaos-fencing-retry.sh` (docker +
-      aws). Run against docker on 2026-08-06 and confirmed both control-plane
-      properties hold: the sweep completes an orphaned intent unprompted
-      (R1), and it drops an intent for a node that re-registered without
-      touching its generation (R2).
+      aws), R1-R4. **Docker 10/10 and AWS 5/5 on 2026-08-06**, covering both
+      the control-plane properties and the end-to-end behaviour:
+      - R1 — sweep acts on an orphaned intent. On docker (single-signal) it
+        completes the fence exactly once; on AWS the synthetic node cannot be
+        detached, so the assertion is the sharper one: the sweep keeps
+        retrying (3 retries observed), never bumps a generation it could not
+        confirm, and leaves the intent owed.
+      - R2 — intent dropped, generation untouched, for a re-registered node.
+      - R3 — real node killed. AWS: real `ec2:DetachVolume` confirmed, then
+        `gen:n1` 0 -> 1 exactly once, intent cleared, claim released, and the
+        third node logged `fence already claimed by another controller` —
+        cross-node dedup against real infrastructure.
+      - R4 (AWS only) — a *genuine* fence failure, forced by attaching an
+        explicit `Deny` on `ec2:DetachVolume` to the `etcfs-nodes` role while
+        a node is partitioned. The controller logged repeated
+        `device access not confirmed severed, NOT bumping generation` every
+        30 s and held the generation at 0 throughout; once the permission was
+        restored, a later sweep completed the fence unaided
+        (`node fenced generation=1 previous=0`, intent cleared). That is the
+        whole item demonstrated end to end: a failure that used to be a
+        terminal limbo now self-heals with no operator action and no code
+        change in the recovery path.
 - [x] **Found by that run, fixed the same day:** `Controller.reconcile` had a
       TOCTOU distinct from the race this item already closed. It listed
       `fence_pending` once per sweep tick, then acted on that snapshot
