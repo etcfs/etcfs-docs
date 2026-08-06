@@ -122,6 +122,44 @@ once.
       Written but not yet run (they need a real etcd); no chaos script exercises
       the retry path yet, since no existing scenario can make a fence fail
       without also killing the controller.
+- [x] Chaos coverage added: `scripts/test/chaos-fencing-retry.sh` (docker +
+      aws). Run against docker on 2026-08-06 and confirmed both control-plane
+      properties hold: the sweep completes an orphaned intent unprompted
+      (R1), and it drops an intent for a node that re-registered without
+      touching its generation (R2).
+- [ ] **Found by that run, not yet fixed:** `Controller.reconcile` has a
+      TOCTOU distinct from the race this item already closed. It lists
+      `fence_pending` once per sweep tick, then acts on that snapshot
+      per-entry without re-checking the entry is still pending once it wins
+      the claim. Reproduced on docker (3 controllers): a long-lived intent
+      visible across a sweep tick can be listed by two controllers before
+      either clears it; the first claims and completes the fence
+      (`N`→`N+1`, clear, release); the second, still holding its
+      now-stale copy from its own `ListFenceIntents` call, then wins the
+      now-released claim and replays the fence unconditionally, bumping
+      `N+1`→`N+2` (`chaos-report-fencing-retry-20260806-121732`, gen landed
+      on 1 in some runs and 2 in others — nondeterministic on tick timing,
+      confirmed via controller logs showing both `node fenced` lines for the
+      same node). Same class of duplicate this item already treats as
+      benign (both `Fencer` implementations are idempotent, the generation
+      CAS only ever increases) — costs a redundant real `Fence()` call per
+      straggler (an extra EC2 API round trip or NVMe preempt), not
+      correctness. The watch path is unaffected: it fires once per DELETE
+      event, so there is no repeated List() to go stale. Fix, when picked
+      up: re-verify the intent still exists (or re-read current generation)
+      *after* winning the claim in `reconcile`, before calling `fenceNode`.
+- [ ] The docker chaos script's baseline write (R3/R4, killing a real node)
+      was flaky on the dev host this was validated on — deterministic
+      "no space left on device" from the FUSE mount on some runs, absent from
+      the etcfuse-meta logs entirely (no arena keys ever got created), and
+      not reproducible in isolation with a fresh cluster and no prior
+      scenario activity. Inodes and nominal disk space were not exhausted.
+      Not chased further — looks like docker/host-level flakiness from rapid
+      repeated `compose up --build` cycles on a loaded box, not a fencing
+      or arena bug, but recorded here since it wasn't fully root-caused.
+      `writef_retry` in the script tolerates it; if it recurs, prefer running
+      R3/R4 as their own invocation rather than as part of `all`, or run
+      against AWS instead.
 
 ## 6. Arena reclamation has no implementation
 
