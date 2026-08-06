@@ -155,18 +155,18 @@ once.
       duplicate for a miss. Coverage:
       `TestController_SweepSkipsFenceCompletedWhileWaitingForClaim` and
       `TestController_WatchPathFencesWithoutARecordedIntent`.
-- [ ] The docker chaos script's baseline write (R3/R4, killing a real node)
-      was flaky on the dev host this was validated on — deterministic
-      "no space left on device" from the FUSE mount on some runs, absent from
-      the etcfuse-meta logs entirely (no arena keys ever got created), and
-      not reproducible in isolation with a fresh cluster and no prior
-      scenario activity. Inodes and nominal disk space were not exhausted.
-      Not chased further — looks like docker/host-level flakiness from rapid
-      repeated `compose up --build` cycles on a loaded box, not a fencing
-      or arena bug, but recorded here since it wasn't fully root-caused.
-      `writef_retry` in the script tolerates it; if it recurs, prefer running
-      R3/R4 as their own invocation rather than as part of `all`, or run
-      against AWS instead.
+- [x] R3/R4's baseline write failed with "no space left on device" during
+      validation. Root cause was the chaos script, not the filesystem: R3/R4
+      opened by deleting `gen:n1` to get a clean baseline, while n1 was still
+      live. `WithGenerationGuard` compares that key's *value*, and a value
+      comparison against a missing key always evaluates false, so every
+      guarded write from n1 was rejected as `ErrFenced` — which
+      `handleCreate`'s `allocInode` failure path reports to FUSE as `-ENOSPC`
+      (`internal/ipc/handlers.go:218`). The script was fencing the node it
+      was about to test. Fixed by baselining `gen:n1` and asserting the
+      delta instead of deleting the key. Worth knowing generally: an
+      unexplained ENOSPC from an EtcFS mount is more likely a missing or
+      stale `gen:<node>` key than a full device.
 
 ## 6. Arena reclamation has no implementation
 
