@@ -123,8 +123,12 @@ once.
       the retry path yet, since no existing scenario can make a fence fail
       without also killing the controller.
 - [x] Chaos coverage added: `scripts/test/chaos-fencing-retry.sh` (docker +
-      aws), R1-R4. **Docker 10/10 and AWS 5/5 on 2026-08-06**, covering both
-      the control-plane properties and the end-to-end behaviour:
+      aws), R1-R4. Results on 2026-08-06: **docker `all` 10/10**, **AWS `all`
+      11/12** (R1-R3 green; R4 failed there on a since-fixed harness bug), and
+      **AWS `R4` 5/5** once fixed. The full AWS suite has not been re-run in a
+      single green invocation since — every scenario has passed on AWS, but
+      not all in one run. Between them they cover the control-plane properties
+      and the end-to-end behaviour:
       - R1 — sweep acts on an orphaned intent. On docker (single-signal) it
         completes the fence exactly once; on AWS the synthetic node cannot be
         detached, so the assertion is the sharper one: the sweep keeps
