@@ -34,24 +34,42 @@ With neither flag the controller degrades to single-signal fencing — bumping t
 
 ## Controller Architecture
 
-The controller runs as a background goroutine within the Go daemon (etcfuse-meta). It watches the etcd membership prefix for DELETE events and maintains a set of active fences to prevent duplicate work.
+The controller runs as a background goroutine within the Go daemon (etcfuse-meta). It watches the etcd membership prefix for DELETE events, and runs a second goroutine — the reconciliation sweep — that retries any fence the watch path did not carry to completion. Both paths share the same two etcd keys: a durable record of the fence that is owed, and a lease-bound claim that stops two controllers performing it at once.
 
 ```
-┌──────────────────────────────────────┐
-│        Fencing Controller            │
-│                                      │
-│  membership watch channel ──►        │
-│    on DELETE event:                  │
-│      extract node ID                 │
-│      if not already fencing:         │
-│        go fenceNode(nodeID)          │
-│                                      │
-│  activeFences map:                   │
-│    {nodeID → start_time}             │
-│    (prevents concurrent fences       │
-│     of the same node)                │
-└──────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│              Fencing Controller                │
+│                                                │
+│  membership watch channel ──►                  │
+│    on DELETE event:                            │
+│      extract node ID and instance ID           │
+│      put fence_pending:<node> = <instance>     │
+│      go fenceNode(node, instance)              │
+│                                                │
+│  reconciliation sweep (every 30s):             │
+│    for each fence_pending:<node>:              │
+│      membership:<node> present? drop the       │
+│        intent — the node re-registered         │
+│      otherwise: fenceNode(node, instance)      │
+│                                                │
+│  fenceNode:                                    │
+│    claim fence_claim:<node> (CAS + lease)      │
+│    sever device access, bump generation        │
+│    delete fence_pending:<node>                 │
+└────────────────────────────────────────────────┘
 ```
+
+### Fence Intent (`fence_pending:<node_id>`)
+
+The membership watch is edge-triggered: it fires once, on the DELETE of a key that is already gone, so a fence that fails, times out, or dies with its controller has no event left to re-trigger it. `fence_pending:<node_id>` is the durable record that closes that gap. It is written on the watch goroutine, before the fence is attempted, and deleted only after the generation bump succeeds — so anything left behind is by definition an incomplete fence. Its value is the expired node's instance ID, stored because that value lives only inside the membership key, which is already deleted by the time a retry runs.
+
+The key is not lease-bound. An owed fence must survive the death of whichever controller happened to observe the expiry.
+
+### Fence Claim (`fence_claim:<node_id>`)
+
+Every survivor watches the same prefix and receives the same DELETE, so all of them begin fencing the same node simultaneously — observed on AWS on 2026-08-06, where two survivors fenced `n1` within 2 ms of each other. `fence_claim:<node_id>` is a create-CAS on an empty key, bound to a lease: exactly one controller wins it and proceeds, and the rest log and return.
+
+The claim is lease-bound precisely because the intent is not. A controller that crashes mid-fence must release its claim automatically, or the retry the intent exists to enable would be blocked forever by a claim nobody will ever drop. The lease TTL (120 s) must exceed the longest a single fence attempt can take — the EBS detach path polls for up to a minute — since a claim expiring under a live fencer would readmit the duplicate fence it exists to prevent. Erring long costs only retry latency after a crash.
 
 ## Membership Watch
 
@@ -76,16 +94,17 @@ The new watch starts from the current etcd revision, so no membership events are
 
 When the controller detects a DELETE event on a membership key, it executes the fence protocol:
 
-### 1. Dedup Check
+### 1. Claim the Fence
 
 ```
-if nodeID is in activeFences:
-    log: "fence already in progress"
+leaseID, won = store.ClaimFence(ctx, nodeID, 120s)
+if not won:
+    log: "fence already claimed by another controller"
     return
-add nodeID to activeFences with current timestamp
+defer store.ReleaseFenceClaim(leaseID)
 ```
 
-The `activeFences` map prevents concurrent fence operations for the same node. If the same node's membership key is deleted twice (e.g., from two different watch events on different controller replicas), only the first fence proceeds. The dedup check uses the membership key prefix — multiple DELETEs for the same node are collapsed.
+The claim is cluster-wide, not per-process: the same node's expiry is observed by every survivor, so an in-memory dedup map would collapse only the duplicates originating within one controller. A duplicate fence was never corrupting — both `Fencer` implementations are idempotent (a second preempt of an unregistered key still leaves it absent, and `EBSDetacher` treats an already-detached volume as success) and the generation CAS serialises the bumps — but it is wasted work against a cloud API or a device during an incident, and it made the logs read as two independent fences of the same node.
 
 ### 2. Read Current Generation
 
@@ -104,7 +123,7 @@ Under NVMe reservations the step is:
 1. Preempt the expired node's reservation key, derived from its node ID (`nvmeresv.KeyForNode`, FNV-1a 64). Deriving rather than assigning means any survivor can compute the key without a registry.
 2. Re-read the reservation report and confirm the key is no longer registered. A preempt that reports success while the registration survives is treated as a failed fence.
 
-Under the EBS fallback it is the detach-then-poll sequence described above. Either way, a fence that cannot be confirmed aborts without bumping: a node the cluster believes is fenced, but is not, is more dangerous than one it knows it failed to fence. This does not retry — see the limbo state described below.
+Under the EBS fallback it is the detach-then-poll sequence described above. Either way, a fence that cannot be confirmed aborts without bumping: a node the cluster believes is fenced, but is not, is more dangerous than one it knows it failed to fence. The abort leaves `fence_pending:<node_id>` in place, so the reconciliation sweep retries the attempt rather than abandoning it.
 
 ### 4. Bump Generation
 
@@ -117,11 +136,12 @@ The CAS bump atomically transitions the generation from `currentGen` to `current
 ### 5. Cleanup
 
 ```
-remove nodeID from activeFences
+delete fence_pending:<node_id>
+release fence_claim:<node_id> (revoke its lease)
 log: "node fenced", node_id, generation, previous
 ```
 
-The controller removes the node from the active set and logs the success. The generation is now one higher than before the fence, which blocks any pending metadata transactions from the fenced node.
+The intent is cleared only here, at the one point where nothing is owed any more; leaving it would make the sweep re-fence the node on every tick. The generation is now one higher than before the fence, which blocks any pending metadata transactions from the fenced node.
 
 ## Dual-Confirmation Model
 
@@ -133,7 +153,13 @@ The two confirmations are:
 
 2. **Device or cloud-API confirmation.** Either the reservation report confirms the node's key is no longer registered (NVMe path), or the EC2 API confirms the shared volume is detached from the instance (`DescribeVolumes` no longer lists the attachment). Both are confirmations that the node cannot reach the block device; the reservation report is the stronger of the two, because the enforcement and the evidence come from the same device rather than from a control plane describing an asynchronous operation.
 
-The generation bump is NOT performed until both confirmations are received. If only one confirmation arrives (e.g., the membership key is deleted but the volume detach API times out), the controller alerts but does not bump. The node remains in a limbo state until the second confirmation arrives or an administrator intervenes.
+The generation bump is NOT performed until both confirmations are received. If only one confirmation arrives (e.g., the membership key is deleted but the volume detach API times out), the controller alerts but does not bump.
+
+That state is no longer a terminal limbo requiring an administrator. The recorded intent makes it a retry: the sweep re-attempts the fence every 30 s until either the second confirmation arrives and the generation is bumped, or the node re-registers. A transient failure — an EC2 API throttle, a device busy during a namespace re-enumeration, a controller killed mid-fence — therefore resolves itself. What still requires intervention is a failure that never clears, such as a device that refuses every preempt; the difference is that the cluster keeps trying and keeps logging `retrying incomplete fence` rather than falling silent after one attempt.
+
+### Re-registration Drops the Intent
+
+If the sweep finds a live `membership:<node_id>` key for a node with a pending intent, it deletes the intent instead of fencing. A node holding a live membership lease again has recovered from the expiry that triggered the fence: its own self-fencing watchdog did not stop it, and it is reachable from etcd. Severing a healthy node's device access on the strength of an expiry it has already recovered from would convert a transient partition into an outage, and the epoch separation the generation provides is only needed against a node that cannot be told it is gone.
 
 ### Simulation Mode
 
@@ -153,9 +179,11 @@ The generation is monotonically non-decreasing. It never resets, never wraps, an
 
 ## Leader Election
 
-The fencing controller supports multiple replicas for high availability. In the current implementation (Phase 5), multiple controller replicas can run concurrently. They watch the same membership prefix and receive the same DELETE events. The dedup check in `activeFences` prevents duplicate fence execution.
+The fencing controller supports multiple replicas for high availability. They watch the same membership prefix and receive the same DELETE events; the per-node `fence_claim:<node_id>` lease described above is what serialises them, so exactly one replica executes any given fence.
 
-A full leader-election protocol (etcd lease-backed lock) is planned for Phase 11. In that model:
+This is deliberately per-fence mutual exclusion rather than cluster-wide leadership. A single fencing leader would be a single point of failure for the one operation that must not be missed, and it would gain nothing here: fences of different nodes are independent, and the claim already gives each one an owner. It also degrades better — a controller that dies holding a claim releases it when its lease expires, and any other replica's sweep picks the fence up.
+
+A full leader-election protocol (etcd lease-backed lock) remains a possible future direction if a fencing action ever needs to be globally serialised rather than per-node. In that model:
 
 1. Multiple controller replicas watch the `fencing/leader` key.
 2. Each replica attempts to acquire the leadership lease via CAS.

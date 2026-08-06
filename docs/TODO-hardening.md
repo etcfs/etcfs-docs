@@ -64,7 +64,7 @@ processes.
       startup log line — since a user relying on cross-node `flock` today gets no
       runtime signal that it's unenforced.
 
-## 5. External fencing: controller race and no retry path for a failed detach
+## 5. External fencing: controller race and no retry path for a failed detach — closed 2026-08-06
 
 Found implementing dual-confirmed EBS detach (`pkg/fencing/detach.go`,
 `pkg/fencing/controller.go`). Neither is a safety issue on its own, but both are
@@ -86,11 +86,42 @@ feature.
   ("remains in a limbo state until... an administrator intervenes") — an
   acknowledged design gap that is now reachable code rather than a hypothetical.
 
-- [ ] Decide whether either is worth closing before it's observed operationally.
-      A periodic reconciliation sweep (retry any node whose lease is expired but
-      generation was never bumped) would close the retry gap and, incidentally,
-      make the race more likely rather than less — the two would need to be
-      designed together, not separately.
+Both halves survive item 9 unchanged, and both now apply to the NVMe preempt
+path as well as the EBS detach path. The 2026-08-06 AWS run
+(`chaos-report-nvme-fencing-20260806-111257`) caught the race directly: both
+survivors began fencing `n1` at the same millisecond, both logged `device
+access severance confirmed`, and one won the generation CAS. That is benign
+for the same reason it is benign on the detach path — a second preempt of an
+already-unregistered key still leaves the key absent, so `NVMeFencer.Fence`
+is idempotent in the way `alreadyDetached` makes `EBSDetacher` idempotent.
+The retry gap is mechanism-independent: it comes from the edge-triggered
+watch, so a reconciliation sweep would close it for both implementations at
+once.
+
+- [x] Both closed together, as the item anticipated they would have to be. The
+      mechanism is two etcd keys, described in full in
+      `docs/architecture/fencing/external-fencing-controller.md`:
+      - `fence_pending:<node_id>` — written on the watch goroutine before the
+        fence is attempted, deleted only after the generation bump. It carries
+        the instance ID, which is otherwise readable only from the membership
+        key that lease expiry already deleted. Anything left in this prefix is
+        by definition an unfinished fence.
+      - `fence_claim:<node_id>` — a lease-bound create-CAS replacing the old
+        in-memory `activeFences` map, so dedup is cluster-wide rather than
+        per-process. Lease-bound because the intent is not: a controller that
+        dies mid-fence must release its claim, or the retry the intent enables
+        would be blocked by a claim nobody drops.
+      `Controller.runSweep` (30s) retries every pending intent, and drops one
+      whose node has re-registered — a node holding a live lease again has
+      recovered from the expiry, and fencing it then would turn a transient
+      partition into an outage.
+- [x] Coverage: four integration tests in
+      `pkg/fencing/controller_integration_test.go` — a failed fence retried by
+      the sweep, the intent cleared on success, the intent dropped on
+      re-registration, and two controllers producing exactly one fence.
+      Written but not yet run (they need a real etcd); no chaos script exercises
+      the retry path yet, since no existing scenario can make a fence fail
+      without also killing the controller.
 
 ## 6. Arena reclamation has no implementation
 
@@ -108,10 +139,17 @@ graceful or not.
       (currently only `pkg/membership.Manager`, harness-only, does this).
 - [ ] Any reclamation path must satisfy invariant 4 from
       `docs/architecture/storage/kleppmann-stale-write-analysis.md`: an arena may
-      only return to the pool once the previous owner is *provably* done with it,
-      and since EBS gives no such proof, this can only be a time-bound argument,
-      never derived from etcd state alone. No current design for this exists — it's
-      the single largest remaining gap in the allocation story.
+      only return to the pool once the previous owner is *provably* done with it.
+      On a cluster started with `--nvme-reservations` that proof now exists and
+      is cheap: a confirmed reservation preempt (item 9) means the device is
+      already rejecting the previous owner's writes, so an arena may be reissued
+      immediately after the fence, with no grace period and no clock-bound
+      argument. Where reservations are unavailable (Docker, `gp3`, or the flag
+      unset) the original problem stands — no such proof exists, and only a
+      time-bound argument would do. Design accordingly: the reclamation trigger
+      should require the strong proof rather than assuming it, so a
+      non-reservation deployment does not silently inherit a guarantee it
+      cannot make.
 
 **Same gap exists one level down, for deleted files.** `AtomicUnlink`
 (`pkg/metadata/dirent.go:226`) removes the dirent and, at `Nlink == 0`, the
@@ -255,7 +293,7 @@ What it costs, beyond the function itself (already built):
       them wrong is expensive to unwind once a balancer is running against
       production traffic.
 
-## 9. Replace advisory fencing with NVMe reservations (device-enforced) — implemented, unverified on AWS
+## 9. Replace advisory fencing with NVMe reservations (device-enforced) — implemented, verified on AWS
 
 `docs/architecture/storage/kleppmann-stale-write-analysis.md` stated until
 2026-08-06 that "EBS Multi-Attach offers no equivalent" to SCSI-3 Persistent
@@ -314,21 +352,57 @@ t3.medium, 2026-08-05, infra fully torn down after):**
   loopback devices support no reservations, and the detach path is already
   verified on AWS.
 
-- [ ] Run `scripts/test/chaos-nvme-fencing.sh` on real AWS. Written but **not
-      yet executed** — every claim about this on real hardware beyond the
-      2026-08-05 spike is currently unverified. R8 (detach/reattach) in
-      particular encodes an expectation, not an observation: registration is
-      per-controller, so a detach should drop it, but that has not been
-      confirmed.
-- [ ] Decide whether the self-fencing watchdog's grace period can be relaxed
-      once the device is the enforcing layer — it no longer has to win a race
-      it used to be the only entrant in.
-- [ ] Item 6 (reclamation) can now be built without grace-period machinery on
-      a reservation-enabled cluster: a confirmed preempt is the quiescence
-      proof invariant 4 demanded. Nothing consumes `free_arena:` yet.
-- [ ] Fold item 5 (controller retry/limbo) into this path: a failed preempt
-      leaves the same limbo a failed detach did, and there is still no
-      reconciliation sweep to retry it.
+- [x] Run `scripts/test/chaos-nvme-fencing.sh` on real AWS. Run 2026-08-06,
+      14/15 assertions pass (`chaos-report-nvme-fencing-20260806-111257`).
+      R1–R7 confirm every claim this item makes: registration at startup,
+      WEAR reservation with genuine concurrent writers, a partitioned node's
+      key preempted in ~6s, the preempted node's `O_DIRECT` write rejected
+      **synchronously at the device** with `EBADE`, the generation bump
+      following the confirmed preempt (not the reverse), survivors
+      unaffected, and re-registration on restart. R8 (detach/reattach)
+      failed only on the script's retry window — the `resv-report` captured
+      moments after the failure showed the node's key registered, so the
+      recovery was real, just slower than the 30s the first version of the
+      script allowed for (hot-reattached NVMe namespaces take longer to
+      re-enumerate than one already attached at boot). Fixed in the script
+      (30s → 60s); not re-run after the fix. Two script-only bugs were found
+      and fixed during this validation (an invalid `nvme resv-report` flag
+      that broke every reservation-state check, and this retry window);
+      neither `pkg/nvmeresv` nor `pkg/fencing` needed any change.
+- [x] Decide whether the self-fencing watchdog's grace period can be relaxed
+      once the device is the enforcing layer. **Decision: leave it at 2× TTL,
+      unchanged.** The premise — that the watchdog no longer has to win a race
+      it used to be the only entrant in — is true only where reservations are
+      available. On Docker, on `gp3`, and on any deployment started without
+      `--nvme-reservations`, the watchdog is still the only thing standing
+      between a partitioned node and the disk, so a longer grace period there
+      is a direct safety regression. Even on a reservation-enabled cluster the
+      remaining jobs argue for keeping it short rather than lengthening it: it
+      bounds how long a wedged FUSE request can block (item 7) and it releases
+      the mount and device handles. Nothing wants a *longer* window, so there
+      is no change to make.
+- [x] Record what the preempt path means for item 6 (reclamation). Done — the
+      quiescence argument now lives in item 6, where the work would happen,
+      and `kleppmann-stale-write-analysis.md`'s invariant 4 has been revised.
+      Short version: a confirmed preempt is the proof invariant 4 demanded, so
+      reclamation on a reservation-enabled cluster needs no grace-period
+      machinery. Nothing consumes `free_arena:` yet, so this unblocks item 6
+      rather than completing any part of it.
+- [x] Decide whether to fold item 5 (controller retry/limbo) into this path.
+      **Decision: keep item 5 separate.** Item 9 changed the shape of neither
+      half of it. The *race* half is, if anything, better understood now: the
+      2026-08-06 AWS run caught both survivors fencing `n1` within 2ms of each
+      other, both reporting `device access severance confirmed`, and exactly
+      one winning the generation CAS. A second preempt of an
+      already-unregistered key is a no-op that still leaves the key absent, so
+      `NVMeFencer.Fence` is naturally idempotent in the same way
+      `alreadyDetached` makes `EBSDetacher` idempotent — the race stays
+      redundant work rather than corruption, on both paths. The *retry* half
+      is untouched: a failed preempt leaves the identical limbo a failed
+      detach did, because the limbo comes from the edge-triggered membership
+      watch, not from the severance mechanism. A reconciliation sweep would
+      close it for both implementations at once, which is an argument for
+      solving it in item 5 rather than duplicating it here.
 
 ---
 
@@ -337,9 +411,9 @@ t3.medium, 2026-08-05, infra fully torn down after):**
 Implementation order:
 
 1. Item 7 (unbounded FUSE context) — only item that's a real bug in a healthy cluster, ready to build, zero dependencies, blocks nothing. Highest value/effort ratio.
-2. Item 9 (NVMe reservations) — biggest impact, but a build decision; unblocks 5 and 6.
-3. Item 5 (controller race/retry) — fold into 9's fenceNode rewrite rather than solving twice.
-4. Item 6 (reclamation) — needs 9's quiescence proof to avoid building grace-period machinery that 9 makes redundant.
+2. ~~Item 9 (NVMe reservations)~~ — done: built and AWS-verified 2026-08-06. Its decisions are recorded in the item; what it unblocks is now live for 5 and 6.
+3. ~~Item 5 (controller race/retry)~~ — done 2026-08-06: one reconciliation sweep plus a durable fence intent closes the retry gap for both the preempt and detach paths, and a lease-bound per-node claim makes the dedup cluster-wide.
+4. Item 6 (reclamation) — 9's confirmed preempt is the quiescence proof invariant 4 demanded, so no grace-period machinery is needed on a reservation-enabled cluster. Gate the trigger on that proof rather than assuming it.
 5. Item 1 (harness mop-up) — independent, low value, do whenever.
 6. Item 8 (RebalanceArena caller) — decision item, likely "no".
 7. Item 2 — resolves as a side effect of 7.
