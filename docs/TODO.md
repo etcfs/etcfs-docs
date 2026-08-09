@@ -1,15 +1,54 @@
 # TODO
 
-Closed items are removed; history lives in git log, `docs/chaos-reports/`, and
-the architecture docs each item touched. This is a throwaway tracking doc, not
-a design doc — for the "why", follow the links.
+Closed items stay, marked **CLOSED** with a line on how they were resolved —
+the list is meant to show what was settled as well as what is left. The full
+story lives in git log, `docs/chaos-reports/`, and the architecture docs each
+item touched. This is a tracking doc, not a design doc — for the "why", follow
+the links.
 
-Ordered by severity, not by area. Everything above "Hardening" is a live
-correctness problem on the default configuration.
+Ordered by severity, not by area. Everything still open above "Hardening" is a
+live correctness problem on the default configuration; items marked CLOSED are
+kept for the record.
 
 # BLOCKING — silent data loss or corruption
 
-## 1. `rename` over an existing file orphans the target's inode
+## 1. The compactor repointed extents at data it never copied — CLOSED
+
+**Resolved** by deleting `pkg/compaction` outright.
+
+`CompactArena` rewrote every extent's `disk_off` to a destination arena and never
+copied a byte — there was no device I/O anywhere in the package. It ran hourly
+from `main.go` against any arena under 50% usage, which a normally-occupied
+arena always is, so a node up for an hour corrupted its own files.
+
+It was not rebuilt, because an extent-based filesystem does not need it. A file
+is a list of extents, so its bytes never had to be contiguous: `Allocate` now
+returns several runs when no single one is large enough, which removes the only
+failure compaction was there to prevent. There is no seek-locality argument
+either — the shared device is NVMe or EBS.
+
+- [x] Unwire and delete the compactor.
+- [x] Multi-run allocation, so fragmented free space stays usable.
+- [x] Return emptied arenas to the global pool on a background sweep, which is
+      the reclamation the compactor was nominally providing.
+
+## 2. Overwriting a byte range returned the old or the new bytes at random — CLOSED
+
+**Resolved** by ordering extents on a stored sequence number and reclaiming what
+a write buries.
+
+Every write appends a fresh extent, so overwriting a range left two extents
+covering it, and `DecodeExtents` ordered them with an unstable sort on offset
+alone — the same file could read back differently from one call to the next. The
+buried extent was never freed either, and the orphan check could not see it,
+because the inode was still alive.
+
+- [x] Deterministic ordering: offset ascending, then sequence descending.
+- [x] Reclaim buried extents at commit, for the ranges this node owns.
+- [x] Scrubber `CheckDeadExtents` for the cross-node remainder, covering both
+      overwritten extents and those left past EOF by a truncate.
+
+## 3. `rename` over an existing file orphans the target's inode
 
 `AtomicRename` (`pkg/metadata/dirent.go:269`) deletes the source dirent and
 puts the target dirent in one transaction. When the target name already exists
@@ -35,7 +74,7 @@ Related gaps in the same function:
 - [ ] Reject a directory rename whose destination is under its own source, and
       a non-empty directory target.
 
-## 2. `CreateInode` gives every inode it creates `nlink = 0`
+## 4. `CreateInode` gives every inode it creates `nlink = 0`
 
 `Nlink: (mode >> 12) & 1` (`pkg/metadata/inode.go:29`), commented "1 for
 directories". It does not do that. `S_IFDIR` is 0o040000, so `mode >> 12` is 4
@@ -55,7 +94,7 @@ those set `Nlink` explicitly.
       for the atomicity item below anyway).
 - [ ] Assert nlink in a test for each of symlink, mknod, and hardlink.
 
-## 3. Shared locks never share
+## 5. Shared locks never share
 
 `GetLockInfo` (`pkg/metadata/lock.go:143`) parses the lock value with
 `fmt.Sscanf(value, '{"mode":"%s"}', &rec.Mode)`. `%s` in `Sscanf` consumes a
@@ -86,7 +125,7 @@ it for every other holder.
 - [ ] Test: two concurrent shared acquisitions both succeed; a shared and an
       exclusive conflict.
 
-## 4. `nlink` increment and decrement can lose updates
+## 6. `nlink` increment and decrement can lose updates
 
 `putInodeWithCAS` (`pkg/metadata/inode.go:150`) is not a CAS. Its only
 comparison is `CreateRevision(key) > 0` — "the inode exists". `IncrementNlink`
@@ -104,7 +143,7 @@ inode is never deleted.
 
 # SHOULD FIX — correctness gaps
 
-## 5. `chmod`, `chown`, `utimens` and growing truncate silently do nothing
+## 7. `chmod`, `chown`, `utimens` and growing truncate silently do nothing
 
 `ec_setattr` (`pkg/fuse/ops.c:680`) sends only `ino`, `fh`, `to_set` and
 `st_size`; the rest of `struct stat` is discarded with `(void) attr;`. The Go
@@ -123,7 +162,7 @@ Applications that check the result of a `chmod` see the old mode.
 - [ ] Define the remaining `FATTR_*` constants rather than the lone
       `fattrSize = 1 << 3` (`handlers.go:335`).
 
-## 6. Every file is owned by uid 1000
+## 8. Every file is owned by uid 1000
 
 `AtomicCreateFile`, `AtomicCreateDir` and `CreateInode` are all called with
 literal `1000, 1000` (`handlers.go:221`, `:247`, `:383`, `:449`). The caller's
@@ -141,7 +180,7 @@ bits are stored but never enforced.
       not, say so in the mount documentation — `default_permissions` at mount
       time gets kernel-side enforcement for the cost of one mount option.
 
-## 7. `symlink`, `link` and `mknod` are not atomic
+## 9. `symlink`, `link` and `mknod` are not atomic
 
 `AtomicCreateFile` puts the dirent and the inode in one transaction. The other
 three creation paths do not:
@@ -163,7 +202,7 @@ extents without inodes, not inodes without dirents.
       does.
 - [ ] Add an "inode with no dirent" check to the scrubber and to `fsck`.
 
-## 8. `rmdir`'s empty-directory check is a separate round trip
+## 10. `rmdir`'s empty-directory check is a separate round trip
 
 `handleRmdir` (`handlers.go:274`) does `LookupDirent`, `GetInode`,
 `ListDirents`, and only then `AtomicUnlink`. Another node can create an entry
@@ -178,7 +217,7 @@ with the child count folded into the inode record.
 
 - [ ] Pick one and make `rmdir` a single transaction.
 
-## 9. A malformed IPC frame takes down the whole metadata daemon
+## 11. A malformed IPC frame takes down the whole metadata daemon
 
 Every handler reads a length from the payload and slices with it unchecked:
 `name := string(rest[:nameLen])` (`handlers.go:36`, and the same pattern at
@@ -206,7 +245,7 @@ desync — and a desync of exactly this kind has happened before, in the
       side's `ipc_sync` and `do_ipc_exchange`, which `malloc` the response
       length just as blindly.
 
-## 10. A membership deletion missed during a watch reconnect is never fenced
+## 12. A membership deletion missed during a watch reconnect is never fenced
 
 `Controller.Run` (`pkg/fencing/controller.go:96`) re-establishes the watch on
 channel close without a revision, so events between the close and the new watch
@@ -220,7 +259,7 @@ anything.
       nodes against live membership keys, so a node that lost its lease gets
       fenced whether or not its event was seen.
 
-## 11. Dead and broken metadata APIs
+## 13. Dead and broken metadata APIs
 
 `UpdateInode` (`inode.go:72`) compares `ModRevision(key) = 0` with the comment
 "placeholder; caller provides correct rev" — no revision is passed, and
@@ -244,7 +283,7 @@ Two of those are also wrong:
 - [ ] If pagination is wanted later (see the readdir item), write it against
       `WithPrefix` + `WithLimit` rather than fixing this one.
 
-## 12. The generation scrub check flags every healthy node after any fence
+## 14. The generation scrub check flags every healthy node after any fence
 
 `CheckGenerationConsistency` (`pkg/scrub/scrubber.go:262`) takes the maximum
 generation across all nodes and reports every extent stamped below it. Because
@@ -261,7 +300,7 @@ the stamp against.
       — it currently feeds an unbounded anomaly list (below) and would fire the
       `etcfuse_scrub_anomalies_total` alert continuously after the first fence.
 
-## 13. Nothing ties allocation to the actual size of the device
+## 15. Nothing ties allocation to the actual size of the device
 
 `AcquireArena` takes the next counter value and uses `arenaID * ArenaSizeBytes`
 as the offset (`pkg/arena/allocator.go:66`). Nothing compares that against
@@ -283,7 +322,7 @@ write.
       instead of two hardcoded copies.
 - [ ] Return 0.0, not 1.0, from `LiveRatio` when no arena is held.
 
-## 14. O_DIRECT silently degrades to a buffered open
+## 16. O_DIRECT silently degrades to a buffered open
 
 `blockio.Open` (`pkg/blockio/device.go:27`) tries `O_RDWR|O_DIRECT` and, on any
 failure, retries without `O_DIRECT` and continues with `direct = false`.
@@ -301,33 +340,32 @@ only signal, and it reads as informational.
       configured. Keep the fallback only for the single-node and file-backed
       test paths, and log it at warning level there.
 
-## 15. A write landing strictly inside an extent reclaims nothing
+## 17. A write landing strictly inside an extent reclaims nothing — CLOSED
 
-Partial overlaps are handled at the edges: an extent covered at its front or
-its back is trimmed to the surviving piece, which keeps its own key and chunk
-number, and the whole blocks it no longer reads from go back to the arena.
+**Resolved** by moving write ordering out of the key and into the value.
 
-A write landing strictly *inside* an extent is not, because the survivor is two
-pieces and the second needs a record of its own. Recency is carried by the chunk
-number in the key, so a new key would assert that piece is newer than the extent
-it was cut from, and it would then beat any genuinely newer extent overlapping
-it — reachable, since extents in another node's arena are never trimmed and so
-do overlap. The write buries the bytes and leaves their blocks allocated. Reads
-stay correct; the space is held until the file is deleted or fully overwritten.
+Extents carry a sequence number as a fifth field, `<log_off>,<disk_off>,<length>,
+<generation>,<sequence>`. Reads order by offset, then by descending sequence.
+The chunk number in the key is now only an identifier.
 
-Also unreclaimed, for the same reason at a smaller scale: a covered region under
-one block, since blocks are the unit of reuse.
+That is what makes a middle split safe: an overwrite trims the extent into a
+head under the original key and a tail under a fresh one, in one transaction,
+and *both keep their parent's sequence*. Neither can outrank a genuinely newer
+extent overlapping it — which was the hazard that blocked this, and is reachable,
+since extents in another node's arena are never trimmed and so do overlap.
 
-The fix is to stop deriving recency from the key. A sequence number stored *in*
-the extent value would let both halves of a split keep the parent's, leaving the
-key free to be nothing but an identifier.
+A four-field value decodes with its sequence set to its chunk number, which is
+the order those records were appended in, so old and new records stay correctly
+ordered against each other. No migration.
 
-- [ ] Add a sequence field to the extent value, defaulting to the chunk number
-      when absent so existing records still decode. Order reads by it, and have
-      a split carry the parent's into both pieces.
-- [ ] Then split down the middle: two records, blocks between them freed.
+- [x] Sequence field in the extent value, defaulting to the chunk number when
+      absent. Reads ordered by it; a split carries the parent's into both pieces.
+- [x] Split down the middle: two records, blocks between them freed.
+- [ ] Still unreclaimed: a covered region smaller than one block, since blocks
+      are the unit of reuse. Bounded and read-correct; the block comes back when
+      its extent is fully covered or the file is deleted.
 
-## 16. Integration suites clobber each other on a shared etcd
+## 18. Integration suites clobber each other on a shared etcd
 
 `pkg/arena`, `pkg/metadata` and `pkg/scrub` all carry `//go:build integration`
 tests that hit one etcd at `ETCD_ENDPOINTS`, with no key namespacing and no
@@ -345,7 +383,7 @@ and the failure reads as a product bug rather than a harness one.
 
 # HARDENING
 
-## 17. The self-fence window and the request timeout are not checked against each other
+## 19. The self-fence window and the request timeout are not checked against each other
 
 `requestTimeout` is 10s (`internal/ipc/retry.go:35`) and its comment states the
 constraint: it must sit below the self-fencing window, which is 2-3× the
@@ -356,7 +394,7 @@ daemon exits before the request deadline can fire — and `Parse`
 - [ ] Reject a lease TTL below `requestTimeout` at startup, or derive
       `requestTimeout` from the TTL instead of hardcoding it.
 
-## 18. Unbounded growth in three background paths
+## 20. Unbounded growth in three background paths
 
 - `Scrubber.anomalies` (`scrubber.go:136`) is appended to on every pass and
   never trimmed. A permanent anomaly — the generation false positive above is
@@ -376,7 +414,7 @@ they are worth fixing before spending the run.
 - [ ] Truncate the WAL periodically — or delete the WAL entirely, see below.
 - [ ] Bound the keepalive drain and log a failed release loudly.
 
-## 19. Backoff sleeps ignore context cancellation
+## 21. Backoff sleeps ignore context cancellation
 
 `retry` (`retry.go:54`) and `NextCounter` (`metadata/alloc.go:66`) both call
 `time.Sleep` between attempts. A request whose context is already cancelled
@@ -385,7 +423,7 @@ noticing.
 
 - [ ] `select` on `ctx.Done()` alongside the timer.
 
-## 20. Control-plane sockets live in `/tmp` with a permissions window
+## 22. Control-plane sockets live in `/tmp` with a permissions window
 
 `--listen` defaults to `/tmp/etcfuse.sock` and the notify socket is hardcoded
 to `/tmp/etcfuse-notify.sock` (`main.go:242`). Both do `os.Remove` then
@@ -397,7 +435,7 @@ remove-then-bind is racy against anything else that can write `/tmp`.
       notify path configurable, and set the umask around the bind rather than
       chmod after it.
 
-## 21. Miscellaneous error handling
+## 23. Miscellaneous error handling
 
 - `wal.Open` failure is swallowed (`main.go:151`): `if err == nil` with no
   `else`, so a missing `/var/lib/etcfuse/` disables the WAL silently.
@@ -418,7 +456,7 @@ remove-then-bind is racy against anything else that can write `/tmp`.
 
 # PERFORMANCE AND SCALE
 
-## 22. The whole filesystem is single-threaded end to end
+## 24. The whole filesystem is single-threaded end to end
 
 `fuse.c:263` runs `fuse_session_loop`, the single-threaded loop. `ops.c` does a
 synchronous `ipc_sync` on one shared fd. The Go side reads, dispatches and
@@ -442,7 +480,7 @@ interleave their frames and steal each other's replies.
       than a response demultiplexer, and the Go side already handles a
       connection per goroutine.
 
-## 23. `readdir` reads the whole directory and does one `GetInode` per entry
+## 25. `readdir` reads the whole directory and does one `GetInode` per entry
 
 `readdirResp` (`handlers.go:86`) ignores the offset and size the kernel sent,
 lists every dirent, and calls `s.store.GetInode` per entry (`:105`) — one etcd
@@ -455,7 +493,7 @@ kernel's buffer size.
 - [ ] Honour the offset and size so a large directory is paged rather than
       materialised whole.
 
-## 24. `statfs` scans every inode in the filesystem
+## 26. `statfs` scans every inode in the filesystem
 
 `handleStatfs` (`handlers.go:178`) does `GetPrefix(ctx, "inode:")` and uses only
 `len(...)`. Every `df` is a full range read over the whole namespace. The file
@@ -464,7 +502,7 @@ count is then compared against a hardcoded 1,000,000 ceiling (`:180`).
 - [ ] Maintain a counter, or accept a stale count from the scrubber's pass,
       which already scans the same prefix.
 
-## 25. The scrubber makes four redundant full-filesystem scans and an N+1
+## 27. The scrubber makes four redundant full-filesystem scans and an N+1
 
 `RunScrubPass` calls five checks that each independently `GetPrefix(PrefixExtent)`
 — collisions, orphans, dead, range, generation — so every 30 seconds the whole
@@ -481,7 +519,7 @@ also issues one `Get` per extent to test whether its inode exists, which
       equality, so two extents that overlap at different offsets — the actual
       invariant — are not detected.
 
-## 26. Block allocation is a linear bit scan under one global lock
+## 28. Block allocation is a linear bit scan under one global lock
 
 `findRun` skips fully-allocated 64-bit words but still walks the rest of the
 bitmap a bit at a time from block 0 on every call, and `Allocate` holds `a.mu`
@@ -499,7 +537,7 @@ of every extent in the filesystem, on the write path.
       silently re-issues live blocks. Worth an assertion at minimum, given the
       write path, the scrubber, and the failed-allocation undo all call it.
 
-## 27. Each write costs a flush, a sync, a full readback, and an fsync
+## 29. Each write costs a flush, a sync, a full readback, and an fsync
 
 `handleWriteBlock` does `FlushDevice`, `SyncRange`, and reads the whole written
 range back to discard it (`datapath.go:131`, `:145`, `:152`), and the WAL
@@ -516,7 +554,7 @@ expensive way to get it.
 
 # SIMPLIFICATION
 
-## 28. Does the WAL earn its place?
+## 30. Does the WAL earn its place?
 
 The WAL's stated job is to free blocks that were allocated and written but
 never committed to etcd. Arena reconstruction already achieves that: `Reconstruct`
@@ -534,7 +572,7 @@ write 41.
 
 - [ ] Decide: delete it, or give it a job reconstruction cannot do.
 
-## 29. Two implementations of the same consistency checks
+## 31. Two implementations of the same consistency checks
 
 `pkg/fsck` and `pkg/scrub` each implement nlink consistency, orphan extents and
 extent range validity, separately, with different thresholds and different
@@ -546,7 +584,7 @@ constants elsewhere.
 - [ ] One check library, two front ends: the offline `fsck` run and the online
       scrubber pass.
 
-## 30. `ipc.Service` cannot be tested against `MockStore`
+## 32. `ipc.Service` cannot be tested against `MockStore`
 
 `Service` holds `*metadata.Store` concretely (`internal/ipc/service.go:26`),
 even though `metadata.MetadataStore` exists as an interface and `pkg/scrub` and
@@ -557,7 +595,7 @@ even though `metadata.MetadataStore` exists as an interface and `pkg/scrub` and
       does, and take it as an interface. That closes the concurrent-inode-
       allocation coverage gap as a side effect rather than as its own project.
 
-## 31. Stale comments that describe a system that no longer exists
+## 33. Stale comments that describe a system that no longer exists
 
 - `cmd/etcfuse-meta/main.go:4` — "runs a gRPC server on a Unix domain socket".
   There is no gRPC anywhere in the wire path.
@@ -576,7 +614,7 @@ even though `metadata.MetadataStore` exists as an interface and `pkg/scrub` and
 
 - [ ] Fix as encountered; none of these is worth its own commit.
 
-## 32. Duplication in the C daemon
+## 34. Duplication in the C daemon
 
 `send_full` and `recv_full` are defined identically in `pkg/fuse/ops.c:51` and
 `pkg/fuse/pool.c:43`, as are the frame encode/decode halves of `ipc_sync` and
@@ -608,7 +646,7 @@ same class of assumption that the `readdirplus` desync broke.
 
 # STILL OPEN FROM BEFORE
 
-## 33. Concurrent inode allocation has no harness coverage
+## 35. Concurrent inode allocation has no harness coverage
 
 `Store.NextCounter` isn't reachable from `MockStore`. Covered only at the
 integration tier (`TestIntegration_CounterIsUniqueUnderConcurrency`) and by
@@ -620,7 +658,7 @@ integration tier (`TestIntegration_CounterIsUniqueUnderConcurrency`) and by
 
 # MAYBE IN THE FUTURE
 
-## 34. Long-duration fuzz
+## 36. Long-duration fuzz
 
 Longest run to date: 240s / ~20k ops (`docs/chaos-reports/2026-07-31-single-cluster-and-fuzz.md`).
 Too short to catch slow leaks (lease/keepalive goroutines, fd/watch-channel
@@ -636,7 +674,7 @@ Three of the leaks it would find are already identified above — the anomaly
 list, the WAL, and the keepalive goroutine — so it is worth fixing those first
 and spending the run on what is left.
 
-## 35. Should `RebalanceArena` be wired to a production caller at all?
+## 37. Should `RebalanceArena` be wired to a production caller at all?
 
 Guarded and atomic, but `RebalanceArena` and `pkg/membership.Manager` have no
 production caller — only the harness uses them.
@@ -646,7 +684,7 @@ production caller — only the harness uses them.
 - [ ] If yes: nail down the trigger condition and manual-vs-automatic posture
       first — those decisions shape everything else.
 
-## 36. Features the POSIX surface is missing
+## 38. Features the POSIX surface is missing
 
 Not bugs, just unbuilt. Listed so the gap is explicit rather than discovered by
 an application:

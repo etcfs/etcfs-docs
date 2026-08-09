@@ -148,7 +148,7 @@ WRITE is called when the kernel has data to write to a file. The Go backend rece
 4. Write the data bytes to the block device via `pwrite()`, one call per run.
 5. Call `sync_file_range()` on each written range to ensure data durability.
 6. Read the node's current fencing generation from `gen:<node_id>` in etcd.
-7. Store one extent entry per run in etcd at `extent:<ino>/<chunk>` with the value `"logical_off,disk_off,length,generation"`, in logical order. Chunk numbers continue from one past the highest currently in use.
+7. Store one extent entry per run in etcd at `extent:<ino>/<chunk>` with the value `"logical_off,disk_off,length,generation,sequence"`, in logical order. Chunk numbers continue from one past the highest currently in use, and every run of a single write shares one sequence — they are one write, over disjoint logical ranges.
 8. If the write extends beyond the current file size, update the inode size in etcd. Steps 7 and 8 are one generation-guarded transaction.
 9. Reclaim any extent this write has fully buried (see below).
 10. Return the number of bytes written.
@@ -171,15 +171,17 @@ Multiple writes to the same file create separate extent keys (`extent:<ino>/0`, 
 
 A write is never an in-place update. Overwriting a range allocates fresh blocks and appends a new extent, so two extents end up covering the same logical bytes. Two consequences follow.
 
-**Reads must resolve to the newer one.** Extents are ordered by logical offset and then by *descending* chunk number, and the read handler takes the first extent covering the offset it wants — so the later write is the one it sees. Chunk numbers are handed out in ascending order, which is what makes "later" well defined.
+**Reads must resolve to the newer one.** Every extent carries a sequence number in its value. Extents are ordered by logical offset and then by *descending* sequence, and the read handler takes the first extent covering the offset it wants — so the later write is the one it sees.
 
 **The buried bytes' blocks are dead.** Once the commit lands, each extent the write touched is rewritten to whatever it still leaves readable, and the blocks in between are returned to the free-list. As with truncation this applies only to extents in an arena this node owns; the rest are left for their owner's scrubber.
 
-An extent covered entirely is deleted. One covered at its front or its back is trimmed to the surviving piece, which keeps the extent's original key — and with it its original chunk number, so the write stays the newer of the two wherever they still overlap.
+An extent covered entirely is deleted. One covered at its front or its back is trimmed to the single surviving piece under the original key. One covered in the *middle* leaves two pieces: the head keeps the original key and the tail is written under a fresh one, both in the same transaction, so a crash cannot leave the middle described twice.
+
+Every surviving piece keeps its parent's sequence number. That is the reason the sequence lives in the value and not in the key: a piece ranked by its own key would claim to be newer than the extent it was cut from, and would then win over a genuinely newer extent overlapping it — reachable, because extents in another node's arena are never trimmed and so do overlap.
 
 Trimming the front moves the survivor's device offset forward, and that distance is rounded *down* to a block boundary. Two reasons. A read reaches the extent through `O_DIRECT`, where the device offset must be sector-aligned; and rounding the other way would leave the bytes between the write's end and the survivor's start described by no extent at all, so they would read back as zeroes. Rounding down instead leaves the survivor holding a few bytes the write also covers, which costs at most one block and resolves correctly, because the write's chunk is the higher one.
 
-A write landing strictly *inside* an extent is the one case left unreclaimed. It would leave two readable pieces, and the second needs a record of its own — but recency is carried by the chunk number in the key, so a new key would claim that piece is newer than the extent it was cut from, and it would then win over any genuinely newer extent overlapping it. That is reachable, because extents in another node's arena are never trimmed and so do overlap. The write buries the bytes without reclaiming them; the read stays correct either way.
+What is still left unreclaimed is a covered region smaller than one block, since blocks are the unit of reuse. The bytes are buried and read correctly; their block stays allocated until the extent holding it is fully covered or the file is deleted.
 
 Reclamation happens after the commit, never before: a transaction rejected by the generation guard must not have freed blocks the file still refers to.
 

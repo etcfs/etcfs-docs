@@ -72,6 +72,22 @@ The fixed-length binary record stored at each `inode:<ino>` key, totalling 72 by
 
 The extent list is **_not_** embedded in the inode record. Extents are stored in separate keys (`extent:<ino>/<chunk>`) to keep the inode value small and to allow extent maps to grow beyond the 1.5 MiB etcd value limit without splitting the inode record itself.
 
+### Extent
+
+Unlike the other records, an extent's value is ASCII: five comma-separated decimal integers at `extent:<ino>/<chunk>`.
+
+```
+<logical_off>,<disk_off>,<length>,<generation>,<sequence>
+```
+
+`generation` is the writer's fencing generation at commit time, which the scrubber cross-checks.
+
+`sequence` orders writes to the same logical bytes. A write is never an in-place update — it allocates fresh blocks and appends an extent — so two extents can cover one range, and the higher sequence is the later write and the one a read resolves to. The chunk number in the key makes the key unique within the inode and nothing more.
+
+Keeping recency in the value rather than the key is what allows an extent to be split. Trimming an overwritten extent down to the pieces still readable can leave two records, and both must remain exactly as old as the extent they were cut from; a second key would instead assert the piece is newer, and it would then win over a genuinely newer extent overlapping it.
+
+A four-field value, written before the sequence field existed, decodes with its sequence set to its chunk number — which is the order those records were appended in, so they stay correctly ordered against each other and against anything written since. No migration is needed.
+
 The `Nlink` field tracks the number of directory entries pointing to this inode. When `Nlink` reaches zero, the inode is eligible for deletion. The fsck checker verifies that `Nlink` matches the actual dirent count for every inode.
 
 ### LockRecord

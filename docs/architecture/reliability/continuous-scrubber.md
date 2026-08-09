@@ -93,20 +93,22 @@ The scrubber runs as a background goroutine within the Go daemon (etcfuse-meta).
 **What it checks:** Every extent of a *live* inode is still reachable through that inode. Two things make an extent unreachable while its file goes on existing:
 
 - **Past the end of the file.** A truncate lowers `inode:<ino>`'s size; every extent starting at or beyond the new size describes bytes no read can ever return, because the kernel clamps a read to the size it last saw.
-- **Overwritten.** A write is not an in-place update: it allocates fresh blocks and appends a new extent. When the new extent covers an older one's logical range entirely, the older one's blocks are dead.
+- **Overwritten.** A write is not an in-place update: it allocates fresh blocks and appends a new extent. When an extent with a higher sequence number covers an older one's logical range entirely, the older one's blocks are dead.
 
 Neither is visible to the orphan check, which looks for extents whose *inode* is gone. Here the inode is very much alive, so without this check the blocks stay allocated for as long as the file exists.
 
 **How it works:**
 1. Scan all `extent:*` keys and all `inode:*` keys, once each.
 2. Group extents by inode; skip any inode that is missing (those belong to the orphan check).
-3. An extent is dead if its `log_off` is at or beyond the inode's size, or if a sibling extent with a higher chunk number covers its whole logical range.
+3. An extent is dead if its `log_off` is at or beyond the inode's size, or if a sibling extent with a higher sequence number covers its whole logical range.
 
 **Resolution:** Automatic, subject to the ownership rule in [Automatic Remediation](#automatic-remediation).
 
 The node that issued the truncate or the overwrite already reclaims what it owns inline, without waiting for a scrub pass. What reaches this check is the cross-node remainder: an operation issued from one node against bytes sitting in another node's arena, which only that arena's owner may reclaim.
 
 An extent that is only *partly* past the new end of file, or only partly overwritten, is left alone here — its surviving portion is still live data, so removing it would take good bytes with it. Trimming one is a rewrite rather than a delete, and the node performing the truncate or the overwrite already does it for the ranges it owns. What this check adds is the whole-extent case, which is the one that has no other owner-side trigger.
+
+That trimming is why the check reads sequence numbers rather than chunk numbers: a trimmed extent can be split into two records, and both keep their parent's sequence, so neither is mistaken for a newer write than it is.
 
 **Likely causes:** ordinary truncates and overwrites. Unlike the other five, a finding here is not evidence of a bug — it is the expected steady state between an operation and the pass that tidies up after it.
 
