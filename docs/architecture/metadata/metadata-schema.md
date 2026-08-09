@@ -88,7 +88,11 @@ Keeping recency in the value rather than the key is what allows an extent to be 
 
 A four-field value, written before the sequence field existed, decodes with its sequence set to its chunk number — which is the order those records were appended in, so they stay correctly ordered against each other and against anything written since. No migration is needed.
 
-The `Nlink` field tracks the number of directory entries pointing to this inode. When `Nlink` reaches zero, the inode is eligible for deletion. The fsck checker verifies that `Nlink` matches the actual dirent count for every inode.
+The `Nlink` field tracks the number of directory entries pointing to this inode. When `Nlink` reaches zero, the inode is eligible for deletion.
+
+Every inode is created with the count its first entry implies: 1 for a regular file, symlink, device node or FIFO, and 2 for a directory, which is reached both through its parent's entry and through its own `.`. `metadata.InitialNlink` is the single definition of that rule.
+
+Directories keep 2 for their whole life. EtcFS does not model the `..` link a subdirectory contributes to its parent, so a directory's count does not vary with its contents. The fsck and scrubber checks assert that fixed value for directories and compare against the real dirent count for everything else.
 
 ### LockRecord
 

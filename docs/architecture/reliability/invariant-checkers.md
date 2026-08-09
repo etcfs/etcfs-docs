@@ -26,6 +26,8 @@ The checkers run in two contexts:
 
 The nlink field on an inode record tracks the number of directory entries that point to that inode. The checker verifies that `InodeRecord.Nlink` equals the count of dirent keys whose value is that inode number.
 
+Directories are the exception, and their count is asserted rather than counted. A directory carries 2 — one for the entry in its parent, one for its own `.` — and EtcFS does not model the `..` link each subdirectory would contribute, so a directory's count never varies with its contents. Counting dirents for a directory would report every directory in the filesystem as inconsistent. `metadata.InitialNlink` is the single definition of that rule, used both when an inode is created and when it is checked.
+
 ### Algorithm
 
 ```
@@ -47,7 +49,7 @@ for every inode record (inode:<ino> → record):
 ### Edge Cases
 
 - **Hard-links.** If inode 100 has nlink=3 and three dirents point to it (from possibly different directories), nlink matches. If one dirent is removed without decrementing nlink, the checker reports 2 dirents but nlink=3.
-- **Directories.** Directory inodes start with nlink=2 (for `.` and `..`). The simulator does not create `.` and `..` entries explicitly, so the checker accepts that directory nlink values may be 1 (just the parent's dirent) without flagging it. The full nlink=2 logic is enforced by the production `AtomicCreateDir`.
+- **Directories.** Directory inodes carry nlink=2. The production checkers assert that value directly rather than counting the single dirent that points at the directory. The simulator does not create `.` and `..` entries explicitly, so its own checker accepts a directory nlink of 1 without flagging it.
 
 ## Inode Existence Checker
 

@@ -75,25 +75,27 @@ reverse index from one scan of the `dirent:` prefix. Only on directory renames.
 A per-inode parent pointer would be a second source of truth for no benefit at
 this scale; revisit if directory renames ever become hot.
 
-## 4. `CreateInode` gives every inode it creates `nlink = 0`
+## 4. `CreateInode` gives every inode it creates `nlink = 0` — CLOSED
 
-`Nlink: (mode >> 12) & 1` (`pkg/metadata/inode.go:29`), commented "1 for
-directories". It does not do that. `S_IFDIR` is 0o040000, so `mode >> 12` is 4
-and `& 1` is 0. The same holds for regular files (8), symlinks (10), and
-character devices (2); only FIFOs (1) come out as 1.
+**Resolved** with `metadata.InitialNlink(mode)`: 2 for a directory, 1 for
+everything else, now the single definition of the rule and used by
+`CreateInode`, `AtomicCreateFile` and `AtomicCreateDir` alike.
 
-Every inode created through `CreateInode` — the symlink, mknod, and link paths
-in `internal/ipc/handlers.go` — is therefore stored with `nlink = 0` while a
-dirent points at it. `fsck`'s and the scrubber's nlink checks flag all of them,
-and any future reclaim keyed on `nlink == 0` would delete live files.
+The old `(mode >> 12) & 1` returned 0 for directories, regular files and
+symlinks — only FIFOs came out right — so every symlink, device node and
+hardlink target was stored as if nothing referenced it.
 
-Files created through `AtomicCreateFile` / `AtomicCreateDir` are unaffected —
-those set `Nlink` explicitly.
+- [x] Correct initial link count, single-sourced.
+- [x] Assert it in a test for each inode type, plus the hardlink and unlink
+      lifecycle.
+- [x] Stop the nlink checkers flagging directories. They counted dirents for
+      every inode, but a directory has one dirent and carries 2, so every
+      directory in the filesystem was reported. Both `pkg/scrub` and `pkg/fsck`
+      now assert the fixed value for directories and count only for the rest.
 
-- [ ] `Nlink: 1`, with directories corrected to 2 by their caller (or move
-      symlink/mknod onto the same atomic-create path as files, which is needed
-      for the atomicity item below anyway).
-- [ ] Assert nlink in a test for each of symlink, mknod, and hardlink.
+EtcFS does not model the `..` link a subdirectory contributes to its parent, so
+a directory's count stays 2 for its whole life. That is what makes asserting it
+correct rather than a workaround.
 
 ## 5. Shared locks never share
 
