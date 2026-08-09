@@ -86,10 +86,10 @@ for _, kv := range kvs {
 
 Two secondary defects fed the same path:
 
-- `AcquireArena` never persisted an ownership record at all, so `arena:<node_id>` keys (the layout at the time; since replaced by `arena:<node_id>/<arena_id>`, see below) were written only by membership and compaction, and a node had no durable claim on the range it was writing into.
-- `Compactor.markGlobalArenaAcquired` wrote the value as ASCII `id=%d` while membership wrote 8-byte big-endian. `DecodeUint64` returns 0 for a short buffer, so a compaction-written record decoded to arena 0 — an arena the node likely did not own.
+- `AcquireArena` never persisted an ownership record at all, so `arena:<node_id>` keys (the layout at the time; since replaced by `arena:<node_id>/<arena_id>`, see below) were written only by membership and by an arena-relocation pass since removed, and a node had no durable claim on the range it was writing into.
+- That relocation pass wrote the value as ASCII `id=%d` while membership wrote 8-byte big-endian. `DecodeUint64` returns 0 for a short buffer, so a relocated record decoded to arena 0 — an arena the node likely did not own.
 
-The fix scopes recovery to the node's own record, requires that record to be exactly eight bytes, records ownership at acquisition time, and makes compaction use the same encoding. Coverage is in `pkg/arena/allocator_integration_test.go` (unit level, real etcd — confirmed to fail without the fix and pass with it) and `scripts/test/chaos-arena-collision.sh` scenarios S8–S10 (cluster level, arena-restart-adoption / concurrent-write-collision / fenced-writer-torn-result). Both suites have been run to completion against a real 3-node docker cluster and a real 3-node AWS EC2 + EBS io2 Multi-Attach cluster; all six scenarios pass in both environments.
+The fix scopes recovery to the node's own record, requires that record to be exactly eight bytes, records ownership at acquisition time, and holds every writer of an ownership value to the one encoding. Coverage is in `pkg/arena/allocator_integration_test.go` (unit level, real etcd — confirmed to fail without the fix and pass with it) and `scripts/test/chaos-arena-collision.sh` scenarios S8–S10 (cluster level, arena-restart-adoption / concurrent-write-collision / fenced-writer-torn-result). Both suites have been run to completion against a real 3-node docker cluster and a real 3-node AWS EC2 + EBS io2 Multi-Attach cluster; all six scenarios pass in both environments.
 
 Two defects in the test harness itself surfaced only when the AWS run was first attempted, and are worth recording since they masked results rather than the product: `chaos-lib.sh`'s `etcdctl_on` helper existed only for docker mode, so every etcd-side assertion silently no-op'd on AWS (empty comparisons that happened to read as both pass and fail depending on which check); and S10's original assertion compared every extent's generation stamp against a baseline of 0, which is wrong because `writeGeneration` floors every stamp to 1 regardless of fencing history — the check flagged every extent in a healthy cluster, unconditionally. Both are fixed; S10 now checks content integrity (a guarded write publishes in full or not at all, never torn) rather than reasoning about the generation floor.
 
@@ -109,7 +109,7 @@ Closing the allocator channel does not close the class. The following remain, or
 
 ## Invariants to Preserve
 
-Any future change to allocation, compaction, or elastic membership must preserve all four:
+Any future change to allocation, arena reclamation, or elastic membership must preserve all four:
 
 1. **Disjoint ownership.** At any instant, at most one node's free-list contains a given arena. Not "at most one node is writing" — at most one node *believes it may* write.
 2. **Recovery reads only own records.** A node reconstructing state must never widen its claim based on cluster-wide scans. Recovery may only narrow or confirm.

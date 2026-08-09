@@ -48,7 +48,6 @@ nav:
       - Storage Substrate:
           - Block Device I/O Substrate: architecture/storage/block-device-io.md
           - Arena Allocator: architecture/storage/arena-allocator.md
-          - Arena Compaction: architecture/storage/arena-compaction.md
           - Write-Ahead Log: architecture/storage/write-ahead-log.md
           - Write Ordering Invariants: architecture/storage/write-ordering-invariants.md
           - "Kleppmann's Stale-Write Hazard Analysis": architecture/storage/kleppmann-stale-write-analysis.md

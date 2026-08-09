@@ -69,7 +69,7 @@ When a watch event arrives for a directory prefix:
 
 - **DELETE event** (file unlinked or renamed out): same invalidation. The kernel's negative cache for the name is also cleared, so a subsequent `stat()` gets a fresh ENOENT (or finds the file if it was recreated).
 
-- **Unknown event** (compaction, TTL expiry, etc.): issue a blanket `FUSE_NOTIFY_INVAL_INODE(parent_ino, 0, 0)` for the parent directory. This is more expensive (flushes all cached dentries for the directory) but safe for ambiguous events.
+- **Unknown event** (lease expiry, an unrecognised key change, etc.): issue a blanket `FUSE_NOTIFY_INVAL_INODE(parent_ino, 0, 0)` for the parent directory. This is more expensive (flushes all cached dentries for the directory) but safe for ambiguous events.
 
 ### Notification API
 
