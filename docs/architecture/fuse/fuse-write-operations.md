@@ -225,15 +225,25 @@ SETATTR modifies one or more inode attributes: size (truncation), mode (permissi
 ### IPC Payload
 
 ```
-[u64:ino] [u64:fh] [u32:valid_bitmask] [attr_blob: 84 bytes]
+[u64:ino] [u64:fh] [u32:valid] [u64:size] [u32:mode] [u32:uid] [u32:gid]
+[u64:atime] [u64:mtime] [u64:ctime]
 ```
 
-The `valid_bitmask` indicates which fields from the attribute blob are meaningful:
+Every field SETATTR can change is on the wire whether or not it is being changed; `valid` is the kernel's `FUSE_SET_ATTR_*` mask saying which of them it actually means, and the rest hold whatever the caller's `struct stat` happened to contain.
+
 - `FATTR_MODE`: Apply the mode field.
 - `FATTR_UID`, `FATTR_GID`: Apply the ownership fields.
 - `FATTR_SIZE`: Truncate or extend the file (see below).
-- `FATTR_ATIME`, `FATTR_MTIME`: Apply the timestamps.
-- `FATTR_ATIME_NOW`, `FATTR_MTIME_NOW`: Set the timestamp to the current time.
+- `FATTR_ATIME`, `FATTR_MTIME`, `FATTR_CTIME`: Apply the given timestamps.
+- `FATTR_ATIME_NOW`, `FATTR_MTIME_NOW`: Set the timestamp to the current time instead.
+
+Timestamps are whole seconds. The inode record stores no sub-second component, so the nanosecond halves are dropped on the C side rather than sent and discarded on the other.
+
+The mode is masked before it is stored: the kernel sends a whole `st_mode`, but `chmod` may not change what kind of file something is, so the stored type bits are kept and only the permission bits are replaced. Without that, a `chmod` on a symlink or a device node would quietly turn it into a regular file.
+
+Any change to mode, ownership or size also moves `ctime`, unless the caller set it explicitly.
+
+The write is a transaction pinned to the revision the inode was read at, so a concurrent change to a different field is not silently overwritten by this one. Losing that comparison returns `EAGAIN` and the kernel retries.
 
 ### Truncation
 
@@ -251,9 +261,11 @@ They apply only to the extents whose device range **this node's arenas own**. A 
 
 Leaving them costs nothing in correctness. Step 3 is what truncation actually means to a reader: the kernel clamps every read to the size it last saw, so bytes past the new end of file are unreachable whether or not an extent still describes them.
 
-### Current SETATTR Behavior
+### Extending a file
 
-SETATTR is currently a simplified implementation that reads the current inode and returns its attributes without applying any modifications. The full attribute update, including generation-guarded CAS, is planned.
+`FATTR_SIZE` with a size *larger* than the current one moves the inode's size and nothing else. The bytes it exposes are a hole: no extent describes them, and a read of that range returns zeroes.
+
+That is what makes holes work in general. A read fills only the ranges an extent actually covers, over a buffer that starts zeroed, and returns the whole range the kernel asked for — so a gap between extents, or a tail past the last one, reads back as zeroes rather than as a short read. The kernel has already clamped the request to the size it last saw, so there is nothing past the end of the file in it.
 
 ## Symbolic Links (SYMLINK)
 

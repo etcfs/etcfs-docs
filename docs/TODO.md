@@ -144,24 +144,33 @@ reason it already pinned that target's dirent.
 
 # SHOULD FIX — correctness gaps
 
-## 7. `chmod`, `chown`, `utimens` and growing truncate silently do nothing
+## 7. `chmod`, `chown`, `utimens` and growing truncate silently do nothing — CLOSED
 
-`ec_setattr` (`pkg/fuse/ops.c:680`) sends only `ino`, `fh`, `to_set` and
-`st_size`; the rest of `struct stat` is discarded with `(void) attr;`. The Go
-side (`handlers.go:337`) reads the same four fields and acts only on
-`valid & fattrSize` when the new size is *smaller*.
+**Resolved** by putting every settable attribute on the wire and applying the
+ones the kernel's mask selects.
 
-So `chmod`, `chown`, and `utimensat` return success and change nothing, and
-`ftruncate` to a larger size changes nothing — the call returns the old
-attributes, which the kernel then caches as the truth for `attr_timeout`.
-Applications that check the result of a `chmod` see the old mode.
+`ec_setattr` sent only `st_size` and discarded the rest of `struct stat`; the
+handler read only `st_size`. So `chmod`, `chown` and `utimensat` returned
+success, changed nothing, and handed back the old attributes for the kernel to
+cache as the truth.
 
-- [ ] Carry mode, uid, gid and the three timestamps over the wire, and apply
-      the ones `to_set` selects, guarded by the inode's `ModRevision`.
-- [ ] Handle a growing truncate by updating `Size` (the sparse read path
-      already returns zeroes for the gap).
-- [ ] Define the remaining `FATTR_*` constants rather than the lone
-      `fattrSize = 1 << 3` (`handlers.go:335`).
+- [x] Carry mode, uid, gid and the timestamps over the wire, and apply the ones
+      `to_set` selects, pinned to the inode's revision as read.
+- [x] Handle a growing truncate by updating `Size`.
+- [x] Define the real `FATTR_*` constants rather than the lone `fattrSize`.
+
+Two things the fix turned up:
+
+- The mode has to be masked. The kernel sends a whole `st_mode`, so storing it
+  as-is would let a `chmod` on a symlink or a device node turn it into a regular
+  file. The stored type bits are kept and only the permission bits replaced.
+- The read path did **not** in fact return zeroes for a gap, which the plan for
+  this item had assumed. Its gap branch was unreachable, and an extent following
+  a hole was copied to the running output position instead of the offset it
+  belonged to, so everything after a gap came back shifted; a tail hole came
+  back as a short read. Rewritten to fill offset-relative over a zeroed buffer
+  and return the whole requested range. The new integration tests fail against
+  the old path and pass against this one.
 
 ## 8. Every file is owned by uid 1000
 

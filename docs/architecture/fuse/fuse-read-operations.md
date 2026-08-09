@@ -191,7 +191,11 @@ The `offset` is the byte position within the file where reading starts. The `siz
 
 The Go backend scans the inode's extent keys (`extent:<ino>/<chunk>`) from etcd. For each extent, it parses the CSV value `"logical_off,disk_off,length,generation"`. It finds the first extent that covers the requested offset and reads the data from the block device via `pread()` at the correct disk offset plus the offset within the extent.
 
-If the file has multiple extents (e.g., from sequential writes), the handler reads from each covering extent in order and concatenates the data. Gaps between extents (sparse file regions) are filled with zero bytes.
+If the file has multiple extents (e.g., from sequential writes), the handler walks them in order and copies each one into the position it occupies *within the request*, not into a running output cursor. That distinction is the whole of it: with a hole before an extent, placing its bytes at the running position shifts everything after the gap.
+
+The output buffer starts zeroed, so a hole needs no work at all — only the ranges an extent covers are filled in. The handler returns the whole range that was asked for, so a gap between extents, or a tail past the last extent, reads back as zeroes rather than as a short read. The kernel has already clamped the request to the size it last saw, so nothing past the end of the file is in it.
+
+Extents arrive ordered by logical offset, and newest first where two of them cover the same one, so taking the first extent that reaches the cursor resolves an overwrite to the later write.
 
 ### Response
 
