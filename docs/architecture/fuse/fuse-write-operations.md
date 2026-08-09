@@ -48,14 +48,17 @@ CREATE is the canonical file creation operation in the FUSE protocol. Unlike MKN
 
 ```
 [u64:parent_ino] [u32:name_len] [name_bytes...] [u32:mode] [u32:flags] [u32:umask]
+[u32:uid] [u32:gid]
 ```
 
 The `mode` is the file type and permissions from the kernel. The `flags` are the open flags (O_RDONLY, O_WRONLY, O_RDWR, etc.). The `umask` is applied to the mode's permission bits.
 
+`uid` and `gid` come from `fuse_req_ctx(req)`, which is the identity of the process that made the syscall. Every creating operation carries them and stores them as the owner. They are not advisory: with `default_permissions` in force, they are what the kernel evaluates its access checks against.
+
 ### Handler Flow
 
 1. Allocate a fresh inode number via the global `inode_alloc_counter` (CAS-based sequential allocation).
-2. Call `AtomicCreateFile(parent, name, ino, mode, uid, gid)` which executes a single etcd transaction:
+2. Call `AtomicCreateFile(parent, name, ino, mode &^ umask, uid, gid)` which executes a single etcd transaction:
    - **Comparison 1:** `CreateRevision(dirent:parent/name) == 0` — the name must not already exist.
    - **Comparison 2:** `CreateRevision(inode:ino) == 0` — the inode number must not already be allocated.
    - **Success:** Create the dirent key and the inode key atomically.
@@ -81,9 +84,7 @@ If the transaction fails because the inode number was claimed by a concurrent op
 
 MKDIR creates a new directory with the same structure as CREATE but with `S_IFDIR` mode and an initial `nlink` of 2 (representing `.` and `..`). The directory size is initialised to 4096 bytes (one block) by convention — this is a placeholder, as directories in EtcFS do not have a meaningful size.
 
-The IPC payload and response format are identical to CREATE. The handler calls `AtomicCreateDir` instead of `AtomicCreateFile`.
-
-The `flags` and `umask` fields are present in the payload, matching the CREATE format. The `umask` is applied to the mode before the dir is created.
+The IPC payload and response format are identical to CREATE, minus the open flags. The `umask` is applied to the mode, and the caller's `uid`/`gid` become the directory's owner. The handler calls `AtomicCreateDir` instead of `AtomicCreateFile`.
 
 ## Deletion (UNLINK, RMDIR)
 

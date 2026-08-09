@@ -68,6 +68,12 @@ The FUSE session is configured with parameters that affect kernel-side caching a
 | `max_write` | 256 KiB | Maximum size of a single write request |
 | `max_background` | 128 | Maximum number of queued asynchronous requests |
 
+### Permission checking
+
+The mount is created with `-o default_permissions`, which hands access control to the kernel: it evaluates the mode, uid and gid this daemon reports for an inode against the calling process, and rejects the syscall before any request reaches the daemon.
+
+That is a deliberate division of labour. EtcFS implements no access checks of its own, because a second copy of those rules in the daemon would be one that can diverge from the kernel's — and getting them subtly wrong is how a filesystem ends up enforcing something other than what `ls -l` shows. What the daemon owes in return is accurate ownership: every creating operation carries `fuse_req_ctx(req)->uid/gid` and stores it, so the values the kernel checks against are the ones the caller actually had.
+
 The single-threaded event loop (`fuse_session_loop`) processes one kernel upcall at a time, making the session loop simpler and avoiding the threading issues of multi-threaded mode. Each handler does synchronous IPC with the Go backend — the loop serialises metadata operations naturally through the single-threaded execution model.
 
 ## IPC Binary Protocol

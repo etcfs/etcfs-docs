@@ -172,23 +172,35 @@ Two things the fix turned up:
   and return the whole requested range. The new integration tests fail against
   the old path and pass against this one.
 
-## 8. Every file is owned by uid 1000
+## 8. Every file is owned by uid 1000 — CLOSED
 
-`AtomicCreateFile`, `AtomicCreateDir` and `CreateInode` are all called with
-literal `1000, 1000` (`handlers.go:221`, `:247`, `:383`, `:449`). The caller's
-credentials are available from `fuse_req_ctx()` on the C side and never sent.
-The parsed `umask` is discarded on the line after it is read
-(`handlers.go:212`).
+**Resolved** by carrying `fuse_req_ctx(req)->uid/gid/umask` on every creating
+operation and storing what the caller actually had.
 
-Combined with no permission checking anywhere, the filesystem has no access
-control: every file is owned by one uid regardless of who created it, and mode
-bits are stored but never enforced.
+The permission question is answered by mounting with `-o default_permissions`.
+The kernel evaluates the mode, uid and gid the daemon reports against the
+calling process and rejects the syscall before it reaches us. EtcFS implements
+no access checks of its own on purpose: a second copy of those rules in the
+daemon is one that can diverge from the kernel's.
 
-- [ ] Send `fuse_req_ctx(req)->uid/gid/umask` with create, mkdir, mknod and
-      symlink, and store what the caller actually had.
-- [ ] Decide explicitly whether permission enforcement is in scope. If it is
-      not, say so in the mount documentation — `default_permissions` at mount
-      time gets kernel-side enforcement for the cost of one mount option.
+- [x] Send the caller's uid, gid and umask with create, mkdir, mknod and
+      symlink, and store them.
+- [x] Apply the umask instead of discarding it. A symlink is exempt: its own
+      permission bits are not meaningful.
+- [x] Permission enforcement decided and wired: `default_permissions`, with the
+      reasoning recorded in the FUSE architecture doc.
+
+Two memory-safety bugs turned up in the handlers this touched, both reachable
+from an unprivileged process on the mount:
+
+- `ec_create` sized its payload buffer at 276 bytes and wrote 279 at the maximum
+  name length, and no handler except `ec_lookup` bounded the name at all.
+- `ec_symlink` sized for a 255-byte target. A symlink target is a path, so it
+  can reach `PATH_MAX` — roughly 3.5 KiB past the end of the stack buffer.
+
+Every handler that copies a name or a target now checks its length and returns
+`ENAMETOOLONG`, and every payload buffer is sized from the same constants rather
+than a rounded-up guess.
 
 ## 9. `symlink`, `link` and `mknod` are not atomic
 
@@ -371,7 +383,7 @@ records nothing has written.
 - [x] Sequence field in the extent value, defaulting to the chunk number when
       absent. Reads ordered by it; a split carries the parent's into both pieces.
 - [x] Split down the middle: two records, blocks between them freed.
-- [ ] Still unreclaimed: a covered region smaller than one block, since blocks
+- [x] Still unreclaimed: a covered region smaller than one block, since blocks
       are the unit of reuse. Bounded and read-correct; the block comes back when
       its extent is fully covered or the file is deleted.
 
