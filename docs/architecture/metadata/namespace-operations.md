@@ -85,7 +85,14 @@ Unlinking a file is more complex because two outcomes are possible depending on 
 
 Both paths execute in a single Txn, so there is no intermediate state where a dirent exists pointing to a deleted inode, or an inode with nlink=0 but no dirent pointing to it.
 
-The transaction first reads the inode to determine the current nlink, then constructs the appropriate operations based on the outcome. It includes a comparison that verifies the dirent still exists at commit time (CreateRevision > 0), preventing a race where another node unlinks the same name concurrently.
+The transaction first reads the dirent and the inode to determine the current nlink, then constructs the appropriate operations based on the outcome. It pins **both** records to the revision each was read at:
+
+- the dirent must still stand where it was read, so a name replaced by a concurrent rename is not unlinked as if it were the original;
+- the inode must still hold the count the new one was computed from.
+
+The second comparison is the one that makes concurrent unlinks correct. Proving only that the inode exists lets two unlinks of two names for the same inode both read `nlink = 2`, both write `nlink = 1`, and leave a file referenced by nothing that is never freed. Losing either comparison is contention rather than failure, so the operation is redone against fresh state, with a jittered backoff between attempts — without the jitter, callers that lost the same race retry in lockstep and collide again on the next tick.
+
+The same pinning applies wherever a link count is read and written back: `IncrementNlink`, `DecrementNlink`, and the target replacement inside `AtomicRename`.
 
 ## Atomic Rename
 

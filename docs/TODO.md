@@ -120,21 +120,27 @@ gone rather than fixed.
       of them releasing; readers and writers exclude each other both ways; a
       refused acquisition leaves no key behind.
 
-## 6. `nlink` increment and decrement can lose updates
+## 6. `nlink` increment and decrement can lose updates — CLOSED
 
-`putInodeWithCAS` (`pkg/metadata/inode.go:150`) is not a CAS. Its only
-comparison is `CreateRevision(key) > 0` — "the inode exists". `IncrementNlink`
-and `DecrementNlink` read the record, modify `Nlink`, and write it back through
-that, so two concurrent hardlink creations on the same inode both read
-`nlink = 1`, both write `nlink = 2`, and one link is unaccounted for.
+**Resolved** by pinning every read-modify-write of an inode to the revision it
+was read at, through `InodeUnchanged(ino, modRev)`.
 
-`AtomicUnlink` (`dirent.go:226`) has the same shape: it reads the inode, adjusts
-`Nlink`, and conditions the transaction only on the dirent's existence. Two
-concurrent unlinks of two names for one inode both write `nlink = 1`, and the
-inode is never deleted.
+`putInodeWithCAS` compared `CreateRevision > 0` — "the inode exists" — which
+proves nothing about the value the new record was computed from. It is now
+`putInodeCAS`, comparing `ModRevision`, and the name is true.
 
-- [ ] Condition these transactions on the inode's `ModRevision` as read, and
-      retry on mismatch. The name `putInodeWithCAS` should then be true.
+`AtomicUnlink` pins the dirent as well as the inode: without that, a name
+replaced by a concurrent rename would be unlinked as if it were still the
+original. `AtomicRename` pins the inode of the target it replaces, for the same
+reason it already pinned that target's dirent.
+
+- [x] Condition these transactions on the inode's `ModRevision` as read, and
+      retry on mismatch.
+- [x] Jittered, context-aware backoff between attempts. Sixteen concurrent hard
+      links to one inode exhausted a plain retry budget — the losers all retried
+      on the same tick and collided again. `NextCounter` had grown its own copy
+      of this by hand and now shares the helper, which also makes its wait stop
+      early on a cancelled context instead of sleeping the full delay.
 
 # SHOULD FIX — correctness gaps
 
