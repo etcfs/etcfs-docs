@@ -301,30 +301,31 @@ only signal, and it reads as informational.
       configured. Keep the fallback only for the single-node and file-backed
       test paths, and log it at warning level there.
 
-## 15. Partial overwrites still leave both extents live
+## 15. A write landing strictly inside an extent reclaims nothing
 
-Full overwrites are handled: a write reclaims every extent it entirely covers
-and inside its own arenas, the scrubber's dead-extent check picks up the rest,
-and reads resolve by descending chunk number so the newer write always wins.
+Partial overlaps are handled at the edges: an extent covered at its front or
+its back is trimmed to the surviving piece, which keeps its own key and chunk
+number, and the whole blocks it no longer reads from go back to the arena.
 
-A *partial* overlap is deliberately left alone — the older extent still holds
-live bytes outside the overwritten range, so it cannot simply be dropped, and
-trimming it is a rewrite rather than a delete. The read ordering keeps the
-answer correct, but the covered portion's blocks stay allocated for the life of
-the file.
+A write landing strictly *inside* an extent is not, because the survivor is two
+pieces and the second needs a record of its own. Recency is carried by the chunk
+number in the key, so a new key would assert that piece is newer than the extent
+it was cut from, and it would then beat any genuinely newer extent overlapping
+it — reachable, since extents in another node's arena are never trimmed and so
+do overlap. The write buries the bytes and leaves their blocks allocated. Reads
+stay correct; the space is held until the file is deleted or fully overwritten.
 
-Same shape for a truncate that lands inside an extent: the head survives, the
-tail is reclaimed only if this node owns the range, and a foreign tail waits
-until the file is deleted or fully overwritten.
+Also unreclaimed, for the same reason at a smaller scale: a covered region under
+one block, since blocks are the unit of reuse.
 
-Bounded, not unbounded — at most one partial extent per overlap — so this is a
-space-efficiency item, not a leak that grows without limit.
+The fix is to stop deriving recency from the key. A sequence number stored *in*
+the extent value would let both halves of a split keep the parent's, leaving the
+key free to be nothing but an identifier.
 
-- [ ] Split a partially covered extent at commit: keep the uncovered head or
-      tail as its own extent, free the middle. Owner-only, same rule as the
-      rest.
-- [ ] Teach the scrubber to trim an extent that straddles EOF, rather than
-      skipping it.
+- [ ] Add a sequence field to the extent value, defaulting to the chunk number
+      when absent so existing records still decode. Order reads by it, and have
+      a split carry the parent's into both pieces.
+- [ ] Then split down the middle: two records, blocks between them freed.
 
 ## 16. Integration suites clobber each other on a shared etcd
 

@@ -106,7 +106,7 @@ Neither is visible to the orphan check, which looks for extents whose *inode* is
 
 The node that issued the truncate or the overwrite already reclaims what it owns inline, without waiting for a scrub pass. What reaches this check is the cross-node remainder: an operation issued from one node against bytes sitting in another node's arena, which only that arena's owner may reclaim.
 
-An extent that is only *partly* past the new end of file, or only partly overwritten, is left alone. Its surviving portion is still live data, so removing it would take good bytes with it, and trimming it is a rewrite rather than a delete. That tail is reclaimed when the file is deleted or fully overwritten.
+An extent that is only *partly* past the new end of file, or only partly overwritten, is left alone here — its surviving portion is still live data, so removing it would take good bytes with it. Trimming one is a rewrite rather than a delete, and the node performing the truncate or the overwrite already does it for the ranges it owns. What this check adds is the whole-extent case, which is the one that has no other owner-side trigger.
 
 **Likely causes:** ordinary truncates and overwrites. Unlike the other five, a finding here is not evidence of a bug — it is the expected steady state between an operation and the pass that tidies up after it.
 

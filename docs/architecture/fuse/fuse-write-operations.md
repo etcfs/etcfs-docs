@@ -173,7 +173,13 @@ A write is never an in-place update. Overwriting a range allocates fresh blocks 
 
 **Reads must resolve to the newer one.** Extents are ordered by logical offset and then by *descending* chunk number, and the read handler takes the first extent covering the offset it wants — so the later write is the one it sees. Chunk numbers are handed out in ascending order, which is what makes "later" well defined.
 
-**The buried extent's blocks are dead.** Once the commit lands, any extent the new one fully covers is unreadable, and its blocks are returned to the free-list. As with truncation this applies only to extents in an arena this node owns; the rest are left for their owner's scrubber. An extent that is only *partly* covered survives — its uncovered bytes are still live, and the read ordering above is what keeps the result correct.
+**The buried bytes' blocks are dead.** Once the commit lands, each extent the write touched is rewritten to whatever it still leaves readable, and the blocks in between are returned to the free-list. As with truncation this applies only to extents in an arena this node owns; the rest are left for their owner's scrubber.
+
+An extent covered entirely is deleted. One covered at its front or its back is trimmed to the surviving piece, which keeps the extent's original key — and with it its original chunk number, so the write stays the newer of the two wherever they still overlap.
+
+Trimming the front moves the survivor's device offset forward, and that distance is rounded *down* to a block boundary. Two reasons. A read reaches the extent through `O_DIRECT`, where the device offset must be sector-aligned; and rounding the other way would leave the bytes between the write's end and the survivor's start described by no extent at all, so they would read back as zeroes. Rounding down instead leaves the survivor holding a few bytes the write also covers, which costs at most one block and resolves correctly, because the write's chunk is the higher one.
+
+A write landing strictly *inside* an extent is the one case left unreclaimed. It would leave two readable pieces, and the second needs a record of its own — but recency is carried by the chunk number in the key, so a new key would claim that piece is newer than the extent it was cut from, and it would then win over any genuinely newer extent overlapping it. That is reachable, because extents in another node's arena are never trimmed and so do overlap. The write buries the bytes without reclaiming them; the read stays correct either way.
 
 Reclamation happens after the commit, never before: a transaction rejected by the generation guard must not have freed blocks the file still refers to.
 
@@ -212,7 +218,9 @@ Truncation (size change) follows the **metadata-then-data** ordering invariant:
 
 Metadata-then-data ordering ensures the inode size shrinks before the freed blocks are returned to the arena free-list. If the node crashes between steps 2 and 3, the blocks are still allocated (not reusable) but the inode still has the old size — the blocks are wasted but no reader can access them because the extent was removed.
 
-Steps 1 and 2 apply only to the extents whose device range **this node's arenas own**. A file's bytes may sit in several nodes' arenas — a write always allocates from the writer's own arena, so a file written by two nodes is spread across both — and only an arena's owner may remove one of its extent records. Deleting a peer's record would strip the reference that peer's in-memory free-list is rebuilt from, stranding those blocks as allocated until it restarted. Extents belonging to another node are therefore left in place, and its scrubber reclaims them (see [Continuous Scrubber](../reliability/continuous-scrubber.md#3-dead-extent-detection)).
+A truncate is an overwrite of everything from the new size to the end of the address space, so steps 1 and 2 run through the same path as [Overwrites](#overwrites) and inherit its rules — including the block-boundary rounding, and the fact that only whole blocks the survivor no longer reads from are handed back.
+
+They apply only to the extents whose device range **this node's arenas own**. A file's bytes may sit in several nodes' arenas — a write always allocates from the writer's own arena, so a file written by two nodes is spread across both — and only an arena's owner may rewrite one of its extent records. Deleting a peer's record would strip the reference that peer's in-memory free-list is rebuilt from, stranding those blocks as allocated until it restarted. Extents belonging to another node are therefore left in place, and its scrubber reclaims them (see [Continuous Scrubber](../reliability/continuous-scrubber.md#3-dead-extent-detection)).
 
 Leaving them costs nothing in correctness. Step 3 is what truncation actually means to a reader: the kernel clamps every read to the size it last saw, so bytes past the new end of file are unreachable whether or not an extent still describes them.
 
