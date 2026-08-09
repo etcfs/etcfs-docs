@@ -48,31 +48,32 @@ because the inode was still alive.
 - [x] Scrubber `CheckDeadExtents` for the cross-node remainder, covering both
       overwritten extents and those left past EOF by a truncate.
 
-## 3. `rename` over an existing file orphans the target's inode
+## 3. `rename` over an existing file orphans the target's inode — CLOSED
 
-`AtomicRename` (`pkg/metadata/dirent.go:269`) deletes the source dirent and
-puts the target dirent in one transaction. When the target name already exists
-and `RENAME_NOREPLACE` is not set, the put silently replaces the target's
-dirent value. The target inode's `nlink` is never decremented and its inode
-record and extents are never deleted — POSIX requires the replaced file to be
-unlinked.
+**Resolved** in `AtomicRename`, which now validates the move and replaces the
+target as an unlink rather than overwriting its dirent.
 
-Related gaps in the same function:
+The replaced inode's link count drops in the same transaction, and the inode
+record goes with it at zero. Its extents are left as orphans on purpose — the
+scrubber reclaims them on the node owning their arena, the only node that may.
 
-- `RenameExchange` is defined (`dirent.go:307`) and accepted from the wire, but
-  the code path does an ordinary rename, which deletes the source and
-  overwrites the target. A caller asking for an atomic exchange gets data loss
-  instead. It should be rejected until implemented.
-- Nothing stops renaming a directory into its own subtree, which detaches the
-  subtree into an unreachable cycle.
-- Nothing checks that a directory target is empty.
+The target is pinned on its `ModRevision` (or on still being absent), so a
+concurrent write to that name aborts the rename instead of vanishing under it.
 
-- [ ] Decrement the replaced target's nlink in the same transaction, deleting
+- [x] Decrement the replaced target's nlink in the same transaction, deleting
       its inode when that reaches zero.
-- [ ] Return `EINVAL` for `RENAME_EXCHANGE` rather than silently doing
+- [x] Return `EINVAL` for `RENAME_EXCHANGE` rather than silently doing
       something else.
-- [ ] Reject a directory rename whose destination is under its own source, and
-      a non-empty directory target.
+- [x] Reject a directory rename whose destination is under its own source, and
+      a non-empty directory target. Also a directory over a file (`ENOTDIR`)
+      and a file over a directory (`EISDIR`).
+- [x] Distinct errnos out of the handler — `errnoFor` had collapsed everything
+      to `EEXIST`.
+
+The subtree check needs a parent walk, and inodes record none, so it builds a
+reverse index from one scan of the `dirent:` prefix. Only on directory renames.
+A per-inode parent pointer would be a second source of truth for no benefit at
+this scale; revisit if directory renames ever become hot.
 
 ## 4. `CreateInode` gives every inode it creates `nlink = 0`
 
@@ -354,9 +355,9 @@ and *both keep their parent's sequence*. Neither can outrank a genuinely newer
 extent overlapping it — which was the hazard that blocked this, and is reachable,
 since extents in another node's arena are never trimmed and so do overlap.
 
-A four-field value decodes with its sequence set to its chunk number, which is
-the order those records were appended in, so old and new records stay correctly
-ordered against each other. No migration.
+The four-field form is no longer accepted: the system is pre-deployment, so the
+decoder requires all five fields rather than carrying a compatibility path for
+records nothing has written.
 
 - [x] Sequence field in the extent value, defaulting to the chunk number when
       absent. Reads ordered by it; a split carries the parent's into both pieces.

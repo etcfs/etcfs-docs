@@ -89,14 +89,19 @@ The transaction first reads the inode to determine the current nlink, then const
 
 ## Atomic Rename
 
-`AtomicRename` moves a file from one directory to another. The transaction:
+`AtomicRename` moves a file or directory from one name to another, possibly across directories. The transaction:
 
 1. Checks that the source dirent exists
-2. Optionally checks that the destination dirent does not exist (RENAME_NOREPLACE flag)
+2. Pins the destination — either "still absent" or "still at the revision just read", so a concurrent write to that name aborts the rename instead of being silently replaced by it
 3. Deletes the source dirent
 4. Creates the destination dirent with the same inode number
+5. When the destination was already taken, unlinks what was there: its inode's link count drops, and the inode record is deleted once nothing points at it
 
-For cross-directory renames, both targets are in the same transaction. The keys are operated on in ascending lexicographic order to prevent deadlocks when two nodes attempt conflicting renames. Etcd serialises the transactions through Raft; exactly one succeeds and the other fails with a conflict error.
+Step 5 is what keeps a replaced file from being orphaned. Its extents are deliberately left behind as orphans, which the scrubber reclaims on the node owning their arena — the only node that may.
+
+Several renames are refused outright: `RENAME_EXCHANGE` (unimplemented, and an ordinary rename would lose the source's data rather than swap it), a directory over a non-directory or the reverse, a non-empty directory target, and a destination lying inside the directory being moved. The last would detach a whole subtree into a cycle no path reaches; the ancestor check walks up a reverse index built from one scan of the `dirent:` prefix, and only when a directory is the thing being moved. See [FUSE Write Operations](../fuse/fuse-write-operations.md#rejected-renames) for the errno each maps to.
+
+For cross-directory renames, every key is in the same transaction. Etcd serialises the transactions through Raft; exactly one succeeds and the other fails with a conflict error.
 
 ## Directory Listing
 

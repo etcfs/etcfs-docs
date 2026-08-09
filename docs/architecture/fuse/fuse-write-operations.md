@@ -112,14 +112,7 @@ Note that RMDIR does **not** delete the parent directory's nlink. The parent dir
 
 ## Rename (RENAME)
 
-RENAME moves a file or directory from one location to another, possibly across directories. It calls `AtomicRename`, which executes a single etcd transaction:
-
-1. Look up the source name to resolve its inode number.
-2. **Comparison 1:** `CreateRevision(dirent:old_parent/old_name) > 0` — the source must exist.
-3. (Optional, for `RENAME_NOREPLACE`): **Comparison 2:** `CreateRevision(dirent:new_parent/new_name) == 0` — the target must not already exist.
-4. **Success operations:** Delete the old dirent, create the new dirent with the same inode value.
-
-For cross-directory renames, both keys are modified in a single transaction. The keys are ordered lexicographically (ascending) to prevent deadlocks when two nodes attempt conflicting renames on related paths.
+RENAME moves a file or directory from one location to another, possibly across directories. It calls `AtomicRename`, which validates the move and then applies it in a single etcd transaction.
 
 The IPC payload carries the old parent, old name, new parent, new name, and a flags bitmask:
 
@@ -128,7 +121,39 @@ The IPC payload carries the old parent, old name, new parent, new name, and a fl
 [u64:new_parent] [u32:new_name_len] [new_name_bytes...] [u32:flags]
 ```
 
-The flags field supports `RENAME_NOREPLACE` (do not overwrite an existing target) and `RENAME_EXCHANGE` (atomically exchange the source and target names) — though only the basic rename is currently implemented.
+### Replacing an existing target
+
+POSIX requires a rename onto an existing name to replace it, and replacing it *is* an unlink. The transaction therefore carries a third operation alongside the two dirent writes: the target inode's link count drops, and the inode record itself is deleted once nothing points at it any more.
+
+Leaving that out is what orphaned the replaced file — its inode and every extent behind it stayed in etcd, reachable through no path. The extents are still left behind deliberately, becoming orphans that the scrubber reclaims on the node owning their arena, which is the only node that may (see [Continuous Scrubber](../reliability/continuous-scrubber.md#automatic-remediation)).
+
+### Transaction shape
+
+1. Resolve the source inode, and the target name if one is already taken.
+2. **Comparison 1:** `CreateRevision(dirent:old_parent/old_name) > 0` — the source must exist.
+3. **Comparison 2**, pinning the target so a concurrent write to that name aborts this rename rather than being silently replaced by it:
+   - target free: `CreateRevision(dirent:new_parent/new_name) == 0`
+   - target taken: `ModRevision(dirent:new_parent/new_name)` equal to the revision the checks below were read at
+4. **Success operations:** delete the old dirent, put the new dirent, and — when a target was replaced — write its decremented inode record or delete it outright.
+
+For cross-directory renames, every key is modified in that one transaction.
+
+### Rejected renames
+
+| Situation | Errno |
+|---|---|
+| `RENAME_EXCHANGE` requested | `EINVAL` |
+| `RENAME_NOREPLACE` and the target exists | `EEXIST` |
+| Directory renamed onto a non-directory | `ENOTDIR` |
+| Non-directory renamed onto a directory | `EISDIR` |
+| Target is a directory with entries in it | `ENOTEMPTY` |
+| Destination lies inside the directory being moved | `EINVAL` |
+
+`RENAME_EXCHANGE` is rejected rather than approximated. An ordinary rename deletes the source and overwrites the target, which is data loss for a caller that asked for the two names to swap.
+
+The last row is the subtree check. Moving a directory beneath itself detaches everything under it: the entries still exist, but no path from the root reaches them, and nothing afterwards can distinguish that from ordinary data. Inodes record no parent, so the ancestor walk builds a reverse index from one scan of the `dirent:` prefix. It runs only when a *directory* is being renamed, which is rare — a per-inode parent pointer would be a second source of truth to keep consistent for no benefit at this scale. The walk is bounded by the number of entries it has seen, so a namespace that already contains a cycle cannot spin there forever.
+
+A dirent whose inode is missing is already corrupt, and fsck reports it. Renaming it is still allowed: moving a broken pointer breaks nothing further, and refusing would take away the obvious way to clear it. Its type is unknown, so the directory rules above do not apply to it.
 
 ## Data Write (WRITE)
 
