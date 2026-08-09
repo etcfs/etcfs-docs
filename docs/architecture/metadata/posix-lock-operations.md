@@ -39,7 +39,7 @@ The daemon logs this limitation at startup (`cmd/etcfuse-meta/main.go`) so that 
 
 ## The Per-Operation Inode Lock
 
-The `lock:<ino>` keys that the read and write paths take (via `lockInode`, `internal/ipc/retry.go`) are unrelated to POSIX locks. They are lease-backed whole-inode locks scoped to a single FUSE operation and released when it returns. They are not process-owned, are not consulted by GETLK or SETLK, and do not survive across requests.
+The `lock:<ino>/` keys that the read and write paths take (via `lockInode`, `internal/ipc/retry.go`) are unrelated to POSIX locks. They are lease-backed whole-inode locks scoped to a single FUSE operation and released when it returns. They are not process-owned, are not consulted by GETLK or SETLK, and do not survive across requests.
 
 This distinction matters for any future implementation — see below.
 
@@ -75,7 +75,7 @@ SETLK response — currently always `0`:
 
 No cross-node lock protocol is planned or scheduled. If one is built, three constraints apply that are easy to miss.
 
-**A separate keyspace is required.** POSIX locks live for the lifetime of a process's lock, across many FUSE requests. `lock:<ino>` is taken and released *per operation* by every read and write. Reusing that key for POSIX locks means the next write's `AcquireLock` fails its `CreateRevision == 0` comparison, retries, and returns `EAGAIN` — making a locked file unwritable by its own lock holder. A distinct prefix (for example `plock:<ino>`) avoids this.
+**A separate keyspace is required.** POSIX locks live for the lifetime of a process's lock, across many FUSE requests. `lock:<ino>/` holders are taken and released *per operation* by every read and write. Reusing that prefix for POSIX locks means the next write's `AcquireLock` finds the range non-empty, retries, and returns `EAGAIN` — making a locked file unwritable by its own lock holder. A distinct prefix (for example `plock:<ino>`) avoids this.
 
 **Byte-range tracking has no natural etcd shape.** etcd keys are per-inode, so held ranges must be encoded as a list inside a single value and mutated by read-modify-CAS. Every lock operation on a hot inode then contends on one key, and the value grows with the number of held ranges. Whole-inode locking avoids this entirely and covers the common cases (lockfiles, advisory whole-file exclusion).
 

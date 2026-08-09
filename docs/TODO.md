@@ -97,36 +97,28 @@ EtcFS does not model the `..` link a subdirectory contributes to its parent, so
 a directory's count stays 2 for its whole life. That is what makes asserting it
 correct rather than a workaround.
 
-## 5. Shared locks never share
+## 5. Shared locks never share — CLOSED
 
-`GetLockInfo` (`pkg/metadata/lock.go:143`) parses the lock value with
-`fmt.Sscanf(value, '{"mode":"%s"}', &rec.Mode)`. `%s` in `Sscanf` consumes a
-whitespace-delimited token, so against `{"mode":"shared","holders":["n1"]}` it
-captures `shared","holders":["n1"]}` — never `shared`.
+**Resolved** by giving every holder its own key and moving the mode into the
+key: `lock:<ino>/<mode>/<lease_id>`, value the holder's node ID.
 
-So `existing.Mode == string(LockShared)` in `AcquireLock` (`lock.go:72`) is
-always false, the shared-lock join path is dead code, and every shared
-acquisition falls through to the "no lock key exists" comparison. Two
-concurrent readers of the same inode conflict, and the second gets
-`ErrConflict`.
+The mode being in the key means a transaction can ask "is any writer holding
+this?" as a range comparison — `CreateRevision == 0` over `lock:<ino>/` for a
+writer, over `lock:<ino>/exclusive/` for a reader. Etcd reads an empty range as
+vacuously true, so that is exactly "no blocking holder", decided inside the
+transaction rather than by a preceding read a competitor could slip through.
 
-The read path treats a failed lock as non-fatal (`datapath.go:240`), so this
-shows up as lost read-lock coverage rather than as an error — which is why it
-has gone unnoticed.
+No lock value is parsed anywhere now, so the `Sscanf` that never matched is
+gone rather than fixed.
 
-A second bug hides behind the first: `ReleaseLock` revokes the lease, and the
-lease owns the key, so one holder releasing a genuinely shared lock would drop
-it for every other holder.
-
-- [ ] Encode and parse the lock record with `encoding/json`. The value is
-      already JSON-shaped; nothing is gained by the hand-rolled version, and
-      the same applies to the membership value (`metadata/membership.go:115`)
-      and its `InstanceIDFromMembership` substring scan.
-- [ ] Give each shared holder its own key under a `lock:<ino>/` prefix so a
-      release cannot revoke someone else's hold, or drop shared locks entirely
-      if the read path does not need them.
-- [ ] Test: two concurrent shared acquisitions both succeed; a shared and an
-      exclusive conflict.
+- [x] Stop parsing the lock value. The mode is in the key; `GetLockInfo`
+      assembles a `LockRecord` from the holder keys instead.
+- [x] A key per shared holder, so one release cannot revoke another's hold.
+- [x] Membership value encoded and decoded with `encoding/json`, replacing the
+      hand-rolled string and the `InstanceIDFromMembership` substring scan.
+- [x] Tests: two concurrent shared acquisitions both succeed and survive one
+      of them releasing; readers and writers exclude each other both ways; a
+      refused acquisition leaves no key behind.
 
 ## 6. `nlink` increment and decrement can lose updates
 

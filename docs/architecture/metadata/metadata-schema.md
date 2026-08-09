@@ -23,7 +23,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 |---|---|---|
 | `inode:<ino>` | `InodeRecord` (72 bytes) | File or directory metadata |
 | `dirent:<parent>/<name>` | `<ino>` (8 bytes) | Directory entry resolving a name to an inode |
-| `lock:<ino>` | `LockRecord` (JSON) | Lease-backed file lock state |
+| `lock:<ino>/<mode>/<lease_id>` | holder's node ID | One holder of an inode's lock, bound to that holder's lease |
 | `arena:<node_id>/<arena_id>` | `<arena_id>` (8 bytes) | One arena a node currently owns |
 | `arena_alloc_log` | counter (8 bytes) | Global arena-ID allocation counter |
 | `membership:<node_id>` | membership metadata | Lease-backed liveness key for cluster membership |
@@ -37,7 +37,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 
 **Directory-entry keys** encode a parent inode and a child name separated by `/`. A directory listing is a prefix scan over `dirent:<parent>/`, which etcd serves in lexicographic order. Each value is simply the target inode number as a big-endian 64-bit integer.
 
-**Lock keys** are scoped to the inode being locked. The value is a JSON blob describing the lock mode (shared or exclusive) and the set of holder node IDs. The key carries an etcd lease, so the lock is automatically released if the holding node's heartbeat ceases.
+**Lock keys** are one per holder, not one per inode. The mode is part of the key and the value is just the holder's node ID. Each key carries its holder's own etcd lease, so a holder that stops heartbeating is dropped automatically — and dropping one holder cannot disturb the others, which is what allows a shared lock to have several at once.
 
 **Arena keys** own a contiguous 1 GiB range on the shared block device. Each node acquires arenas from a global free pool controlled by the `arena_alloc_log` counter. The key name includes the node ID to guarantee exclusive ownership.
 
@@ -96,14 +96,14 @@ All five fields are required. EtcFS is pre-deployment, so the decoder rejects th
 
 ### LockRecord
 
-A JSON value stored at `lock:<ino>`, describing the current lock state.
+Not a stored value: `GetLockInfo` assembles it by scanning an inode's holder keys.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `mode` | `string` | `"shared"` for read locks, `"exclusive"` for write locks |
-| `holders` | `[]string` | List of node IDs currently holding the lock |
+| `Mode` | `string` | `"exclusive"` if any holder is a writer, otherwise `"shared"` |
+| `Holders` | `[]string` | Node IDs currently holding the lock |
 
-The lock key is bound to an etcd lease. When the lease expires (node crash, network partition beyond TTL margin), the lock key is automatically deleted, releasing the lock.
+When a holder's lease expires (node crash, network partition beyond TTL margin), its key is deleted automatically and it drops out of this list. The inode is unlocked once the last holder is gone.
 
 ### Arena ownership record
 
@@ -131,7 +131,7 @@ Each key family has a constructor function that builds the etcd key string from 
 - `InodeKey(ino)` — produces `"inode:<ino>"`
 - `DirentKey(parent, name)` — produces `"dirent:<parent>/<name>"`
 - `DirentPrefix(parent)` — produces `"dirent:<parent>/"` for prefix scans
-- `LockKey(ino)` — produces `"lock:<ino>"`
+- `LockKey(ino, mode, leaseID)` — produces `"lock:<ino>/<mode>/<lease_id>"`; `LockPrefix(ino)` and `LockModePrefix(ino, mode)` produce the ranges a transaction compares against
 - `ArenaOwnerKey(nodeID, arenaID)` — produces `"arena:<nodeID>/<arenaID>"`
 - `ArenaNodePrefix(nodeID)` — produces `"arena:<nodeID>/"` for prefix scans
 - `MembershipKey(nodeID)` — produces `"membership:<nodeID>"`

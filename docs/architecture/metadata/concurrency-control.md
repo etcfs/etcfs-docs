@@ -17,7 +17,9 @@ Lock operations, lease-backed lock expiry, fencing generations, and the safety p
 
 EtcFS provides two distinct lock classes:
 
-**Data locks** are per-inode locks that serialise concurrent access to file data. They support shared (read) and exclusive (write) modes, matching POSIX `flock`/`fcntl` semantics. A lock is represented by a `lock:<ino>` key in etcd, bound to a lease.
+**Data locks** are per-inode locks that serialise concurrent access to file data. They support shared (read) and exclusive (write) modes. A lock is represented by one key *per holder* — `lock:<ino>/<mode>/<lease_id>` — each bound to that holder's own lease.
+
+A key each is what makes a shared lock possible at all. The key carries the lease that backs it, so a single key holding many readers would be dropped for all of them the moment any one released. Putting the mode in the key rather than the value also lets a transaction ask "is any writer holding this?" as a range comparison, with no value to parse.
 
 **Namespace operations** — file creation, deletion, rename — do not use locks at all. No directory is ever locked. Instead, every namespace mutation is a single atomic etcd transaction that succeeds or fails atomically. Two nodes simultaneously creating different files in the same directory execute independent transactions on different keys; neither blocks the other.
 
@@ -25,13 +27,15 @@ This design eliminates directory-level lock contention entirely. The only serial
 
 ## Lock Acquisition
 
-`AcquireLock` attempts to create a `lock:<ino>` key via a CAS transaction. The semantics depend on the requested mode:
+`AcquireLock` grants a lease and then writes this holder's key in a transaction guarded by a single range comparison: the range that must be empty for the acquisition to be allowed.
 
-**Exclusive lock.** The transaction checks that no lock key exists for this inode (CreateRevision == 0). If the key does not exist, the transaction creates it with the lock mode and holder information, bound to a newly granted etcd lease.
+**Exclusive lock.** The range is `lock:<ino>/` — every holder in any mode. A writer is blocked by anyone.
 
-**Shared lock.** The implementation checks that no exclusive lock exists. Multiple shared locks can coexist — they are tracked in the `holders` list of the lock record.
+**Shared lock.** The range is `lock:<ino>/exclusive/`. A reader is blocked only by a writer, so any number of readers hold the inode at once, each under its own key.
 
-In both cases, if the CAS comparison fails, the lock acquisition fails with `ErrConflict`. The caller can retry (with backoff) or report the conflict to the application.
+Etcd evaluates a comparison over a range as "true for every key in it", and an empty range is vacuously true, so `CreateRevision == 0` over the range reads as "no blocking holder exists". Deciding it inside the transaction rather than by a preceding read is what closes the window a competing acquisition would otherwise slip through.
+
+If the comparison fails, the acquisition fails with `ErrConflict` and its lease is revoked, leaving nothing behind. The caller can retry with backoff or report the conflict to the application.
 
 The lock is bound to an etcd lease. The production data path (`internal/ipc/datapath.go`, both the read and write handlers) calls this with a fixed 2-second TTL (`inodeLockTTL` in `internal/ipc/retry.go`) — not a configurable default; every caller of `AcquireLock` in the running system passes the same constant. The method returns a keepalive channel that the holder must continuously consume. A separate goroutine drains this channel; as long as the goroutine is running and the etcd connection is healthy, the lock stays held.
 
@@ -40,7 +44,7 @@ The lock is bound to an etcd lease. The production data path (`internal/ipc/data
 This is the core safety mechanism. When the lock-holding node crashes or is partitioned from etcd:
 
 1. The keepalive goroutine stops consuming (or cannot reach etcd).
-2. After the lease TTL expires (2 seconds), etcd automatically deletes the `lock:<ino>` key.
+2. After the lease TTL expires (2 seconds), etcd automatically deletes that holder's key.
 3. Any other node watching the lock key receives a DELETE event.
 4. The watching node can then attempt to acquire the lock.
 
@@ -48,13 +52,13 @@ The lease mechanism is fundamentally safer than a "release on crash" protocol be
 
 ## Lock Release
 
-`ReleaseLock` explicitly revokes the lease backing the lock. Etcd deletes the lock key immediately. Any watchers receive a DELETE event. This is used for clean lock release during normal operation (close(), munlock(), process exit).
+`ReleaseLock` revokes the lease backing one holder's key. Etcd deletes that key immediately, and any watchers receive a DELETE event. A shared lock survives with its remaining holders — only the last one to leave actually unlocks the inode.
 
 There is no explicit "unlock" key operation — the lease revocation is sufficient. The lock's own TTL (2 seconds) provides an upper bound on how long the lock itself can remain held after a crash. That is a different figure from the self-fencing watchdog's window: the watchdog gates on the node's *membership* lease (`gen:<node>`/`membership:<node>`, TTL configured separately via `--lease-ttl`, default 10 seconds — see `internal/config/config.go`) and fires at 2–3× that TTL, not the lock TTL. The two leases are independent and not proportional to each other; conflating them here previously understated the actual self-fence window by describing it as derived from the lock's 5-second TTL, a value that was itself wrong.
 
 ## Lock Watching
 
-`WatchLock` creates a watch on the `lock:<ino>` key. This is used by blocking lock operations (SETLKW — "set lock, wait"). When a lock acquisition fails due to conflict, the caller can set up a watch and block until the lock is released or expired. The watch delivers an event when the key is deleted (lock released or expired), at which point the blocked caller can retry.
+`WatchLock` creates a prefix watch over `lock:<ino>/`, so it sees any holder arriving or leaving. This is used by blocking lock operations (SETLKW — "set lock, wait"). When a lock acquisition fails due to conflict, the caller can set up a watch and block until the lock is released or expired. The watch delivers an event when the key is deleted (lock released or expired), at which point the blocked caller can retry.
 
 The watch uses etcd's native prefix-watch mechanism. It is established after a failed lock attempt, not before — this avoids a race where the lock is released between the check and the watch establishment.
 
