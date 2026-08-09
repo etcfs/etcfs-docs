@@ -30,6 +30,15 @@ A secondary implementation that provides O_DIRECT access to the block device. Th
 
 ## Device Discovery
 
+### Go Metadata Daemon (`pkg/blockio`)
+
+`etcfuse-meta` accepts two flags for locating the shared volume:
+
+- `--volume-id` (preferred) — a cloud volume ID (e.g. `vol-0abcdef1234567890`). `pkg/blockio.ResolvePath` resolves it to a device path by scanning `/sys/block` for a device whose serial matches the volume ID (dashes stripped). This runs on every daemon start, not only after a fence: an EBS volume's guest-side NVMe enumeration under AWS Nitro is not guaranteed stable across a detach/reattach cycle, or even across an unrelated attach/detach elsewhere in the same instance, so a path resolved at a previous start cannot be trusted at the next one. Resolution failure (no device with a matching serial) is fatal — the daemon does not fall back to guessing a path, since a wrong guess would silently open the wrong disk.
+- `--block-device` — a literal device path (e.g. `/dev/nvme1n1`). Used as-is with no re-resolution; appropriate for local/loopback setups (Docker Compose, the chaos test harness) where the path is fixed for the container's lifetime. When both flags are set, `--volume-id` wins and overwrites `--block-device` with the resolved path before the device is opened.
+
+### C FUSE Daemon (`pkg/block`, unused)
+
 The block device is opened by calling `etcfs_block_open(volume_id)`. The `volume_id` parameter accepts either:
 - A device path (e.g., `"/dev/nvme1n1"`, `"/dev/xvdf"`)
 - A volume ID string (e.g., `"vol-0abcdef1234567890"`)

@@ -113,24 +113,44 @@ and `pkg/nvmeresv`. AWS: `chaos-nvme-fencing.sh` R1-R7 green
 (`chaos-report-nvme-fencing-20260806-111257`); R8 fixed (30s -> 60s retry
 window). No open items.
 
-## 10. `--block-device` path is not stable across an EBS detach/reattach cycle
+## 10. `--block-device` path is not stable across an EBS detach/reattach cycle — implemented, AWS-verified
 
-Root-caused via item 6/9's R8. `cmd/etcfuse-meta --block-device=<path>` takes
+Root-caused via item 6/9's R8. `cmd/etcfuse-meta --block-device=<path>` took
 a literal path with no re-resolution; AWS Nitro's NVMe enumeration isn't
-guaranteed stable across detach/reattach. `scripts/infra/state.sh`'s
-`detect_ebs_dev` already solves this by matching on EBS serial, but nothing
-in the production binary calls it — chaos-harness side
-(`chaos-lib.sh`'s `restart_daemons`) is already fixed; this item is the
-production-code half.
+guaranteed stable across detach/reattach.
 
-- [ ] Decide where resolution belongs: `internal/config` resolving
-      `--block-device` before `blockio.Open`, or a new `--volume-id` flag
-      that always resolves (matches what `block-device-io.md` describes for
-      the unused C path).
-- [ ] Resolve at every restart, not just after a fence — device paths can
-      drift from any AZ-level NVMe churn.
-- [ ] `setup-compute.sh` / `add-compute-node.sh` also hardcode
-      `/dev/nvme1n1` in their systemd unit templates.
+Fixed with option B: a new `--volume-id` flag (cloud volume ID) that always
+resolves. `pkg/blockio.ResolvePath` (mirrors `scripts/infra/state.sh`'s
+`detect_ebs_dev`) matches the volume ID against device serials under
+`/sys/block` and returns the current path; `cmd/etcfuse-meta/main.go` calls
+it before any device is opened — on every start, not only after a fence, so
+NVMe churn from an unrelated attach/detach on the same instance is covered
+too. Resolution failure is fatal rather than falling back to a guessed path.
+Documented in
+[Block Device I/O Substrate § Device Discovery](architecture/storage/block-device-io.md#device-discovery).
+`--block-device` (literal path, no re-resolution) is kept for local/loopback
+setups (Docker Compose, the chaos harness) where the path never moves.
+
+- [x] Resolution lives in `pkg/blockio.ResolvePath`, wired into
+      `cmd/etcfuse-meta/main.go` ahead of `blockio.Open` and
+      `fencing.NewNVMeFencer`.
+- [x] Runs at every daemon start, not just post-fence.
+- [x] `setup-compute.sh` / `add-compute-node.sh` systemd unit templates
+      switched from hardcoded `--block-device=/dev/nvme1n1` to
+      `--volume-id=${VOL_ID}`. `chaos-lib.sh`'s nvme-fencing mode
+      (`ETCFS_FENCE_MODE=nvme`) switched too, so the harness exercises the
+      same code path production uses instead of a separate bash
+      implementation of the same resolution.
+- [x] AWS validation: `chaos-nvme-fencing.sh` R1-R8 green against the new
+      `--volume-id` path (`chaos-report-nvme-fencing-20260809-130029`), R8
+      confirming a node re-resolves and re-registers correctly after a real
+      detach/reattach/restart cycle. No open items.
+
+R9 (arena reclaim after a confirmed preempt) failed in this run — the arena
+is released from the fenced node but not returned to `free_arena:`. That is
+item 6/9's reclaim-pool bookkeeping, not this item's path resolution, and is
+not yet written up as its own item — flagging here since this run is where
+it surfaced.
 
 ---
 
