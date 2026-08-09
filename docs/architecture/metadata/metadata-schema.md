@@ -29,7 +29,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 | `membership:<node_id>` | membership metadata | Lease-backed liveness key for cluster membership |
 | `gen:<node_id>` | generation counter | Fencing epoch counter, bumped on confirmed fence |
 | `inode_alloc_counter` | counter (8 bytes) | Per-node inode-range reservation counter |
-| `extent:<ino>/<chunk>` | 32-byte extent entries | Chunked extent map for a file, 1 MiB per chunk key |
+| `extent:<ino>/<chunk>` | five comma-separated integers (ASCII) | One extent: a logical byte range of a file mapped onto the shared device |
 
 ### Key semantics
 
@@ -72,6 +72,12 @@ The fixed-length binary record stored at each `inode:<ino>` key, totalling 72 by
 
 The extent list is **_not_** embedded in the inode record. Extents are stored in separate keys (`extent:<ino>/<chunk>`) to keep the inode value small and to allow extent maps to grow beyond the 1.5 MiB etcd value limit without splitting the inode record itself.
 
+The `Nlink` field tracks the number of directory entries pointing to this inode. When `Nlink` reaches zero, the inode is eligible for deletion.
+
+Every inode is created with the count its first entry implies: 1 for a regular file, symlink, device node or FIFO, and 2 for a directory, which is reached both through its parent's entry and through its own `.`. `metadata.InitialNlink` is the single definition of that rule.
+
+Directories keep 2 for their whole life. EtcFS does not model the `..` link a subdirectory contributes to its parent, so a directory's count does not vary with its contents. The fsck and scrubber checks assert that fixed value for directories and compare against the real dirent count for everything else.
+
 ### Extent
 
 Unlike the other records, an extent's value is ASCII: five comma-separated decimal integers at `extent:<ino>/<chunk>`.
@@ -86,13 +92,7 @@ Unlike the other records, an extent's value is ASCII: five comma-separated decim
 
 Keeping recency in the value rather than the key is what allows an extent to be split. Trimming an overwritten extent down to the pieces still readable can leave two records, and both must remain exactly as old as the extent they were cut from; a second key would instead assert the piece is newer, and it would then win over a genuinely newer extent overlapping it.
 
-A four-field value, written before the sequence field existed, decodes with its sequence set to its chunk number — which is the order those records were appended in, so they stay correctly ordered against each other and against anything written since. No migration is needed.
-
-The `Nlink` field tracks the number of directory entries pointing to this inode. When `Nlink` reaches zero, the inode is eligible for deletion.
-
-Every inode is created with the count its first entry implies: 1 for a regular file, symlink, device node or FIFO, and 2 for a directory, which is reached both through its parent's entry and through its own `.`. `metadata.InitialNlink` is the single definition of that rule.
-
-Directories keep 2 for their whole life. EtcFS does not model the `..` link a subdirectory contributes to its parent, so a directory's count does not vary with its contents. The fsck and scrubber checks assert that fixed value for directories and compare against the real dirent count for everything else.
+All five fields are required. EtcFS is pre-deployment, so the decoder rejects the older four-field form outright rather than carrying a compatibility path for records nothing has written.
 
 ### LockRecord
 
