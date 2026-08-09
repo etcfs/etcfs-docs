@@ -15,7 +15,6 @@ The background verification system that cross-checks etcd metadata against itsel
 - [Metrics Output](#metrics-output)
 - [Integration with the Fencing Generation Protocol](#integration-with-the-fencing-generation-protocol)
 - [Integration with Crash Recovery](#integration-with-crash-recovery)
-- [Integration with Compaction](#integration-with-compaction)
 
 ## Design Philosophy
 
@@ -194,10 +193,15 @@ The only anomaly that the scrubber auto-remediates (in the current implementatio
 
 Remediation protocol for orphans, in the same pass that detects them:
 1. The orphan is logged with `AutoFix: true`, carrying the `disk_off` and `length` decoded from the extent's value.
-2. The `extent:<ino>/<chunk>` key is deleted from etcd. This comes first: the blocks must stop being reachable through metadata before they can be handed to another allocation, or a reader resolving the extent could land on data that has already been overwritten. A failed delete skips the reclaim, leaving both the key and its blocks for the next pass.
-3. `arena.Allocator.Free(disk_off, length)` returns the blocks to the free-list.
+2. `arena.Allocator.Owns(disk_off)` is consulted. A range outside every arena this node holds is reported and left alone — see below.
+3. The `extent:<ino>/<chunk>` key is deleted from etcd. This comes before the reclaim: the blocks must stop being reachable through metadata before they can be handed to another allocation, or a reader resolving the extent could land on data that has already been overwritten. A failed delete skips the reclaim, leaving both the key and its blocks for the next pass.
+4. `arena.Allocator.Free(disk_off, length)` returns the blocks to the free-list.
 
-The free-list is per-process and in-memory, so step 3 only reclaims ranges inside arenas *this* node owns; `Free` ignores anything else. A range in another node's arena stays allocated until that node's own scrubber reaches it, or until the arena is compacted. The reclaim is also not durable — a restart rebuilds the bitmap from the live extents in etcd, which no longer include the deleted file's, so the space returns that way instead.
+Step 2 is what keeps reclamation from leaking across nodes. The free-list is per-process and in-memory, and it is rebuilt from the live `extent:` keys — so deleting the extent record of a range inside a *peer's* arena would remove the only reference that peer's bitmap is derived from, and those blocks would stay marked allocated there until it restarted. Leaving the orphan for its owner costs nothing, because every arena has exactly one owner and every owner runs the same pass.
+
+An orphan in an arena that currently sits in the free pool is left alone by the same rule, and is still cleaned up: whoever claims that arena next marks the range live from the extent record that is still there, and its own next pass then finds the orphan, owns it, and reclaims it.
+
+The reclaim is not durable, and does not need to be — a restart rebuilds the bitmap from the live extents in etcd, which no longer include the deleted file's, so the space returns that way instead.
 
 This is what makes file deletion actually return disk space. `AtomicUnlink` removes the dirent and, at `nlink == 0`, the inode record, but never touches the file's extent keys; without the reclaim step the blocks stay marked allocated with nothing referencing them, and space leaks on every deletion.
 
