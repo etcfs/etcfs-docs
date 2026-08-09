@@ -59,7 +59,7 @@ Store replay is the MockStore's equivalent of reading metadata from etcd on star
 | Lock records | No | Lock keys are bound to leases; leases expire on crash. The mock does not implement lease persistence across crashes, so lock state is lost. This matches reality: a daemon crash loses all lease keepalives, and etcd expires the leases. |
 | Inode allocation counter | Yes | `inode_alloc_counter` is a durable key |
 | Fencing generation | Yes | `gen:<node_id>` is a durable key |
-| Arena assignment | Yes | `arena:<node_id>` is a durable key |
+| Arena assignment | Yes | `arena:<node_id>/<arena_id>` is a durable key, one per arena owned |
 | Membership | No | Lease-backed; lost on crash |
 
 ### What Does Not Survive

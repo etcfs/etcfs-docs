@@ -192,7 +192,7 @@ After a crash, the following state is reconstructed from durable storage:
 | Lock state | None (lost) | Locks are released on crash — lease TTL expires |
 | Membership | etcd (`membership:<node_id>`) | Re-created at startup |
 | Fencing generation | etcd (`gen:<node_id>`) | Read on demand via GetGeneration |
-| Arena ownership | etcd (`arena:<node_id>`) | Read at startup by the allocator |
+| Arena ownership | etcd (`arena:<node_id>/<arena_id>`) | Read at startup by the allocator |
 | WAL | Local file | Replayed at startup |
 | Inode number counter | etcd (`inode_alloc_counter`) | Read on first allocation (CAS) |
 

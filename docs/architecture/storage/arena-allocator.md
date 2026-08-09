@@ -45,6 +45,8 @@ BlocksPerArena: 262,144
 
 Each arena is identified by a unique unsigned 64-bit integer (the `Arena.ID`). The disk start is `ID * ArenaSizeBytes`, and the disk end (exclusive) is `(ID + 1) * ArenaSizeBytes`. Arena IDs are assigned sequentially from the global `arena_alloc_log` counter.
 
+A node is not limited to one arena: `allocateBlocks` acquires a further arena whenever the ones it already holds cannot satisfy a write, so a node writing more than 1 GiB owns several at once. Each arena's ownership is a separate etcd record, `arena:<node_id>/<arena_id>` — one key per arena, not one per node — so acquiring a second arena cannot overwrite the first's claim.
+
 ## Bitmap Free-List
 
 Each arena carries a bitmap of `BlocksPerArena / 64 = 4096` uint64 entries. Each bit represents one block: 1 = allocated, 0 = free.
@@ -118,15 +120,24 @@ AcquireArena(nodeID):
     Txn:
       If cmp:
         Put("arena_alloc_log", encode(next))
-        Put("arena:<nodeID>", encode(current))   // claim arena
         return Arena{ID: current, DiskStart: current * 1GiB, DiskEnd: (current+1) * 1GiB}
       Else:
         retry
 
   return ENOSPC  (after 5 attempts)
+
+recordOwnership(nodeID, arenaID):
+  Txn:
+    If CreateRevision("arena:<nodeID>/<arenaID>") == 0:
+      Put("arena:<nodeID>/<arenaID>", encode(arenaID))   // claim this arena
+      return ok
+    Else:
+      return error("already owned")   // the ID came back already claimed
 ```
 
 The CAS on the counter ensures at-most-once allocation per arena ID. If two nodes attempt to acquire an arena simultaneously, exactly one succeeds for each unique counter value. The failing node retries with the next counter value.
+
+Recording ownership is a second, separate CAS, conditioned on the per-arena key not already existing. It cannot be folded into the counter's transaction: the ownership key is per-arena (`arena:<nodeID>/<arenaID>`), unlike the counter, and a lost race here means the arena ID somehow came back already claimed — a bug elsewhere, not contention to retry through.
 
 The maximum total device capacity is `2^64 * 1 GiB` (if arena IDs are 64-bit unsigned), but in practice is limited by EBS volume size (64 TiB for io2 Multi-Attach). With 1 GiB arenas, the global counter supports up to 64 TiB / 1 GiB = 65,536 arenas, which is well within the counter's range.
 
@@ -164,14 +175,16 @@ The block size (4096 bytes) matches the O_DIRECT sector alignment requirement fo
 
 ## Arena Release
 
-An arena is not just allocated, it must eventually be given back — otherwise every node departure, graceful or not, leaks that node's arena space permanently. `Store.ReleaseArena(ctx, nodeID)` moves a node's `arena:<node_id>` record into `free_arena:<arena_id>` in one transaction, CAS-guarded on the record's current value so a release racing on stale state cannot free an arena the node was given afterwards. `ClaimFreeArena` (above) is the other half of the same round trip.
+An arena is not just allocated, it must eventually be given back — otherwise every node departure, graceful or not, leaks that node's arena space permanently. `Store.ReleaseArena(ctx, nodeID)` moves *every* arena the node owns — not just one — from its `arena:<node_id>/<arena_id>` record into `free_arena:<arena_id>`, one CAS-guarded transaction per arena so a concurrent compactor move of one arena cannot abort the release of the rest. `ClaimFreeArena` (above) is the other half of the same round trip.
 
 Release is wired in two places, gated on different proofs of quiescence:
 
-- **Graceful departure.** `Membership.Leave(ctx, store)` releases the arena, then revokes the membership lease — in that order, so the arena record is already gone by the time the membership key's deletion could wake a fencing controller. `cmd/etcfuse-meta` calls `Leave` after its IPC server has stopped, not from the context-cancellation path that starts shutdown: the IPC server having stopped is what proves no further write can be issued from this node, and that proof only exists once shutdown is further along than "cancel received."
-- **Confirmed fence.** `pkg/fencing.Controller` releases a fenced node's arena after the generation bump, but only when a `Fencer` confirmed the severance (NVMe preempt or EBS detach — see [External Fencing Controller](../fencing/external-fencing-controller.md)). Single-signal mode (no `Fencer` configured, e.g. plain Docker) leaves the arena leaked deliberately: a lease expiry alone is not proof the node has stopped writing, so there is nothing to satisfy invariant 4 of [Kleppmann's Stale-Write Hazard](kleppmann-stale-write-analysis.md) with.
+- **Graceful departure.** `Membership.Leave(ctx, store)` releases the node's arenas, then revokes the membership lease — in that order, so the ownership records are already gone by the time the membership key's deletion could wake a fencing controller. `cmd/etcfuse-meta` calls `Leave` after its IPC server has stopped, not from the context-cancellation path that starts shutdown: the IPC server having stopped is what proves no further write can be issued from this node, and that proof only exists once shutdown is further along than "cancel received."
+- **Confirmed fence.** `pkg/fencing.Controller` releases a fenced node's arenas after the generation bump, but only when a `Fencer` confirmed the severance (NVMe preempt or EBS detach — see [External Fencing Controller](../fencing/external-fencing-controller.md)). Single-signal mode (no `Fencer` configured, e.g. plain Docker) leaves the arenas leaked deliberately: a lease expiry alone is not proof the node has stopped writing, so there is nothing to satisfy invariant 4 of [Kleppmann's Stale-Write Hazard](kleppmann-stale-write-analysis.md) with.
 
-Reclamation is in-memory and per-node: the free list above lives in each allocator's own bitmap, and a node only ever reads its own `arena:<node_id>` key (never a prefix scan, see below), so there is no mechanism today for a node to reclaim ranges inside *another* node's still-owned arena. A durable, cluster-visible free list would be needed for that; not built, because a restart's bitmap reconstruction (below) already recovers the same space by another route, and no deployment has needed cross-node range reclaim yet.
+Block-level reclamation is in-memory and per-node: the free list above lives in each allocator's own bitmap, and a node only ever reads its own `arena:<node_id>/` records (never a prefix scan over all nodes, see below), so there is no mechanism for a node to reclaim ranges inside *another* node's still-owned arena — and there won't be. Two nodes allocating inside one arena is exactly the two-writers-one-range corruption the whole scheme exists to prevent; whole-arena transfer via `free_arena:` already recycles space at the only granularity that's safe without a fenced source. A durable, cluster-visible block free list is likewise not planned: the durable `extent:` keys already are that free list, one level of indirection away — both `Reconstruct` (crash recovery, below) and a recycled arena's live-extent scan derive the bitmap from them on demand. Persisting a second bitmap would just be a second source of truth that can drift from the first.
+
+Space that falls through the cracks anyway — a released arena's ownership record surviving a crash between delete and put, or a single-signal-mode fence's deliberate leak — is not silently lost: `fsck.checkArenaOrphans` walks every arena ID below the `arena_alloc_log` high-water mark and reports any that is owned by no node and absent from the free pool, or owned by one and free in the pool at the same time. It reports, it does not repair — deciding an arena is truly abandoned needs an operator's knowledge of which nodes are gone for good.
 
 ### Free After Deletion
 
@@ -201,7 +214,7 @@ When a file is fully deleted (all hard links removed, nlink reaching zero), the 
 
 After an unclean shutdown, the arena allocator's local state (the in-memory bitmap) is lost. On restart:
 
-1. The node acquires its current arena by reading **its own** `arena:<node_id>` key from etcd — never the other nodes' keys. The record is a bare 8-byte big-endian arena ID; anything else (missing key, wrong length) is treated as "no arena" rather than decoded, since a malformed record could otherwise resolve to a valid-looking but wrong ID.
+1. The node recovers every arena it owns by prefix-scanning **its own** `arena:<node_id>/` records from etcd — never the other nodes' keys, and never just the most recent of its own. Each record is a bare 8-byte big-endian arena ID; anything else (wrong length) is skipped rather than decoded, since a malformed record could otherwise resolve to a valid-looking but wrong ID.
 
 2. The node's local bitmap is rebuilt by scanning the extent keys in etcd. Every `extent:<ino>/<chunk>` entry that falls within the node's arena range is decoded, and the corresponding blocks are marked allocated.
 
@@ -211,15 +224,16 @@ After an unclean shutdown, the arena allocator's local state (the in-memory bitm
 
 The bitmap reconstruction from etcd is O(N) in the number of extents. For a completely full arena with 262,144 single-block extents, this is 262,144 extent reads — which takes a few seconds at typical etcd read rates.
 
-If the node has no arena key in etcd (it was fenced and its arena was reclaimed by other nodes), the allocator starts with zero arenas and acquires a new one on the first write request.
+If the node has no arena records in etcd (it was fenced and its arenas were reclaimed by other nodes), the allocator starts with zero arenas and acquires a new one on the first write request.
 
-### Why "own key only" is not optional
+### Why "own prefix only" is not optional
 
-Step 1 reads exactly one key, not a prefix scan over all `arena:*` keys. Reading the whole prefix was the actual behaviour until it was fixed (see [Kleppmann's Stale-Write Hazard in EtcFS](kleppmann-stale-write-analysis.md#the-allocator-channel) for the full analysis): every node's arena would be pulled into the restarting node's free-list, and step 4's `Allocate` calls would then hand out disk offsets inside a range another node was actively writing to. Both writers hold valid leases and current fencing generations in that scenario, so the generation guard on the metadata commit has nothing to reject — the corruption is silent, and only the scrubber's `CheckExtentCollisions` catches it, after the fact.
+Step 1 scans exactly `arena:<node_id>/`, not the whole `arena:` prefix. Reading the whole prefix was the actual behaviour until it was fixed (see [Kleppmann's Stale-Write Hazard in EtcFS](kleppmann-stale-write-analysis.md#the-allocator-channel) for the full analysis): every node's arena would be pulled into the restarting node's free-list, and step 4's `Allocate` calls would then hand out disk offsets inside a range another node was actively writing to. Both writers hold valid leases and current fencing generations in that scenario, so the generation guard on the metadata commit has nothing to reject — the corruption is silent, and only the scrubber's `CheckExtentCollisions` catches it, after the fact.
 
-Two related defects fed the same bug and are fixed alongside it:
+Several related defects fed the same class of bug and are fixed alongside it:
 
-- `AcquireArena` did not persist an ownership record at acquisition time, so a node had no durable claim on the range it was writing into until something else (membership leave, compaction) happened to write `arena:<node_id>` later.
+- `AcquireArena` did not persist an ownership record at acquisition time, so a node had no durable claim on the range it was writing into until something else (membership leave, compaction) happened to write it later.
 - The compactor encoded the ownership value as ASCII (`fmt.Sprintf("id=%d", arenaID)`) while everything else uses 8-byte big-endian, so a compaction-relocated arena decoded to ID 0 on the next restart.
+- Before the per-arena key layout, a single `arena:<node_id>` record meant a node's *second* `AcquireArena` call silently overwrote its first — the first arena became owned by nobody, never re-adopted on restart and never returned to the free pool. Any node writing more than 1 GiB hit this on every write session. `ReleaseArena` had the matching half of the same bug: it freed only the most recently acquired arena, leaking the rest on every departure or fence.
 
-Regression coverage: `pkg/arena/allocator_integration_test.go` (real etcd, verified to fail without the fix and pass with it) and `scripts/test/chaos-arena-collision.sh` scenarios S8 (restart-adoption), S9 (concurrent cross-node writes, no offset collision), S10 (fenced writer leaves no torn result) — run against both docker and AWS.
+Regression coverage: `pkg/arena/allocator_integration_test.go` (real etcd) — `TestIntegration_ReconstructRecoversAllOwnedArenas` and `TestIntegration_ReleaseArenaReleasesAllOwned` are the multi-arena regressions, verified to fail against the old single-key layout and pass against the current one; the rest of that file covers the earlier defects above. `scripts/test/chaos-arena-collision.sh` scenarios S8 (restart-adoption), S9 (concurrent cross-node writes, no offset collision), S10 (fenced writer leaves no torn result) — run against both docker and AWS.

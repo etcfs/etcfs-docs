@@ -56,7 +56,7 @@ All nodes share the same etcd key space. The key naming convention ensures isola
 | `inode:<ino>` | None (cluster-wide) | All nodes can read; one node's `AtomicCreateFile` creates |
 | `dirent:<parent>/<name>` | None (cluster-wide) | All nodes read/write via CAS transactions |
 | `lock:<ino>` | Lease-bound holder | All nodes can read; only holder writes |
-| `arena:<node_id>` | Exclusive to the named node | All nodes read for reclamation; only owner writes |
+| `arena:<node_id>/<arena_id>` | Exclusive to the named node | All nodes read for reclamation; only owner writes |
 | `membership:<node_id>` | Lease-bound liveness | All nodes watch for join/fail events |
 | `gen:<node_id>` | Fencing controller (exclusive writer) | All nodes read for generation guards |
 | `extent:<ino>/<chunk>` | Owned by the inode's writer | All nodes read; only one node appends |

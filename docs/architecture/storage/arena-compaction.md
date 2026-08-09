@@ -42,13 +42,21 @@ Compaction is triggered by the `NeedsCompaction` check:
 
 ```
 NeedsCompaction():
-  arenas = GetPrefix("arena:")    // all arena keys
+  arenas = GetPrefix("arena:")    // all ownership keys, arena:<node_id>/<arena_id>
   for each arena:
-    usage = arenaUsage(arena.ID)
+    _, arenaID, ok = ParseArenaKey(arena.Key)
+    if !ok: continue
+    usage = arenaUsage(arenaID)
     if usage < DefaultCompactRatio:
-      add arena.ID to candidates
+      add arenaID to candidates
   return (len(candidates) > 0, candidates)
 ```
+
+`ParseArenaKey` splits the key on its last `/` — the node ID is everything
+before it, the arena ID everything after. Before the per-arena key layout
+(`arena:<node_id>/<arena_id>`), this parsed the *node ID* string as if it were
+a numeric arena ID, which always failed and made every candidate's usage
+calculation run against arena 0 regardless of which arena it actually named.
 
 The usage calculation scans all extent keys and checks whether each extent falls within the arena's disk range (`disk_off >= arena_start && disk_off + length <= arena_end`). Only extents from live inodes are counted — the extent key must exist and its owning inode must also exist.
 
@@ -91,8 +99,8 @@ The batch size of 128 is chosen to stay well within etcd's recommended per-trans
 
 After all extent keys have been updated:
 
-1. Mark the source arena as free: create a `free_arena:<arena_id>` key in etcd.
-2. Mark the destination arena as acquired: update the owner's `arena:<node_id>` key.
+1. Mark the source arena as free: create a `free_arena:<arena_id>` key, and delete its `arena:<node_id>/<arena_id>` ownership record, in one transaction.
+2. Mark the destination arena as acquired: create a new `arena:<node_id>/<dst_arena_id>` ownership record.
 
 The source arena's disk blocks are now available for reuse. The destination arena is now the home of the compacted extents. No data is moved on the block device — only the etcd extent keys are updated. The actual block device contents remain at their original offsets; the "move" is purely a metadata operation.
 
@@ -152,16 +160,19 @@ After all extent keys are updated:
 
 ```
 markGlobalArenaAvailable(srcArenaID):
-    Put("free_arena:<srcArenaID>", "free")
+    ownerKey = find the arena:*/srcArenaID key, if any node still holds it
+    Txn:
+        Put("free_arena:<srcArenaID>", "free")
+        Delete(ownerKey)   // if found
 ```
 
-The `free_arena:<id>` key signals to other nodes that this arena is available for acquisition. The arena's original `arena:<node_id>` key is not deleted — the destination arena key replaces it for the owning node. The free pool of arena IDs is separate from the arena ownership keys.
+The `free_arena:<id>` key signals to other nodes that this arena is available for acquisition. Its owner's `arena:<node_id>/<srcArenaID>` record is deleted in the same transaction — leaving it in place would mean the arena is simultaneously free and owned, and a node claiming it from the free pool would collide with the node whose stale record still names it. Each arena has its own ownership key (`arena:<node_id>/<arena_id>`), so releasing one arena never touches the node's other ownership records.
 
 ### Destination Arena Acquisition
 
 ```
 markGlobalArenaAcquired(dstArenaID, nodeID):
-    Put("arena:<nodeID>", EncodeUint64(dstArenaID))
+    Put("arena:<nodeID>/<dstArenaID>", EncodeUint64(dstArenaID))
 ```
 
 The destination arena is recorded as owned by the node. A subsequent `NeedsCompaction` check on the node will include the destination arena (which now holds the compacted extents) in its utilization calculation.
@@ -189,7 +200,7 @@ Compaction reads and writes extent keys. It does **not** modify inode records, d
 
 - `extent:<ino>/<chunk>` keys — updated with new disk offsets.
 - `free_arena:<id>` key — created for the source arena.
-- `arena:<node_id>` key — updated to reflect the new arena ownership.
+- `arena:<node_id>/<arena_id>` keys — the source arena's record is deleted, a new record is created for the destination arena.
 
 No inode's `size`, `blocks`, `mtime`, or `generation` changes during compaction. No directory entry changes. No lock changes. Compaction is transparent to applications reading or writing files — they see the same data at the same file offsets through the same inode.
 

@@ -44,7 +44,7 @@ Mechanism, coverage, and every bug found along the way are documented in
 (§ Fence Intent / Fence Claim / dual confirmation). AWS: `chaos-fencing-retry.sh`
 all scenarios green (see `docs/chaos-reports/`). No open items.
 
-## 6. Arena reclamation — implemented and tested 2026-08-06
+## 6. Arena reclamation — implemented and tested 2026-08-06; multi-arena leak closed 2026-08-09
 
 Mechanism documented in [Arena Allocator § Arena Release](architecture/storage/arena-allocator.md#arena-release)
 and [Kleppmann invariant 4](architecture/storage/kleppmann-stale-write-analysis.md#invariants-to-preserve).
@@ -54,14 +54,30 @@ etcd; `chaos-arena-reclaim.sh` 4/4 Docker + 5/5 AWS; `chaos-nvme-fencing.sh`
 processes not killed on restart, hardcoded NVMe device paths not surviving
 detach/reattach, `destroy-infra.sh` missing nodes added via `add_node`).
 
-- [ ] Durable, cluster-visible free list. Not built — reclamation today is
-      in-memory/per-node, sufficient because a restart's bitmap rebuild
-      recovers the same space and nothing yet needs to reclaim space inside
-      *another* node's arena. Build when that changes.
-- [ ] `arena:<node_id>` records only one arena per node (`pkg/arena/allocator.go`
-      ponytail note) — a node holding several recovers only the most recent
-      after restart. Move to `arena:<node_id>/<arena_id>` if multi-arena
-      ownership becomes normal.
+2026-08-09: moved arena ownership from one `arena:<node_id>` record per node
+to one `arena:<node_id>/<arena_id>` record per arena. The single-key layout
+was a live leak, not a hypothetical one — `allocateBlocks` already acquired a
+further arena whenever a node's current ones filled up, and the second
+`AcquireArena` silently overwrote the first record: that arena was never
+re-adopted on restart and never returned to the free pool. `ReleaseArena` had
+the matching bug on departure/fencing, releasing only the most recent arena.
+Fixed in `pkg/arena`, `pkg/metadata`, `pkg/compaction`, `pkg/fsck`,
+`pkg/fsinfo`, `pkg/membership` (harness); see arena-allocator.md § Arena
+Release and § Crash Recovery Integration for the full writeup. Added
+`fsck.checkArenaOrphans` to report (not repair) any arena that falls through
+the cracks anyway. No open items — both prior bullets here are resolved or
+decided against:
+
+- Durable, cluster-visible block free list: decided **not to build**. The
+  durable `extent:` keys already serve as that free list one level of
+  indirection away — both crash recovery and a recycled arena's live-extent
+  scan derive the in-memory bitmap from them on demand. A persisted bitmap
+  would be a second source of truth that can drift from the first.
+- Cross-node reclamation (one node freeing space inside another's arena):
+  decided **not to build**. That is exactly the two-writers-one-range
+  corruption the arena scheme exists to prevent. Whole-arena transfer via
+  `free_arena:` already recycles space at the only granularity that's safe
+  without a fenced source.
 
 ## 7. FUSE handlers run with an unbounded context — bound added, tuning open
 

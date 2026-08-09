@@ -24,7 +24,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 | `inode:<ino>` | `InodeRecord` (72 bytes) | File or directory metadata |
 | `dirent:<parent>/<name>` | `<ino>` (8 bytes) | Directory entry resolving a name to an inode |
 | `lock:<ino>` | `LockRecord` (JSON) | Lease-backed file lock state |
-| `arena:<node_id>` | `ArenaRecord` | Disk range owned by a node for block allocation |
+| `arena:<node_id>/<arena_id>` | `<arena_id>` (8 bytes) | One arena a node currently owns |
 | `arena_alloc_log` | counter (8 bytes) | Global arena-ID allocation counter |
 | `membership:<node_id>` | membership metadata | Lease-backed liveness key for cluster membership |
 | `gen:<node_id>` | generation counter | Fencing epoch counter, bumped on confirmed fence |
@@ -85,18 +85,11 @@ A JSON value stored at `lock:<ino>`, describing the current lock state.
 
 The lock key is bound to an etcd lease. When the lease expires (node crash, network partition beyond TTL margin), the lock key is automatically deleted, releasing the lock.
 
-### ArenaRecord
+### Arena ownership record
 
-Stored at `arena:<node_id>`, describing a 1 GiB contiguous disk range owned by a node.
+Stored at `arena:<node_id>/<arena_id>`, one key per arena a node owns — not one key per node, since a node acquires a further arena whenever its current ones fill up. The value is the arena ID itself, 8-byte big-endian; `DiskStart`/`DiskEnd` are derived (`ID * ArenaSizeBytes`, `(ID+1) * ArenaSizeBytes`), not stored.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `NodeID` | `string` | Node that owns this arena |
-| `DiskStart` | `uint64` | Byte offset on the block device where the arena begins |
-| `DiskEnd` | `uint64` | Byte offset where the arena ends (exclusive) |
-| `FreeList` | `[]uint64` | Sorted list of free-block offsets within the arena |
-
-Each arena is 1 GiB (2^30 bytes) divided into 4 KiB blocks, yielding 262,144 blocks per arena. The allocator tracks free/allocated blocks via a bitmap local to the node. The free-list is periodically persisted to etcd for crash recovery.
+Each arena is 1 GiB (2^30 bytes) divided into 4 KiB blocks, yielding 262,144 blocks per arena. The allocator tracks free/allocated blocks via an in-memory bitmap local to the node, rebuilt on restart from the live `extent:` keys — see [Arena Allocator § Crash Recovery Integration](../storage/arena-allocator.md#crash-recovery-integration). Nothing about block-level free/allocated state is persisted; only arena ownership is.
 
 ### MembershipRecord
 
@@ -119,7 +112,8 @@ Each key family has a constructor function that builds the etcd key string from 
 - `DirentKey(parent, name)` — produces `"dirent:<parent>/<name>"`
 - `DirentPrefix(parent)` — produces `"dirent:<parent>/"` for prefix scans
 - `LockKey(ino)` — produces `"lock:<ino>"`
-- `ArenaKey(nodeID)` — produces `"arena:<nodeID>"`
+- `ArenaOwnerKey(nodeID, arenaID)` — produces `"arena:<nodeID>/<arenaID>"`
+- `ArenaNodePrefix(nodeID)` — produces `"arena:<nodeID>/"` for prefix scans
 - `MembershipKey(nodeID)` — produces `"membership:<nodeID>"`
 - `GenKey(nodeID)` — produces `"gen:<nodeID>"`
 
