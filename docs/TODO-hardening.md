@@ -37,48 +37,6 @@ report free / always succeed. Documented as deliberate "Phase 3" scope in
 - [ ] At minimum, log the limitation at startup instead of leaving it a doc
       footnote.
 
-## 5. External fencing: controller race and retry — closed 2026-08-06
-
-Mechanism, coverage, and every bug found along the way are documented in
-[External Fencing Controller](architecture/fencing/external-fencing-controller.md)
-(§ Fence Intent / Fence Claim / dual confirmation). AWS: `chaos-fencing-retry.sh`
-all scenarios green (see `docs/chaos-reports/`). No open items.
-
-## 6. Arena reclamation — implemented and tested 2026-08-06; multi-arena leak closed 2026-08-09
-
-Mechanism documented in [Arena Allocator § Arena Release](architecture/storage/arena-allocator.md#arena-release)
-and [Kleppmann invariant 4](architecture/storage/kleppmann-stale-write-analysis.md#invariants-to-preserve).
-Tested: `pkg/arena`, `pkg/scrub`, `pkg/fencing` integration tests against real
-etcd; `chaos-arena-reclaim.sh` 4/4 Docker + 5/5 AWS; `chaos-nvme-fencing.sh`
-17/17 AWS (also fixed several chaos-harness bugs along the way — stale daemon
-processes not killed on restart, hardcoded NVMe device paths not surviving
-detach/reattach, `destroy-infra.sh` missing nodes added via `add_node`).
-
-2026-08-09: moved arena ownership from one `arena:<node_id>` record per node
-to one `arena:<node_id>/<arena_id>` record per arena. The single-key layout
-was a live leak, not a hypothetical one — `allocateBlocks` already acquired a
-further arena whenever a node's current ones filled up, and the second
-`AcquireArena` silently overwrote the first record: that arena was never
-re-adopted on restart and never returned to the free pool. `ReleaseArena` had
-the matching bug on departure/fencing, releasing only the most recent arena.
-Fixed in `pkg/arena`, `pkg/metadata`, `pkg/compaction`, `pkg/fsck`,
-`pkg/fsinfo`, `pkg/membership` (harness); see arena-allocator.md § Arena
-Release and § Crash Recovery Integration for the full writeup. Added
-`fsck.checkArenaOrphans` to report (not repair) any arena that falls through
-the cracks anyway. No open items — both prior bullets here are resolved or
-decided against:
-
-- Durable, cluster-visible block free list: decided **not to build**. The
-  durable `extent:` keys already serve as that free list one level of
-  indirection away — both crash recovery and a recycled arena's live-extent
-  scan derive the in-memory bitmap from them on demand. A persisted bitmap
-  would be a second source of truth that can drift from the first.
-- Cross-node reclamation (one node freeing space inside another's arena):
-  decided **not to build**. That is exactly the two-writers-one-range
-  corruption the arena scheme exists to prevent. Whole-arena transfer via
-  `free_arena:` already recycles space at the only granularity that's safe
-  without a fenced source.
-
 ## 7. FUSE handlers run with an unbounded context — bound added, tuning open
 
 `dispatch` now builds one bounded context (`requestTimeout`, 10s,
@@ -105,61 +63,12 @@ production caller — only the harness uses them.
 - [ ] If yes: nail down the trigger condition and manual-vs-automatic posture
       first — those decisions shape everything else.
 
-## 9. Replace advisory fencing with NVMe reservations — implemented, AWS-verified
-
-Mechanism, spike results, and resolved design decisions documented in
-[External Fencing Controller](architecture/fencing/external-fencing-controller.md)
-and `pkg/nvmeresv`. AWS: `chaos-nvme-fencing.sh` R1-R7 green
-(`chaos-report-nvme-fencing-20260806-111257`); R8 fixed (30s -> 60s retry
-window). No open items.
-
-## 10. `--block-device` path is not stable across an EBS detach/reattach cycle — implemented, AWS-verified
-
-Root-caused via item 6/9's R8. `cmd/etcfuse-meta --block-device=<path>` took
-a literal path with no re-resolution; AWS Nitro's NVMe enumeration isn't
-guaranteed stable across detach/reattach.
-
-Fixed with option B: a new `--volume-id` flag (cloud volume ID) that always
-resolves. `pkg/blockio.ResolvePath` (mirrors `scripts/infra/state.sh`'s
-`detect_ebs_dev`) matches the volume ID against device serials under
-`/sys/block` and returns the current path; `cmd/etcfuse-meta/main.go` calls
-it before any device is opened — on every start, not only after a fence, so
-NVMe churn from an unrelated attach/detach on the same instance is covered
-too. Resolution failure is fatal rather than falling back to a guessed path.
-Documented in
-[Block Device I/O Substrate § Device Discovery](architecture/storage/block-device-io.md#device-discovery).
-`--block-device` (literal path, no re-resolution) is kept for local/loopback
-setups (Docker Compose, the chaos harness) where the path never moves.
-
-- [x] Resolution lives in `pkg/blockio.ResolvePath`, wired into
-      `cmd/etcfuse-meta/main.go` ahead of `blockio.Open` and
-      `fencing.NewNVMeFencer`.
-- [x] Runs at every daemon start, not just post-fence.
-- [x] `setup-compute.sh` / `add-compute-node.sh` systemd unit templates
-      switched from hardcoded `--block-device=/dev/nvme1n1` to
-      `--volume-id=${VOL_ID}`. `chaos-lib.sh`'s nvme-fencing mode
-      (`ETCFS_FENCE_MODE=nvme`) switched too, so the harness exercises the
-      same code path production uses instead of a separate bash
-      implementation of the same resolution.
-- [x] AWS validation: `chaos-nvme-fencing.sh` R1-R8 green against the new
-      `--volume-id` path (`chaos-report-nvme-fencing-20260809-130029`), R8
-      confirming a node re-resolves and re-registers correctly after a real
-      detach/reattach/restart cycle. No open items.
-
-R9 (arena reclaim after a confirmed preempt) failed in this run — the arena
-is released from the fenced node but not returned to `free_arena:`. That is
-item 6/9's reclaim-pool bookkeeping, not this item's path resolution, and is
-not yet written up as its own item — flagging here since this run is where
-it surfaced.
-
 ---
 
 ## Order
 
 1. Item 7 tuning — ready, zero dependencies.
-2. ~~Item 9~~, ~~Item 5~~,
-3. Item 6, 10
-4. Item 1 — independent, low value, do whenever.
-5. Item 8 — decision item, likely "no".
-6. Item 2 — resolved as a side effect of item 7 (renumber once item 1 lands).
-7. Item 3, 4
+2. Item 1 — independent, low value, do whenever.
+3. Item 8 — decision item, likely "no".
+4. Item 2 — resolved as a side effect of item 7 (renumber once item 1 lands).
+5. Item 3, 4
