@@ -1,164 +1,90 @@
 # POSIX Lock Operations
 
-The `fcntl()`/`flock()` lock model in EtcFS: GETLK and SETLK semantics, the lease-backed lock design, and the integration with the fencing generation protocol.
+How `fcntl()` and `flock()` locks behave in EtcFS today, why `fcntl()` locking is currently broken, and what building real cross-node locking would require.
 
 ## Table of Contents
 
-- [Design Overview](#design-overview)
-- [Phase 3 Implementation](#phase-3-implementation)
-- [Full Lock Protocol (Planned)](#full-lock-protocol-planned)
-- [Lock Types](#lock-types)
-- [Blocking Lock Acquisition](#blocking-lock-acquisition)
-- [Lock Lifecycle](#lock-lifecycle)
+- [Current Behavior](#current-behavior)
+- [Two Unrelated Lock Interfaces](#two-unrelated-lock-interfaces)
+- [The Per-Operation Inode Lock](#the-per-operation-inode-lock)
+- [Wire Format](#wire-format)
+- [Building Cross-Node Locking](#building-cross-node-locking)
 - [Fencing Integration](#fencing-integration)
 
-## Design Overview
+## Current Behavior
 
-POSIX file locks (both POSIX `fcntl()` records and BSD `flock()` calls) map onto the etcd-based lock mechanism described in Concurrency Control. Each lock is represented by a `lock:<ino>` key in etcd, bound to an etcd lease.
+`handleGetlk` and `handleSetlk` in `internal/ipc/handlers.go` are no-ops. GETLK parses the requested range, discards it, and always answers `F_UNLCK` ("the range is free"). SETLK validates the payload length and always returns success. Neither touches etcd — both take `_ context.Context`. No lock state is recorded anywhere.
 
-The lock model distinguishes two classes of lock operations:
+The consequence is worse than "unenforced across nodes". Because the FUSE filesystem implements `getlk`/`setlk`, the kernel stops doing its own POSIX-lock bookkeeping for this mount and defers to the daemon — which grants everything. **`fcntl()` record locks therefore do not exclude even two processes on the same node.**
 
-- **Query (GETLK):** Returns the current lock state for a byte range on an inode. In EtcFS, this is a simplified operation that reports the first conflicting lock, or F_UNLCK if the range is free.
+This was measured directly, with two processes taking `F_SETLK`/`F_WRLCK` on one file:
 
-- **Acquire/Release (SETLK, SETLKW):** Atomically acquires or releases a lock on a byte range. SETLK returns immediately with success or failure; SETLKW blocks until the lock can be acquired.
+| Lock interface | Local filesystem (control) | EtcFS mount |
+| --- | --- | --- |
+| `fcntl()` `F_SETLK` (via `lockf`) | refused (`EAGAIN`) | **second process acquires** |
+| `flock()` | refused (`EAGAIN`) | refused (`EAGAIN`) |
 
-## Phase 3 Implementation
+The result is deterministic across repeated runs and applies to both newly created and pre-existing files.
 
-Phase 3 provides a minimal lock implementation:
+An earlier version of this document claimed that leaving the handlers permissive "keeps the kernel's own per-node lock bookkeeping authoritative, which is correct within a single node". That claim is false, and the table above is the evidence. Wiring the no-op handlers is what broke single-node `fcntl()` locking; before they existed, the kernel handled it correctly.
 
-- **GETLK** always returns F_UNLCK (no conflict). The response reports the requested range as free, regardless of actual lock state.
-- **SETLK** always succeeds, immediately granting the requested lock with no conflict detection.
-- **SETLKW** is not implemented; the kernel is not asked to block.
+The daemon logs this limitation at startup (`cmd/etcfuse-meta/main.go`) so that a workload depending on file locking gets some signal rather than silent, always-successful lock calls.
 
-Reporting no conflict is deliberate rather than merely convenient: the daemon does not track byte-range locks, so it could not honour a conflict it reported — SETLK would never be able to grant the lock afterwards and the caller would retry forever. Leaving both operations permissive keeps the kernel's own per-node lock bookkeeping authoritative, which is correct within a single node and unenforced across nodes.
+## Two Unrelated Lock Interfaces
 
-The `lock:<ino>` keys the read and write paths take are whole-inode leases scoped to one operation. They are not process-owned POSIX record locks and are not consulted by GETLK or SETLK.
+`fcntl()` record locks and `flock()` locks are separate kernel interfaces and reach a FUSE filesystem through separate operations.
 
-This simplification is sufficient for single-node workloads where lock contention is minimal. Multi-node lock correctness will be implemented in Phase 7.
+- **`fcntl()`** maps to the `getlk`/`setlk` operations. EtcFS wires both (`ops.getlk`, `ops.setlk` in `pkg/fuse/ops.c`), which is why they are broken as described above.
+- **`flock()`** maps to a distinct `flock` operation. EtcFS does **not** wire it, so the kernel handles `flock()` locally, per mount. It is correct within a single node and unenforced across nodes — which is the behavior the old document incorrectly attributed to `fcntl()` as well.
 
-### GETLK Payload
+## The Per-Operation Inode Lock
+
+The `lock:<ino>` keys that the read and write paths take (via `lockInode`, `internal/ipc/retry.go`) are unrelated to POSIX locks. They are lease-backed whole-inode locks scoped to a single FUSE operation and released when it returns. They are not process-owned, are not consulted by GETLK or SETLK, and do not survive across requests.
+
+This distinction matters for any future implementation — see below.
+
+## Wire Format
+
+GETLK payload:
 
 ```
 [u64:ino] [u64:start] [u64:len] [u32:type] [u32:pid]
 ```
 
-The `type` field is F_RDLCK (shared), F_WRLCK (exclusive), or F_UNLCK (query). The `start` and `len` define the byte range. `pid` identifies the owner for POSIX process-level lock semantics.
+`type` is `F_RDLCK`, `F_WRLCK`, or `F_UNLCK`. `start` and `len` define the byte range; `pid` identifies the owner.
 
-### GETLK Response (Phase 3)
+GETLK response — currently always reports `type = F_UNLCK`:
 
 ```
 [i32:error] [u64:start] [u64:len] [u32:type] [u32:pid]
 ```
 
-Always reports `type=F_UNLCK`, meaning the requested range is free.
-
-### SETLK Payload
+SETLK payload — as GETLK, plus a `sleep` flag marking `F_SETLKW`:
 
 ```
 [u64:ino] [u64:start] [u64:len] [u32:type] [u32:pid] [u32:sleep]
 ```
 
-Same format as GETLK plus a `sleep` flag marking SETLKW. The `type` field distinguishes acquire (F_RDLCK, F_WRLCK) from release (F_UNLCK).
-
-### SETLK Response (Phase 3)
+SETLK response — currently always `0`:
 
 ```
 [i32:error]
 ```
 
-Always 0 (success).
+## Building Cross-Node Locking
 
-## Full Lock Protocol (Planned)
+No cross-node lock protocol is planned or scheduled. If one is built, three constraints apply that are easy to miss.
 
-The complete lock protocol (Phases 7+) will implement proper conflict resolution:
+**A separate keyspace is required.** POSIX locks live for the lifetime of a process's lock, across many FUSE requests. `lock:<ino>` is taken and released *per operation* by every read and write. Reusing that key for POSIX locks means the next write's `AcquireLock` fails its `CreateRevision == 0` comparison, retries, and returns `EAGAIN` — making a locked file unwritable by its own lock holder. A distinct prefix (for example `plock:<ino>`) avoids this.
 
-### Lock Acquisition via etcd
+**Byte-range tracking has no natural etcd shape.** etcd keys are per-inode, so held ranges must be encoded as a list inside a single value and mutated by read-modify-CAS. Every lock operation on a hot inode then contends on one key, and the value grows with the number of held ranges. Whole-inode locking avoids this entirely and covers the common cases (lockfiles, advisory whole-file exclusion).
 
-```
-AcquireLock(ino, mode, ttl):
-1.  Grant an etcd lease with the given TTL.
-2.  Build a CAS transaction:
-      Comparison (exclusive): CreateRevision(lock:ino) == 0  (no lock exists)
-      Comparison (shared):    Value(lock:ino) != "exclusive" (no exclusive lock)
-      Success: Put(lock:ino, mode + holder + lease_id)
-      Failure: Revoke lease, return EAGAIN or EACCES.
-3.  If the transaction succeeds, start a keepalive goroutine.
-4.  Return the lease ID and keepalive channel.
-```
+**`F_SETLKW` requires asynchronous replies in the C daemon.** Blocking means retaining the `fuse_req_t`, returning without replying, and answering later from an etcd watch callback. Every handler in `pkg/fuse/ops.c` is synchronous request/reply today, so this is the largest piece of the work and it is on the C side, not in Go.
 
-### Blocking Wait (SETLKW)
-
-When a SETLKW (set lock, wait) request is made and the lock is already held in a conflicting mode, the EtcFS daemon watches the `lock:<ino>` key for changes:
-
-1. Attempt acquisition. If it fails with EAGAIN:
-2. Create an etcd watch on the lock key.
-3. Block the FUSE request (do not reply yet — save the `fuse_req_t`).
-4. When the watch fires (lock key deleted or modified), re-attempt acquisition.
-5. If acquisition succeeds, reply to the blocked FUSE request with success.
-6. If the watch times out or the context is cancelled, reply with EAGAIN.
-
-This avoids polling and provides near-instant lock handoff when the holder releases. The watch is established **after** the failed acquisition, avoiding the race where the lock is released between the check and the watch establishment.
-
-## Lock Types
-
-### F_RDLCK (Shared Read Lock)
-
-Multiple readers can hold F_RDLCK on the same byte range simultaneously. The etcd `lock:<ino>` key records a shared lock with a list of holders. The CAS transaction for acquiring a shared lock checks that no exclusive lock exists; it permits coexistence with other shared locks.
-
-### F_WRLCK (Exclusive Write Lock)
-
-A single writer holds F_WRLCK. No other lock (shared or exclusive) can coexist on the same byte range. The CAS transaction check is `CreateRevision(lock:ino) == 0` — the key must not exist at all.
-
-### F_UNLCK (Release)
-
-Releasing a lock (setting type to F_UNLCK) revokes the etcd lease backing the lock. The lock key is deleted. Any watchers on the key receive a DELETE event and can proceed with their own acquisition attempt.
-
-### Byte Range Overlap Detection
-
-The lock protocol must detect overlapping byte ranges within a single inode. For example, if process A holds F_WRLCK on bytes 0–100, process B should be able to acquire F_WRLCK on bytes 200–300. The etcd key model (`lock:<ino>`) is per-inode, not per-range, so range tracking must be encoded in the lock value.
-
-The planned approach is a single etcd key per inode whose value encodes a sorted-list representation of held ranges and their modes. The CAS transaction reads this list, checks for overlap with the requested range, and writes back the updated list. The full implementation is deferred to Phase 7.
-
-## Lock Lifecycle
-
-### Normal Release
-
-1. The application calls `close(fd)` or `fcntl(fd, F_SETLK, lock_type=F_UNLCK)`.
-2. The FUSE daemon's RELEASE or SETLK handler calls `ReleaseLock(ino, lease_id)`.
-3. `RevokeLease` deletes the lock key immediately.
-4. Any blocked SETLKW on another node wakes up and acquires the lock.
-
-### Crash Release
-
-1. The node holding the lock crashes.
-2. The keepalive stream on the lock's etcd lease stops.
-3. After the lease TTL (default 5 seconds), etcd deletes the lock key.
-4. The fencing controller bumps the fencing generation.
-5. Other nodes watching the lock key receive a DELETE event.
-6. They attempt re-acquisition with a generation check.
-
-### Lease Expiry on Partition
-
-1. The node is partitioned from etcd but still writing to the block device.
-2. The keepalive stream breaks; within 2× TTL margin, the lease expires.
-3. The etcd cluster deletes the lock key.
-4. The self-fencing watchdog fires: the node closes the block device FD.
-5. The fencing controller bumps the generation after confirming the block device detach.
-
-This is the critical race: the lock is gone (step 3) before the node has definitely stopped writing (step 4 and 5). This is why the fencing generation guard exists — any ongoing write's metadata commit will fail because its generation guard no longer matches the bumped generation.
+The cheapest correct change is not additive: removing `ops.getlk`/`ops.setlk` and their handlers restores the kernel's local `fcntl()` enforcement, giving `fcntl()` the same node-local-correct behavior `flock()` already has.
 
 ## Fencing Integration
 
-The lock subsystem integrates with the fencing generation protocol at two points:
+Whatever the lock layer does, it is not what protects data during a fence. Every metadata mutation carries this node's fencing generation as a transaction guard (`metadata.Store.SetGuard`, installed by `Service.InstallStoreGuard`), so a fenced node's commits are rejected regardless of which locks it believes it holds.
 
-### Lock Grant
-
-When granting a lock that was previously held by a node that is now believed dead, the grant transaction must include a comparison on the fencing generation. The holder's generation must have been bumped since the old holder's last known generation. Without this check, the old holder could still have the lock key (if the lease hasn't expired yet) and still be writing.
-
-The generation check is `WithGenerationGuard(new_holder, bump_expected_gen)`. This is not yet implemented in Phase 3; it will be added in Phase 5 when the fencing subsystem is complete.
-
-### Extent Write Guard
-
-Every extent write that commits metadata to etcd (via `AppendExtent`) includes a generation guard in its transaction. If the writer's generation has been bumped (it was fenced), the transaction fails and the extent is rejected. This ensures that even if the lock protocol erroneously releases a lock to a second node while the first node is still writing, the first node's writes cannot corrupt the metadata.
-
-The generation stamp is also stored in the extent record itself, allowing the scrubber to detect and report any extents with stale generations.
+This is why a lock protocol is a correctness feature for *applications*, not a safety mechanism for the filesystem: a stale lock cannot cause metadata corruption, because the generation guard rejects the commit behind it. See `docs/architecture/storage/kleppmann-stale-write-analysis.md`.

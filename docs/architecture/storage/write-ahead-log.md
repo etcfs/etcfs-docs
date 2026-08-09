@@ -145,7 +145,7 @@ truncate_before(wal, timestamp_ns):
   update entry_count header
 ```
 
-In the current implementation (Phase 6), truncation is a stub that does nothing. The WAL is small enough (entries are 49 bytes each; at 1000 writes/second and a 100ms window, the WAL has ~100 uncommitted entries = 4.9 KiB) that truncation is not yet necessary. Full truncation will be implemented when the WAL is proven to grow under sustained write load.
+In the current implementation, truncation is a stub that does nothing. The WAL is small enough (entries are 49 bytes each; at 1000 writes/second and a 100ms window, the WAL has ~100 uncommitted entries = 4.9 KiB) that truncation is not yet necessary. Full truncation will be implemented when the WAL is proven to grow under sustained write load.
 
 ## Interaction with Arena Free-List
 
@@ -165,12 +165,12 @@ The generation check during WAL replay is the final layer of protection against 
 
 ## Limitations
 
-The WAL implementation in Phase 6 has these limitations that will be addressed in later phases:
+The current WAL implementation has these limitations that will be addressed in future work:
 
-| Limitation | Impact | Resolution (Phase) |
+| Limitation | Impact | Resolution |
 |---|---|---|
-| No truncation | WAL grows unboundedly for long-running nodes | Truncation in Phase 10 |
-| No checksum | Silent corruption of WAL entries is not detected | CRC32 per entry in Phase 11 |
-| No index | Full-file scan on every restart | Entry index in Phase 11 |
-| Single-file | No WAL rotation or compaction | Multi-file WAL in Phase 10 |
+| No truncation | WAL grows unboundedly for long-running nodes | Truncation (not yet implemented) |
+| No checksum | Silent corruption of WAL entries is not detected | CRC32 per entry (not yet implemented) |
+| No index | Full-file scan on every restart | Entry index (not yet implemented) |
+| Single-file | No WAL rotation or compaction | Multi-file WAL (not yet implemented) |
 | No recovery of committed entries | Blocks from committed entries are never freed by WAL replay (they are freed by the truncate/delete path via the arena allocator) | By design |

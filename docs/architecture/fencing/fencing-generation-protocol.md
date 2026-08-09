@@ -185,7 +185,7 @@ The generation check prevents a partially-fenced node from claiming to still own
 
 ## Integration with the Scrubber
 
-The scrubber (Phase 8) reads each extent's generation stamp and compares it against the inode's current generation. If the extent stamp is less than the generation, the extent was written before a fence and may be stale.
+The scrubber reads each extent's generation stamp and compares it against the inode's current generation. If the extent stamp is less than the generation, the extent was written before a fence and may be stale.
 
 The scrubber reports `GENERATION_MISMATCH` findings, listing each extent with its stale stamp and the expected current generation. These findings are for human review — the scrubber does not automatically delete or reclaim generation-stale extents, because the data may still be valid (the node that wrote it may not have been the node that was fenced).
 

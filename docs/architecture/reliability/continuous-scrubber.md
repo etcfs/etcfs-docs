@@ -157,13 +157,13 @@ t8: Sleep until next interval
 
 The checks are sequential and read-only. They use `GetPrefix` for bulk scans, which is efficient for etcd's B-tree index. The scan results are snapshots at a point-in-time — concurrent mutations during the pass may cause transient inconsistencies that are detected and reported. Most such transient anomalies are benign (e.g., an inode created between the extent scan and the inode scan), and the next pass will not report them.
 
-The scrubber stores all anomalies in an in-memory slice. Anomalies persist across passes until the scrubber is restarted or the anomalies are cleared by a separate call (planned for Phase 11). The `Anomalies()` method returns a copy of the current anomaly list for external querying.
+The scrubber stores all anomalies in an in-memory slice. Anomalies persist across passes until the scrubber is restarted or the anomalies are cleared by a separate call (planned). The `Anomalies()` method returns a copy of the current anomaly list for external querying.
 
 ## Rate Limiting
 
-The scrubber operates at `rateLimit = 0.1` by default, meaning it limits its etcd read load to 10% of what the normal foreground I/O consumes. The rate limiting in Phase 8 is implicit — the scrubber interval controls the pass frequency, and each pass is a burst of reads.
+The scrubber operates at `rateLimit = 0.1` by default, meaning it limits its etcd read load to 10% of what the normal foreground I/O consumes. The current rate limiting is implicit — the scrubber interval controls the pass frequency, and each pass is a burst of reads.
 
-A more granular rate limiter (planned for Phase 10) would:
+A more granular rate limiter (planned) would:
 - Track the number of etcd read operations per second.
 - Compare against a moving average of foreground op/s.
 - Throttle the scrubber's scan speed to stay within the configured fraction.
@@ -208,7 +208,7 @@ When the scrubber finds anomalies, it:
 2. Increments the `etcfuse_scrub_anomalies_total` Prometheus counter with a `type` label (collision, orphan, range, generation, nlink).
 3. Stores the anomaly in the in-memory list for Prometheus gauge queries.
 
-In the production deployment (Phase 11), a Prometheus alert rule fires on `etcfuse_scrub_anomalies_total > 0` for non-orphan types:
+In the production deployment, a Prometheus alert rule fires on `etcfuse_scrub_anomalies_total > 0` for non-orphan types:
 ```
 alert: ScrubAnomalyDetected
 expr: rate(etcfuse_scrub_anomalies_total[5m]) > 0

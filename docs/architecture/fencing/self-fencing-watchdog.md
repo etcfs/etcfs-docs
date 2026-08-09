@@ -91,7 +91,7 @@ trigger():
   os.Exit(77)
 ```
 
-Exit code 77 is a convention distinguishing self-fenced exits from crashes or normal shutdowns. The systemd unit (Phase 11) can use this exit code to trigger a specific restart policy.
+Exit code 77 is a convention distinguishing self-fenced exits from crashes or normal shutdowns. The systemd unit can use this exit code to trigger a specific restart policy.
 
 ## Trigger Sequence
 

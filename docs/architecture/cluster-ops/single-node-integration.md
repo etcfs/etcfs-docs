@@ -178,7 +178,7 @@ If the block device was in use and the WAL file exists, it is replayed to reconc
 
 ### 6. File System Check
 
-No automatic fsck is run on startup. The scrubber (Phase 8) runs continuously in the background and detects any inconsistencies that may have been introduced by the crash. The `fsck` tool can be run manually for a comprehensive offline check.
+No automatic fsck is run on startup. The scrubber runs continuously in the background and detects any inconsistencies that may have been introduced by the crash. The `fsck` tool can be run manually for a comprehensive offline check.
 
 ## State Reconstruction
 
@@ -200,7 +200,7 @@ The key insight is that the etcd cluster holds all durable metadata except the b
 
 ## Write Path Walkthrough
 
-A full write operation from application to disk (as implemented in Phases 3 + 7):
+A full write operation from application to disk:
 
 ```
 Application:
@@ -229,8 +229,8 @@ Data Write:
   → FUSE handler (ec_write)
     → IPC: op WRITE, ino=42, offset=0, data_len=4096, [data bytes]
     → Go: GetInode(42) → current size=0
-    → Phase 3: size=4096, Put(inode:42, update_size)
-    → Phase 6+: reserve arena block, WAL append, pwrite+fsync, etcd commit, mark committed
+    → metadata update: size=4096, Put(inode:42, update_size)
+    → data path: reserve arena block, WAL append, pwrite+fsync, etcd commit, mark committed
     → Go: return write response with written=4096
     → C: fuse_reply_write(req, 4096)
     → kernel: write acknowledged

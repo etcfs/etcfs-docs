@@ -152,7 +152,7 @@ The fsync (step 2) guarantees that the data is durable on the block device befor
 
 ## io_uring (Planned)
 
-The synchronous `pread`/`pwrite` interface is a Phase 5–6 initial implementation. Phase 7 will replace it with io_uring for:
+The current implementation uses a synchronous `pread`/`pwrite` interface. A planned io_uring integration will replace it for:
 
 - **Batch submission.** Multiple I/O requests can be submitted in a single system call, reducing context-switch overhead.
 - **Asynchronous completion.** The FUSE daemon does not need to block a thread for each I/O operation. io_uring completions can be processed on a dedicated completion thread.
@@ -169,7 +169,7 @@ io_uring* etcfs_block_io_submit(dev, operations[], count, completion_callback)
 int etcfs_block_io_wait(uring, timeout)
 ```
 
-The io_uring integration is deferred to Phase 7 because it requires changes to the daemon's I/O model (the current synchronous IPC model would need to be extended to support asynchronous I/O completion).
+The io_uring integration is deferred because it requires changes to the daemon's I/O model (the current synchronous IPC model would need to be extended to support asynchronous I/O completion).
 
 ## Interaction with the Arena Allocator
 

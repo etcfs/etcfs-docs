@@ -115,7 +115,7 @@ On every tick (`Tick()`), the mock decrements each lease's TTL. When a lease's T
 2. A DELETE watch event is delivered for each deleted key.
 3. The lease is removed from the lease map.
 
-Key binding is implicit: keys are bound to leases only through the `WithLease` option on `clientv3.OpPut`. The mock does not currently implement `WithLease` for key binding; lease simulation is used for its side effects (deleting all keys on expiry) rather than for per-key lease association. The full lease-to-key binding will be added when Phase 5 (fencing) tests require it.
+Key binding is implicit: keys are bound to leases only through the `WithLease` option on `clientv3.OpPut`. The mock does not currently implement `WithLease` for key binding; lease simulation is used for its side effects (deleting all keys on expiry) rather than for per-key lease association. The full lease-to-key binding will be added when fencing tests require it.
 
 ### Lease Revocation
 
@@ -155,7 +155,7 @@ The MockStore uses a single `sync.Mutex` for all operations. Every public method
 
 The mutex is not re-entrant. Transaction operations (Txn) hold the mutex for the entire comparison-and-application cycle, which is atomic from the caller's perspective. Background goroutines (keepalive streams) access the lease map under the mutex.
 
-For the harness workload (sequential operations in the simulator), contention on the mutex is negligible. For concurrent multi-node tests (Phase 9), the mutex serialises all store access, which is semantically correct — real etcd also serialises transactions through Raft.
+For the harness workload (sequential operations in the simulator), contention on the mutex is negligible. For concurrent multi-node tests, the mutex serialises all store access, which is semantically correct — real etcd also serialises transactions through Raft.
 
 ## Limitations
 
@@ -173,4 +173,4 @@ The MockStore intentionally diverges from real etcd in several ways:
 | Lease -> key binding | Not tracked | Full tracking via `WithLease` |
 | Auth / TLS | Not implemented | Full support |
 
-These limitations are acceptable because the MockStore exists to test metadata-layer logic (correctness of CAS operations, nlink consistency, invariant compliance), not Raft or replication correctness. A real etcd cluster in integration tests (Phase 7+) provides the final validation.
+These limitations are acceptable because the MockStore exists to test metadata-layer logic (correctness of CAS operations, nlink consistency, invariant compliance), not Raft or replication correctness. A real etcd cluster in integration tests provides the final validation.

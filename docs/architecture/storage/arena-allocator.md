@@ -165,7 +165,7 @@ Allocate(size):
   return no_contiguous_space_error
 ```
 
-The allocator scans arenas in order and returns the first suitable contiguous range. There is no fragmentation avoidance (no defragmentation across allocations). Fragmentation is handled at compaction time (Phase 10) by copying live extents to a new arena.
+The allocator scans arenas in order and returns the first suitable contiguous range. There is no fragmentation avoidance (no defragmentation across allocations). Fragmentation is handled at compaction time by copying live extents to a new arena.
 
 ### Allocation Size
 

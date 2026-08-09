@@ -65,7 +65,7 @@ for every dirent key (dirent:<parent>/<name> → <ino>):
 
 - **Inode deleted while dirent still references it.** If `unlinkFile` decrements nlink to zero and deletes the inode, but forgets to delete the last dirent, the checker catches it.
 - **Inode never created.** If a dirent is created without a matching inode (e.g., the inode creation CAS failed but the dirent was written anyway), the checker catches it.
-- **Inode deleted by a concurrent operation.** In a multi-simulator scenario (Phase 9), one node could delete an inode while another node holds a dirent pointing to it. The checker detects this cross-node inconsistency.
+- **Inode deleted by a concurrent operation.** In a multi-simulator scenario, one node could delete an inode while another node holds a dirent pointing to it. The checker detects this cross-node inconsistency.
 
 ### Limitations
 

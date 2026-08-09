@@ -124,7 +124,7 @@ The protocol defines 26 operation codes covering the full FUSE low-level API:
 | 23 | WRITE | `fuse_reply_write` |
 | 24 | FSYNC | `fuse_reply_err` |
 
-The read-only operations (1–4, 13–17) form the Phase 2 surface. Write operations (5–12, 22–24) are implemented in Phase 3. Block-device operations (18–19) are wired up in Phase 6.
+The read-only operations (1–4, 13–17) form the read-only surface. Write operations (5–12, 22–24) are implemented. Block-device operations (18–19) are wired up.
 
 ### Payload Formats
 

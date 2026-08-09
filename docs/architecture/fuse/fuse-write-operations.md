@@ -38,7 +38,7 @@ All namespace mutations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK, MK
 | OPEN | 13 | `fuse_reply_open` | None (acknowledge) | No |
 | RELEASE | 14 | `fuse_reply_err` | None (acknowledge) | No |
 | FLUSH | 26 | `fuse_reply_err` | None (acknowledge) | No |
-| FSYNC | 24 | `fuse_reply_err` | None (acknowledge in Phase 3) | Eventually (Phase 6) |
+| FSYNC | 24 | `fuse_reply_err` | None (acknowledge) | Eventually |
 
 ## File Creation (CREATE)
 
@@ -128,7 +128,7 @@ The IPC payload carries the old parent, old name, new parent, new name, and a fl
 [u64:new_parent] [u32:new_name_len] [new_name_bytes...] [u32:flags]
 ```
 
-The flags field supports `RENAME_NOREPLACE` (do not overwrite an existing target) and `RENAME_EXCHANGE` (atomically exchange the source and target names) — though Phase 3 only implements the basic rename.
+The flags field supports `RENAME_NOREPLACE` (do not overwrite an existing target) and `RENAME_EXCHANGE` (atomically exchange the source and target names) — though only the basic rename is currently implemented.
 
 ## Data Write (WRITE)
 
@@ -201,9 +201,9 @@ Truncation (size change) follows the **metadata-then-data** ordering invariant:
 
 Metadata-then-data ordering ensures the inode size shrinks before the freed blocks are returned to the arena free-list. If the node crashes between steps 2 and 3, the blocks are still allocated (not reusable) but the inode still has the old size — the blocks are wasted but no reader can access them because the extent was removed.
 
-### Phase 3 Implementation
+### Current SETATTR Behavior
 
-Phase 3 implements a simplified SETATTR that reads the current inode and returns its attributes without applying any modifications. The full attribute update, including generation-guarded CAS, will be added in Phase 7.
+SETATTR is currently a simplified implementation that reads the current inode and returns its attributes without applying any modifications. The full attribute update, including generation-guarded CAS, is planned.
 
 ## Symbolic Links (SYMLINK)
 
@@ -259,7 +259,7 @@ MKNOD is rarely used on modern Linux systems (udev manages device nodes) but is 
 
 ### OPEN
 
-OPEN is called when a file is opened with `open()`, `creat()`, or `openat()`. In Phase 3, OPEN is a no-op that acknowledges the open. The file handle (`fh`) is set to zero, and the `direct_io` flag is set to 1 — bypassing the kernel's page cache for file data, consistent with the eventual O_DIRECT block I/O model.
+OPEN is called when a file is opened with `open()`, `creat()`, or `openat()`. Currently, OPEN is a no-op that acknowledges the open. The file handle (`fh`) is set to zero, and the `direct_io` flag is set to 1 — bypassing the kernel's page cache for file data, consistent with the eventual O_DIRECT block I/O model.
 
 ### RELEASE
 

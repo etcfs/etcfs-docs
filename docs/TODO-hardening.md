@@ -25,17 +25,23 @@ leaks, arena fragmentation drift, etcd DB growth).
       violation.
 - [ ] Docker first; AWS only once the sampling harness is proven.
 
-## 4. POSIX fcntl/flock locks are unenforced across nodes
+## 4. fcntl() locks are broken on the same node, not just across nodes
 
-`internal/ipc/handlers.go`'s `handleGetlk`/`handleSetlk` are no-ops — always
-report free / always succeed. Documented as deliberate "Phase 3" scope in
-`docs/architecture/metadata/posix-lock-operations.md` § Full Lock Protocol
-(Planned), but a workload relying on cross-node `flock` gets no signal today.
+`handleGetlk`/`handleSetlk` are no-ops (always free / always granted). Because
+the FUSE filesystem implements `getlk`/`setlk`, the kernel defers to the daemon
+instead of doing its own bookkeeping — so `fcntl()` locks exclude nothing, even
+between two processes on one node. Measured, deterministic: two processes both
+take `F_WRLCK` on the same file. `flock()` is unaffected (never wired, kernel
+handles it locally). Details and evidence in
+`docs/architecture/metadata/posix-lock-operations.md`.
 
-- [ ] Decide whether Phase 7 (real byte-range lock tracking) is still the
-      direction, given the fencing-guard work now touches adjacent code.
-- [ ] At minimum, log the limitation at startup instead of leaving it a doc
-      footnote.
+- [x] Log the limitation at startup rather than leaving it a doc footnote.
+- [ ] Delete `ops.getlk`/`ops.setlk` and both handlers, restoring the kernel's
+      local `fcntl()` enforcement. Negative diff, and it makes `fcntl()` match
+      the node-local-correct behavior `flock()` already has.
+- [ ] Only then decide whether cross-node locking is worth building at all.
+      Nothing depends on it today; the generation guard, not the lock layer, is
+      what protects metadata during a fence.
 
 ## 7. FUSE handlers run with an unbounded context — bound added, tuning open
 
@@ -46,12 +52,15 @@ stream was tied to the same context, which would have silently expired
 locks at the request deadline — now uses `context.Background()` explicitly.
 Regression: `TestIntegration_LockSurvivesAcquisitionContextCancel`.
 
-- [ ] Single blanket 10s timeout for all operation classes — deliberate, but
-      unvalidated against real traffic. Revisit if a specific class proves it
-      wrong.
-- [ ] Chaos assertion that a partitioned node's FUSE op returns within a
-      bound *without* relying on self-fencing killing the daemon (current FJ2
-      probe only passes because the daemon dies first).
+- [x] Chaos assertion that a partitioned node's FUSE op returns within a bound
+      *without* relying on self-fencing killing the daemon. FJ5 in
+      `chaos-elastic-fault-injection.sh` joins node4 with a 120s lease TTL
+      (`CHAOS_LEASE_TTL`), pushing the self-fence window past the probe, and
+      asserts the daemon is alive both before and after.
+- [x] Single blanket 10s timeout validated against a real partition (AWS, FJ5):
+      write 11s, getattr 1s, readdir 1s. The write bound *is* `requestTimeout`
+      firing, not the retry budget — splitting per operation class would only
+      tighten the classes already returning in 1s, so one value stays correct.
 
 ## 8. Should `RebalanceArena` be wired to a production caller at all?
 
@@ -67,8 +76,10 @@ production caller — only the harness uses them.
 
 ## Order
 
-1. Item 7 tuning — ready, zero dependencies.
-2. Item 1 — independent, low value, do whenever.
-3. Item 8 — decision item, likely "no".
-4. Item 2 — resolved as a side effect of item 7 (renumber once item 1 lands).
-5. Item 3, 4
+1. The `fcntl()` locks fix (deleting `ops.getlk`/`ops.setlk`) — smallest diff
+   here, and it fixes a live correctness bug rather than a coverage gap.
+2. `MockStore` concurrent-allocation coverage — independent, low value, do
+   whenever.
+3. The `RebalanceArena` production-wiring decision — decision item, likely "no".
+4. The multi-hour fuzz run — needs a sampling harness before it is worth
+   starting.

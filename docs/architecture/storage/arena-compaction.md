@@ -64,9 +64,9 @@ In the current implementation, `NeedsCompaction` is an explicit API call. The pr
 
 ## Compaction Protocol
 
-The full compaction protocol for a single arena consists of four phases:
+The full compaction protocol for a single arena consists of four steps:
 
-### Phase 1: Scan Extents
+### Step 1: Scan Extents
 
 Scan all `extent:*` keys in etcd. For each extent whose `disk_off` falls within the source arena's range:
 
@@ -77,7 +77,7 @@ Scan all `extent:*` keys in etcd. For each extent whose `disk_off` falls within 
 
 At the end of this phase, the remapping list contains every live extent in the source arena. The list size equals the arena's live extent count.
 
-### Phase 2: Compute New Offsets
+### Step 2: Compute New Offsets
 
 For each extent being moved, compute the new disk offset in the destination arena:
 
@@ -87,7 +87,7 @@ new_disk_off = dst_arena_start + (disk_off - src_arena_start)
 
 This preserves the relative offset within the arena. If an extent was at offset 4 MiB in the source arena (4 MiB from the arena start), it is placed at 4 MiB from the destination arena start. This is a simplification — a full implementation would allocate from the free bitmap to avoid fragmentation.
 
-### Phase 3: Batch Update Extent Keys
+### Step 3: Batch Update Extent Keys
 
 The extent keys are updated in batches. Each batch is a single etcd transaction containing up to 128 `OpPut` operations. Each `OpPut` updates the extent key's value with the new `disk_off`, keeping the `logical_off`, `length`, and `generation` unchanged.
 
@@ -95,7 +95,7 @@ Batching is essential because a single arena may contain thousands of live exten
 
 The batch size of 128 is chosen to stay well within etcd's recommended per-transaction operation limit (128 ops is the default max-txn-ops in etcd). Each batch is committed atomically — either all 128 extent keys are updated, or none are.
 
-### Phase 4: Release Source Arena, Acquire Destination Arena
+### Step 4: Release Source Arena, Acquire Destination Arena
 
 After all extent keys have been updated:
 

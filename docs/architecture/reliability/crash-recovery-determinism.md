@@ -12,9 +12,9 @@ The crash simulation protocol, store-replay reconstruction, and seed-based deter
 
 ## Crash-Recovery Protocol
 
-The crash simulation in the harness follows a four-phase protocol that mirrors what the real daemon does on restart after an unclean shutdown.
+The crash simulation in the harness follows a four-step protocol that mirrors what the real daemon does on restart after an unclean shutdown.
 
-### Phase 1: Total State Loss
+### Step 1: Total State Loss
 
 When `simulateCrash` is called, all simulator-local caches are cleared:
 
@@ -26,7 +26,7 @@ When `simulateCrash` is called, all simulator-local caches are cleared:
 
 This represents the real system's loss of all in-memory state when the daemon process terminates.
 
-### Phase 2: Full Store Scan
+### Step 2: Full Store Scan
 
 After clearing the caches, the simulator re-reads all metadata from the MockStore by scanning the key space:
 
@@ -35,13 +35,13 @@ After clearing the caches, the simulator re-reads all metadata from the MockStor
 
 This scan reads the complete namespace — every inode and every directory entry. For a production filesystem with millions of files, this scan would be replaced by a more targeted reconciliation (reading from the etcd revision snapshot). In the harness, a full scan is acceptable because the data volume is small (hundreds to thousands of keys).
 
-### Phase 3: Consistency Check
+### Step 3: Consistency Check
 
 After rebuilding the caches, the invariant checkers run automatically. Any inconsistency in the stored data — orphaned inodes without dirents, dirents pointing to missing inodes, nlink mismatches — is detected and reported.
 
 If the crash occurred during an atomic operation (simulated by the MockStore's single-mutex model), the state is consistent because the operation either completed fully or never started. The MockStore does not support partial application of multi-key transactions in the sense that a real etcd cluster might — the mutex ensures that a transaction's operations are all applied or none are applied.
 
-### Phase 4: Resume
+### Step 4: Resume
 
 After the crash recovery completes, the simulator is ready for further operations. The `inoCounter` starts from the maximum inode number found in the scanned records, plus one. New operations build on the recovered state without knowing that a crash occurred.
 
@@ -99,7 +99,7 @@ The simulator does **not** model:
 
 - **Lease expiry races.** Lease TTLs are decremented deterministically per tick, but the exact tick at which a lease expires depends on when `Tick()` is called relative to operations. Since Tick is called in a deterministic loop, lease expiry is deterministic for a given operation count: `ops` × `ticksPerOp`.
 
-- **Goroutine scheduling.** Used only in multi-node tests (Phase 9) for concurrent operations. The MockStore's mutex serialises all store access, but the interleaving of goroutines (which goroutine runs which operation in which order) is non-deterministic at the Go runtime level. Multi-node tests use higher-level invariants (total file count, no duplicate inodes) rather than exact-sequence checks.
+- **Goroutine scheduling.** Used only in multi-node tests for concurrent operations. The MockStore's mutex serialises all store access, but the interleaving of goroutines (which goroutine runs which operation in which order) is non-deterministic at the Go runtime level. Multi-node tests use higher-level invariants (total file count, no duplicate inodes) rather than exact-sequence checks.
 
 ## Seed Management
 
@@ -111,7 +111,7 @@ Seeds are passed as `int64` values to `NewSimulator(seed)`. The harness uses two
 
 ## Multi-Node Crash Scenarios
 
-The multi-node cluster simulator (Phase 9) extends crash recovery with additional complexity:
+The multi-node cluster simulator extends crash recovery with additional complexity:
 
 ### Shared Store
 
