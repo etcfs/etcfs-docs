@@ -121,7 +121,9 @@ production-code half.
 ## Order
 
 1. Item 7 tuning — ready, zero dependencies.
-2. ~~Item 9~~, ~~Item 5~~, ~~Item 6~~ — done 2026-08-06.
-3. Item 1 — independent, low value, do whenever.
-4. Item 8 — decision item, likely "no".
-5. Item 2 — resolved as a side effect of item 7 (renumber once item 1 lands).
+2. ~~Item 9~~, ~~Item 5~~,
+3. Item 6, 10
+4. Item 1 — independent, low value, do whenever.
+5. Item 8 — decision item, likely "no".
+6. Item 2 — resolved as a side effect of item 7 (renumber once item 1 lands).
+7. Item 3, 4
