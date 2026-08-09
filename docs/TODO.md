@@ -9,36 +9,7 @@ correctness problem on the default configuration.
 
 # BLOCKING — silent data loss or corruption
 
-## 1. Overwriting a byte range returns the old or the new bytes, nondeterministically
-
-Every write appends a fresh extent under `NextExtentChunk` (max chunk + 1,
-`pkg/metadata/extent.go:156`). Nothing detects that the new extent covers a
-logical range an existing extent already covers, so writing twice at the same
-offset leaves two extents with the same `LogOff`.
-
-`DecodeExtents` orders them with `sort.Slice` (`extent.go:125`), which is not
-stable, so the relative order of two extents sharing a `LogOff` is
-unspecified. `handleRead` (`internal/ipc/datapath.go:264`) walks the list, uses
-the first extent that covers the offset, and advances past it — the second one
-is never consulted. The read therefore returns whichever of the two the sort
-happened to place first.
-
-The superseded extent is also never freed, so every overwrite leaks its blocks
-until the scrubber's orphan pass reclaims them — which it will not, because the
-inode still exists.
-
-No test covers a second write to the same offset; the whole overwrite path is
-unexercised.
-
-- [ ] Resolve overlap at commit: replace or split the covered extents in the
-      same transaction that writes the new one, and free the blocks the
-      replaced extents held.
-- [ ] Make `DecodeExtents` deterministic regardless (`sort.SliceStable`, or a
-      tiebreak on chunk number), so a partial fix cannot still read stale bytes.
-- [ ] Regression test: write, overwrite, read back; and overwrite a range that
-      partially covers an existing extent from both ends.
-
-## 2. `rename` over an existing file orphans the target's inode
+## 1. `rename` over an existing file orphans the target's inode
 
 `AtomicRename` (`pkg/metadata/dirent.go:269`) deletes the source dirent and
 puts the target dirent in one transaction. When the target name already exists
@@ -64,7 +35,7 @@ Related gaps in the same function:
 - [ ] Reject a directory rename whose destination is under its own source, and
       a non-empty directory target.
 
-## 3. `CreateInode` gives every inode it creates `nlink = 0`
+## 2. `CreateInode` gives every inode it creates `nlink = 0`
 
 `Nlink: (mode >> 12) & 1` (`pkg/metadata/inode.go:29`), commented "1 for
 directories". It does not do that. `S_IFDIR` is 0o040000, so `mode >> 12` is 4
@@ -84,7 +55,7 @@ those set `Nlink` explicitly.
       for the atomicity item below anyway).
 - [ ] Assert nlink in a test for each of symlink, mknod, and hardlink.
 
-## 4. Shared locks never share
+## 3. Shared locks never share
 
 `GetLockInfo` (`pkg/metadata/lock.go:143`) parses the lock value with
 `fmt.Sscanf(value, '{"mode":"%s"}', &rec.Mode)`. `%s` in `Sscanf` consumes a
@@ -115,7 +86,7 @@ it for every other holder.
 - [ ] Test: two concurrent shared acquisitions both succeed; a shared and an
       exclusive conflict.
 
-## 5. `nlink` increment and decrement can lose updates
+## 4. `nlink` increment and decrement can lose updates
 
 `putInodeWithCAS` (`pkg/metadata/inode.go:150`) is not a CAS. Its only
 comparison is `CreateRevision(key) > 0` — "the inode exists". `IncrementNlink`
@@ -133,7 +104,7 @@ inode is never deleted.
 
 # SHOULD FIX — correctness gaps
 
-## 6. `chmod`, `chown`, `utimens` and growing truncate silently do nothing
+## 5. `chmod`, `chown`, `utimens` and growing truncate silently do nothing
 
 `ec_setattr` (`pkg/fuse/ops.c:680`) sends only `ino`, `fh`, `to_set` and
 `st_size`; the rest of `struct stat` is discarded with `(void) attr;`. The Go
@@ -152,7 +123,7 @@ Applications that check the result of a `chmod` see the old mode.
 - [ ] Define the remaining `FATTR_*` constants rather than the lone
       `fattrSize = 1 << 3` (`handlers.go:335`).
 
-## 7. Every file is owned by uid 1000
+## 6. Every file is owned by uid 1000
 
 `AtomicCreateFile`, `AtomicCreateDir` and `CreateInode` are all called with
 literal `1000, 1000` (`handlers.go:221`, `:247`, `:383`, `:449`). The caller's
@@ -170,7 +141,7 @@ bits are stored but never enforced.
       not, say so in the mount documentation — `default_permissions` at mount
       time gets kernel-side enforcement for the cost of one mount option.
 
-## 8. `symlink`, `link` and `mknod` are not atomic
+## 7. `symlink`, `link` and `mknod` are not atomic
 
 `AtomicCreateFile` puts the dirent and the inode in one transaction. The other
 three creation paths do not:
@@ -192,7 +163,7 @@ extents without inodes, not inodes without dirents.
       does.
 - [ ] Add an "inode with no dirent" check to the scrubber and to `fsck`.
 
-## 9. `rmdir`'s empty-directory check is a separate round trip
+## 8. `rmdir`'s empty-directory check is a separate round trip
 
 `handleRmdir` (`handlers.go:274`) does `LookupDirent`, `GetInode`,
 `ListDirents`, and only then `AtomicUnlink`. Another node can create an entry
@@ -207,7 +178,7 @@ with the child count folded into the inode record.
 
 - [ ] Pick one and make `rmdir` a single transaction.
 
-## 10. A malformed IPC frame takes down the whole metadata daemon
+## 9. A malformed IPC frame takes down the whole metadata daemon
 
 Every handler reads a length from the payload and slices with it unchecked:
 `name := string(rest[:nameLen])` (`handlers.go:36`, and the same pattern at
@@ -235,7 +206,7 @@ desync — and a desync of exactly this kind has happened before, in the
       side's `ipc_sync` and `do_ipc_exchange`, which `malloc` the response
       length just as blindly.
 
-## 11. A membership deletion missed during a watch reconnect is never fenced
+## 10. A membership deletion missed during a watch reconnect is never fenced
 
 `Controller.Run` (`pkg/fencing/controller.go:96`) re-establishes the watch on
 channel close without a revision, so events between the close and the new watch
@@ -249,7 +220,7 @@ anything.
       nodes against live membership keys, so a node that lost its lease gets
       fenced whether or not its event was seen.
 
-## 12. Dead and broken metadata APIs
+## 11. Dead and broken metadata APIs
 
 `UpdateInode` (`inode.go:72`) compares `ModRevision(key) = 0` with the comment
 "placeholder; caller provides correct rev" — no revision is passed, and
@@ -273,7 +244,7 @@ Two of those are also wrong:
 - [ ] If pagination is wanted later (see the readdir item), write it against
       `WithPrefix` + `WithLimit` rather than fixing this one.
 
-## 13. The generation scrub check flags every healthy node after any fence
+## 12. The generation scrub check flags every healthy node after any fence
 
 `CheckGenerationConsistency` (`pkg/scrub/scrubber.go:262`) takes the maximum
 generation across all nodes and reports every extent stamped below it. Because
@@ -290,7 +261,7 @@ the stamp against.
       — it currently feeds an unbounded anomaly list (below) and would fire the
       `etcfuse_scrub_anomalies_total` alert continuously after the first fence.
 
-## 14. Nothing ties allocation to the actual size of the device
+## 13. Nothing ties allocation to the actual size of the device
 
 `AcquireArena` takes the next counter value and uses `arenaID * ArenaSizeBytes`
 as the offset (`pkg/arena/allocator.go:66`). Nothing compares that against
@@ -312,7 +283,7 @@ write.
       instead of two hardcoded copies.
 - [ ] Return 0.0, not 1.0, from `LiveRatio` when no arena is held.
 
-## 15. O_DIRECT silently degrades to a buffered open
+## 14. O_DIRECT silently degrades to a buffered open
 
 `blockio.Open` (`pkg/blockio/device.go:27`) tries `O_RDWR|O_DIRECT` and, on any
 failure, retries without `O_DIRECT` and continues with `direct = false`.
@@ -330,9 +301,50 @@ only signal, and it reads as informational.
       configured. Keep the fallback only for the single-node and file-backed
       test paths, and log it at warning level there.
 
+## 15. Partial overwrites still leave both extents live
+
+Full overwrites are handled: a write reclaims every extent it entirely covers
+and inside its own arenas, the scrubber's dead-extent check picks up the rest,
+and reads resolve by descending chunk number so the newer write always wins.
+
+A *partial* overlap is deliberately left alone — the older extent still holds
+live bytes outside the overwritten range, so it cannot simply be dropped, and
+trimming it is a rewrite rather than a delete. The read ordering keeps the
+answer correct, but the covered portion's blocks stay allocated for the life of
+the file.
+
+Same shape for a truncate that lands inside an extent: the head survives, the
+tail is reclaimed only if this node owns the range, and a foreign tail waits
+until the file is deleted or fully overwritten.
+
+Bounded, not unbounded — at most one partial extent per overlap — so this is a
+space-efficiency item, not a leak that grows without limit.
+
+- [ ] Split a partially covered extent at commit: keep the uncovered head or
+      tail as its own extent, free the middle. Owner-only, same rule as the
+      rest.
+- [ ] Teach the scrubber to trim an extent that straddles EOF, rather than
+      skipping it.
+
+## 16. Integration suites clobber each other on a shared etcd
+
+`pkg/arena`, `pkg/metadata` and `pkg/scrub` all carry `//go:build integration`
+tests that hit one etcd at `ETCD_ENDPOINTS`, with no key namespacing and no
+cleanup between suites. `go test -tags=integration ./...` runs the three package
+binaries in parallel, so they delete and recreate each other's inodes: observed
+as `TestGuard_FencedNodeLeavesStateIntact` failing on a missing inode, and a
+scrub test finding its extents already reclaimed as orphans.
+
+Each suite passes on its own against a clean store, which is what the per-package
+invocation in each file's header comment prescribes — but nothing enforces it,
+and the failure reads as a product bug rather than a harness one.
+
+- [ ] Namespace every integration test's keys by test name, or make the suites
+      run under `-p 1` with a store wipe in `TestMain`.
+
 # HARDENING
 
-## 16. The self-fence window and the request timeout are not checked against each other
+## 17. The self-fence window and the request timeout are not checked against each other
 
 `requestTimeout` is 10s (`internal/ipc/retry.go:35`) and its comment states the
 constraint: it must sit below the self-fencing window, which is 2-3× the
@@ -343,7 +355,7 @@ daemon exits before the request deadline can fire — and `Parse`
 - [ ] Reject a lease TTL below `requestTimeout` at startup, or derive
       `requestTimeout` from the TTL instead of hardcoding it.
 
-## 17. Unbounded growth in three background paths
+## 18. Unbounded growth in three background paths
 
 - `Scrubber.anomalies` (`scrubber.go:136`) is appended to on every pass and
   never trimmed. A permanent anomaly — the generation false positive above is
@@ -363,7 +375,7 @@ they are worth fixing before spending the run.
 - [ ] Truncate the WAL periodically — or delete the WAL entirely, see below.
 - [ ] Bound the keepalive drain and log a failed release loudly.
 
-## 18. Backoff sleeps ignore context cancellation
+## 19. Backoff sleeps ignore context cancellation
 
 `retry` (`retry.go:54`) and `NextCounter` (`metadata/alloc.go:66`) both call
 `time.Sleep` between attempts. A request whose context is already cancelled
@@ -372,7 +384,7 @@ noticing.
 
 - [ ] `select` on `ctx.Done()` alongside the timer.
 
-## 19. Control-plane sockets live in `/tmp` with a permissions window
+## 20. Control-plane sockets live in `/tmp` with a permissions window
 
 `--listen` defaults to `/tmp/etcfuse.sock` and the notify socket is hardcoded
 to `/tmp/etcfuse-notify.sock` (`main.go:242`). Both do `os.Remove` then
@@ -384,7 +396,7 @@ remove-then-bind is racy against anything else that can write `/tmp`.
       notify path configurable, and set the umask around the bind rather than
       chmod after it.
 
-## 20. Miscellaneous error handling
+## 21. Miscellaneous error handling
 
 - `wal.Open` failure is swallowed (`main.go:151`): `if err == nil` with no
   `else`, so a missing `/var/lib/etcfuse/` disables the WAL silently.
@@ -405,7 +417,7 @@ remove-then-bind is racy against anything else that can write `/tmp`.
 
 # PERFORMANCE AND SCALE
 
-## 21. The whole filesystem is single-threaded end to end
+## 22. The whole filesystem is single-threaded end to end
 
 `fuse.c:263` runs `fuse_session_loop`, the single-threaded loop. `ops.c` does a
 synchronous `ipc_sync` on one shared fd. The Go side reads, dispatches and
@@ -429,7 +441,7 @@ interleave their frames and steal each other's replies.
       than a response demultiplexer, and the Go side already handles a
       connection per goroutine.
 
-## 22. `readdir` reads the whole directory and does one `GetInode` per entry
+## 23. `readdir` reads the whole directory and does one `GetInode` per entry
 
 `readdirResp` (`handlers.go:86`) ignores the offset and size the kernel sent,
 lists every dirent, and calls `s.store.GetInode` per entry (`:105`) — one etcd
@@ -442,7 +454,7 @@ kernel's buffer size.
 - [ ] Honour the offset and size so a large directory is paged rather than
       materialised whole.
 
-## 23. `statfs` scans every inode in the filesystem
+## 24. `statfs` scans every inode in the filesystem
 
 `handleStatfs` (`handlers.go:178`) does `GetPrefix(ctx, "inode:")` and uses only
 `len(...)`. Every `df` is a full range read over the whole namespace. The file
@@ -451,20 +463,24 @@ count is then compared against a hardcoded 1,000,000 ceiling (`:180`).
 - [ ] Maintain a counter, or accept a stale count from the scrubber's pass,
       which already scans the same prefix.
 
-## 24. The scrubber makes four redundant full-filesystem scans and an N+1
+## 25. The scrubber makes four redundant full-filesystem scans and an N+1
 
-`RunScrubPass` (`scrubber.go:129`) calls four checks that each independently
-`GetPrefix(PrefixExtent)` — collisions, orphans, range, generation — so every
-30 seconds the whole extent space is read four times. `CheckOrphanExtents` then
-issues one `Get` per extent (`:216`) to test whether its inode exists.
+`RunScrubPass` calls five checks that each independently `GetPrefix(PrefixExtent)`
+— collisions, orphans, dead, range, generation — so every 30 seconds the whole
+extent space is read five times, and the inode space twice. `CheckOrphanExtents`
+also issues one `Get` per extent to test whether its inode exists, which
+`CheckDeadExtents` already answers from a single prefix scan.
 
 - [ ] Scan once per pass and pass the result to each check.
-- [ ] Replace the per-extent `Get` with one `GetPrefix(PrefixInode)` into a set.
+- [ ] Replace the per-extent `Get` with one `GetPrefix(PrefixInode)` into a set,
+      the way `CheckDeadExtents` already does. The two checks then share one
+      pair of scans and could merge outright — both answer "can anything still
+      read this extent?", one via the inode's existence and one via its size.
 - [ ] While there: `CheckExtentCollisions` (`:187`) compares `DiskOff` for exact
       equality, so two extents that overlap at different offsets — the actual
       invariant — are not detected.
 
-## 25. Block allocation is a linear bit scan under one global lock
+## 26. Block allocation is a linear bit scan under one global lock
 
 `findRun` skips fully-allocated 64-bit words but still walks the rest of the
 bitmap a bit at a time from block 0 on every call, and `Allocate` holds `a.mu`
@@ -482,7 +498,7 @@ of every extent in the filesystem, on the write path.
       silently re-issues live blocks. Worth an assertion at minimum, given the
       write path, the scrubber, and the failed-allocation undo all call it.
 
-## 26. Each write costs a flush, a sync, a full readback, and an fsync
+## 27. Each write costs a flush, a sync, a full readback, and an fsync
 
 `handleWriteBlock` does `FlushDevice`, `SyncRange`, and reads the whole written
 range back to discard it (`datapath.go:131`, `:145`, `:152`), and the WAL
@@ -499,7 +515,7 @@ expensive way to get it.
 
 # SIMPLIFICATION
 
-## 27. Does the WAL earn its place?
+## 28. Does the WAL earn its place?
 
 The WAL's stated job is to free blocks that were allocated and written but
 never committed to etcd. Arena reconstruction already achieves that: `Reconstruct`
@@ -517,7 +533,7 @@ write 41.
 
 - [ ] Decide: delete it, or give it a job reconstruction cannot do.
 
-## 28. Two implementations of the same consistency checks
+## 29. Two implementations of the same consistency checks
 
 `pkg/fsck` and `pkg/scrub` each implement nlink consistency, orphan extents and
 extent range validity, separately, with different thresholds and different
@@ -529,7 +545,7 @@ constants elsewhere.
 - [ ] One check library, two front ends: the offline `fsck` run and the online
       scrubber pass.
 
-## 29. `ipc.Service` cannot be tested against `MockStore`
+## 30. `ipc.Service` cannot be tested against `MockStore`
 
 `Service` holds `*metadata.Store` concretely (`internal/ipc/service.go:26`),
 even though `metadata.MetadataStore` exists as an interface and `pkg/scrub` and
@@ -540,7 +556,7 @@ even though `metadata.MetadataStore` exists as an interface and `pkg/scrub` and
       does, and take it as an interface. That closes the concurrent-inode-
       allocation coverage gap as a side effect rather than as its own project.
 
-## 30. Stale comments that describe a system that no longer exists
+## 31. Stale comments that describe a system that no longer exists
 
 - `cmd/etcfuse-meta/main.go:4` — "runs a gRPC server on a Unix domain socket".
   There is no gRPC anywhere in the wire path.
@@ -559,7 +575,7 @@ even though `metadata.MetadataStore` exists as an interface and `pkg/scrub` and
 
 - [ ] Fix as encountered; none of these is worth its own commit.
 
-## 31. Duplication in the C daemon
+## 32. Duplication in the C daemon
 
 `send_full` and `recv_full` are defined identically in `pkg/fuse/ops.c:51` and
 `pkg/fuse/pool.c:43`, as are the frame encode/decode halves of `ipc_sync` and
@@ -591,7 +607,7 @@ same class of assumption that the `readdirplus` desync broke.
 
 # STILL OPEN FROM BEFORE
 
-## 32. Concurrent inode allocation has no harness coverage
+## 33. Concurrent inode allocation has no harness coverage
 
 `Store.NextCounter` isn't reachable from `MockStore`. Covered only at the
 integration tier (`TestIntegration_CounterIsUniqueUnderConcurrency`) and by
@@ -603,7 +619,7 @@ integration tier (`TestIntegration_CounterIsUniqueUnderConcurrency`) and by
 
 # MAYBE IN THE FUTURE
 
-## 33. Long-duration fuzz
+## 34. Long-duration fuzz
 
 Longest run to date: 240s / ~20k ops (`docs/chaos-reports/2026-07-31-single-cluster-and-fuzz.md`).
 Too short to catch slow leaks (lease/keepalive goroutines, fd/watch-channel
@@ -619,7 +635,7 @@ Three of the leaks it would find are already identified above — the anomaly
 list, the WAL, and the keepalive goroutine — so it is worth fixing those first
 and spending the run on what is left.
 
-## 34. Should `RebalanceArena` be wired to a production caller at all?
+## 35. Should `RebalanceArena` be wired to a production caller at all?
 
 Guarded and atomic, but `RebalanceArena` and `pkg/membership.Manager` have no
 production caller — only the harness uses them.
@@ -629,7 +645,7 @@ production caller — only the harness uses them.
 - [ ] If yes: nail down the trigger condition and manual-vs-automatic posture
       first — those decisions shape everything else.
 
-## 35. Features the POSIX surface is missing
+## 36. Features the POSIX surface is missing
 
 Not bugs, just unbuilt. Listed so the gap is explicit rather than discovered by
 an application:

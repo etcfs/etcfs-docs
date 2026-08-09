@@ -1,12 +1,12 @@
 # Continuous Scrubber
 
-The background verification system that cross-checks etcd metadata against itself to detect invariant violations — extent collisions, orphaned blocks, range violations, generation mismatches, and nlink inconsistencies — before they can cause silent data loss.
+The background verification system that cross-checks etcd metadata against itself to detect invariant violations — extent collisions, orphaned blocks, unreachable blocks, range violations, generation mismatches, and nlink inconsistencies — before they can cause silent data loss.
 
 ## Table of Contents
 
 - [Design Philosophy](#design-philosophy)
 - [Scrubber Architecture](#scrubber-architecture)
-- [Five Invariant Checks](#five-invariant-checks)
+- [Six Invariant Checks](#six-invariant-checks)
 - [Scrub Pass Lifecycle](#scrub-pass-lifecycle)
 - [Rate Limiting](#rate-limiting)
 - [Anomaly Classification](#anomaly-classification)
@@ -20,13 +20,13 @@ The background verification system that cross-checks etcd metadata against itsel
 
 The scrubber exists because no software is bug-free. The metadata invariants defined in the schema — no two inodes claim the same block, every extent falls within an arena, every inode's nlink matches its dirent count — hold true after every correct operation, but a software bug, a partial writes after a crash, or a fencing race can silently violate them.
 
-The scrubber does **not** aim to prevent violations. It detects them after the fact. It runs continuously in the background, scanning all metadata keys in etcd, and reports any anomaly it finds. For safe anomalies (orphaned extents), it remediates automatically. For unsafe anomalies (extent collisions, generation mismatches), it alerts and waits for human intervention.
+The scrubber does **not** aim to prevent violations. It detects them after the fact. It runs continuously in the background, scanning all metadata keys in etcd, and reports any anomaly it finds. For safe anomalies (extents nothing can read), it remediates automatically. For unsafe anomalies (extent collisions, generation mismatches), it alerts and waits for human intervention.
 
 The scrubber is the system's immune system, not its vaccine. It assumes that violations will occur (bugs are real) and provides the detection and recovery mechanisms to handle them.
 
 ## Scrubber Architecture
 
-The scrubber is a single goroutine that loops on a configurable interval (default 10ms between passes, but in practice rate-limited to much slower). Each pass executes all five invariant checks sequentially, aggregates the results, and stores them for querying.
+The scrubber is a single goroutine that loops on a configurable interval (default 10ms between passes, but in practice rate-limited to much slower). Each pass executes all six invariant checks sequentially, aggregates the results, and stores them for querying.
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -35,6 +35,7 @@ The scrubber is a single goroutine that loops on a configurable interval (defaul
 │  every interval:                                      │
 │    CheckExtentCollisions()                            │
 │    CheckOrphanExtents()                               │
+│    CheckDeadExtents()                                 │
 │    CheckRangeValidity()                                │
 │    CheckGenerationConsistency()                        │
 │    CheckNlinkConsistency()                             │
@@ -42,7 +43,7 @@ The scrubber is a single goroutine that loops on a configurable interval (defaul
 │    if any anomalies found:                            │
 │      log WARN with per-type counts                    │
 │      emit metrics (anomalies_total by type)           │
-│      auto-remediate safe cases (orphans)              │
+│      auto-remediate safe cases (orphan + dead)        │
 │                                                       │
 │    increment totalChecked counter                     │
 └──────────────────────────────────────────────────────┘
@@ -50,7 +51,7 @@ The scrubber is a single goroutine that loops on a configurable interval (defaul
 
 The scrubber runs as a background goroutine within the Go daemon (etcfuse-meta). It shares the etcd connection with the metadata store — no separate connection is needed.
 
-## Five Invariant Checks
+## Six Invariant Checks
 
 ### 1. Extent Collision Detection
 
@@ -87,7 +88,29 @@ The scrubber runs as a background goroutine within the Go daemon (etcfuse-meta).
 - Inode key deleted (e.g., by a manual etcdctl command) without cleaning up the corresponding extent keys.
 - Bug in the unlink path that deletes the inode but forgets the extent keys.
 
-### 3. Range Validity Check
+### 3. Dead Extent Detection
+
+**What it checks:** Every extent of a *live* inode is still reachable through that inode. Two things make an extent unreachable while its file goes on existing:
+
+- **Past the end of the file.** A truncate lowers `inode:<ino>`'s size; every extent starting at or beyond the new size describes bytes no read can ever return, because the kernel clamps a read to the size it last saw.
+- **Overwritten.** A write is not an in-place update: it allocates fresh blocks and appends a new extent. When the new extent covers an older one's logical range entirely, the older one's blocks are dead.
+
+Neither is visible to the orphan check, which looks for extents whose *inode* is gone. Here the inode is very much alive, so without this check the blocks stay allocated for as long as the file exists.
+
+**How it works:**
+1. Scan all `extent:*` keys and all `inode:*` keys, once each.
+2. Group extents by inode; skip any inode that is missing (those belong to the orphan check).
+3. An extent is dead if its `log_off` is at or beyond the inode's size, or if a sibling extent with a higher chunk number covers its whole logical range.
+
+**Resolution:** Automatic, subject to the ownership rule in [Automatic Remediation](#automatic-remediation).
+
+The node that issued the truncate or the overwrite already reclaims what it owns inline, without waiting for a scrub pass. What reaches this check is the cross-node remainder: an operation issued from one node against bytes sitting in another node's arena, which only that arena's owner may reclaim.
+
+An extent that is only *partly* past the new end of file, or only partly overwritten, is left alone. Its surviving portion is still live data, so removing it would take good bytes with it, and trimming it is a rewrite rather than a delete. That tail is reclaimed when the file is deleted or fully overwritten.
+
+**Likely causes:** ordinary truncates and overwrites. Unlike the other five, a finding here is not evidence of a bug — it is the expected steady state between an operation and the pass that tidies up after it.
+
+### 4. Range Validity Check
 
 **What it checks:** Every extent's `disk_off + length` falls within the valid arena range. The global arena range is 0 to `maxArena * arenaSize` (default 1024 arenas × 1 GiB = 1 TB).
 
@@ -103,7 +126,7 @@ The scrubber runs as a background goroutine within the Go daemon (etcfuse-meta).
 - Manual corruption of an extent key's value.
 - Node configured with a different arena size than the rest of the cluster.
 
-### 4. Generation Consistency Check
+### 5. Generation Consistency Check
 
 **What it checks:** Every extent's generation stamp matches the current fencing generation of the node that wrote it. A stale generation stamp means the extent was written before a fence event — the write may have been part of an incomplete post-fence sequence.
 
@@ -120,7 +143,7 @@ The scrubber runs as a background goroutine within the Go daemon (etcfuse-meta).
 - The generation counter was manually reset or deleted.
 - The node's generation was bumped by a concurrent fence on a different controller replica that the metadata store was not aware of at commit time (impossible with the CAS guarantee, but worth checking).
 
-### 5. Nlink Consistency Check
+### 6. Nlink Consistency Check
 
 **What it checks:** For every inode, the `nlink` field in its record equals the number of directory entries (`dirent:*` keys) whose value points to that inode.
 
@@ -140,18 +163,20 @@ The scrubber runs as a background goroutine within the Go daemon (etcfuse-meta).
 
 ## Scrub Pass Lifecycle
 
-A single scrub pass executes the five checks in sequence:
+A single scrub pass executes the six checks in sequence:
 
 ```
 t0: Lock, record lastRun = now
 t1: CheckExtentCollisions — scan all extent keys, build disk_off map
 t2: CheckOrphanExtents — scan all extent keys, check inode existence
-t3: CheckRangeValidity — scan all extent keys, check disk_off+len
-t4: CheckGenerationConsistency — scan all extent keys, check gen stamp
-t5: CheckNlinkConsistency — scan all dirent keys, scan all inode keys, compare
-t6: Lock, append all results to anomaly list, increment totalChecked
-t7: Log summary (clean or per-type anomaly counts)
-t8: Sleep until next interval
+t3: CheckDeadExtents — scan all extent and inode keys, compare against size and chunk order
+t4: CheckRangeValidity — scan all extent keys, check disk_off+len
+t5: CheckGenerationConsistency — scan all extent keys, check gen stamp
+t6: CheckNlinkConsistency — scan all dirent keys, scan all inode keys, compare
+t7: Lock, append all results to anomaly list, increment totalChecked
+t8: Reclaim the owned orphan and dead extents found above
+t9: Log summary (clean or per-type anomaly counts)
+t10: Sleep until next interval
 ```
 
 The checks are sequential and read-only. They use `GetPrefix` for bulk scans, which is efficient for etcd's B-tree index. The scan results are snapshots at a point-in-time — concurrent mutations during the pass may cause transient inconsistencies that are detected and reported. Most such transient anomalies are benign (e.g., an inode created between the extent scan and the inode scan), and the next pass will not report them.
@@ -185,21 +210,27 @@ Result:
 
 The `Type` determines the severity:
 - **collision, range, generation, nlink** — require human review. These are logged as WARN and emitted as metrics, but no automatic action is taken.
-- **orphan** — safe to auto-remediate. The blocks are freed and the extent key is deleted.
+- **orphan, dead** — safe to auto-remediate. The blocks are freed and the extent key is deleted.
 
 ## Automatic Remediation
 
-The only anomaly that the scrubber auto-remediates (in the current implementation) is orphan extents.
+The anomalies the scrubber auto-remediates are orphan extents and dead extents. Both are the same operation — an extent record nothing can read, and the blocks behind it — so both run through one protocol.
 
-Remediation protocol for orphans, in the same pass that detects them:
-1. The orphan is logged with `AutoFix: true`, carrying the `disk_off` and `length` decoded from the extent's value.
+Remediation, in the same pass that detects them:
+1. The finding is logged with `AutoFix: true`, carrying the `disk_off` and `length` decoded from the extent's value.
 2. `arena.Allocator.Owns(disk_off)` is consulted. A range outside every arena this node holds is reported and left alone — see below.
 3. The `extent:<ino>/<chunk>` key is deleted from etcd. This comes before the reclaim: the blocks must stop being reachable through metadata before they can be handed to another allocation, or a reader resolving the extent could land on data that has already been overwritten. A failed delete skips the reclaim, leaving both the key and its blocks for the next pass.
 4. `arena.Allocator.Free(disk_off, length)` returns the blocks to the free-list.
 
-Step 2 is what keeps reclamation from leaking across nodes. The free-list is per-process and in-memory, and it is rebuilt from the live `extent:` keys — so deleting the extent record of a range inside a *peer's* arena would remove the only reference that peer's bitmap is derived from, and those blocks would stay marked allocated there until it restarted. Leaving the orphan for its owner costs nothing, because every arena has exactly one owner and every owner runs the same pass.
+Step 2 is the ownership rule, and it is what keeps reclamation from leaking across nodes:
 
-An orphan in an arena that currently sits in the free pool is left alone by the same rule, and is still cleaned up: whoever claims that arena next marks the range live from the extent record that is still there, and its own next pass then finds the orphan, owns it, and reclaims it.
+> **Only the arena's owner may delete or shorten an extent record.**
+
+The free-list is per-process and in-memory, and it is rebuilt from the live `extent:` keys — so deleting the record of a range inside a *peer's* arena would remove the only reference that peer's bitmap is derived from, and those blocks would stay marked allocated there until it restarted. The record has to outlive the operation for its owner to find it.
+
+The rule costs nothing, because every arena has exactly one owner and every owner runs the same pass. It is why the FUSE truncate and overwrite paths also reclaim only what they own (`ipc.Service.dropExtent`), leaving the rest here — and why correctness never depends on the timing: the inode's size bounds what a read can reach past the end of a file, and the extent chunk order decides which of two overlapping extents a read resolves to. A dead extent that has not been collected yet costs space, never a wrong answer.
+
+An extent in an arena that currently sits in the free pool is left alone by the same rule, and is still cleaned up: whoever claims that arena next marks the range live from the record that is still there, and its own next pass then finds it unreachable, owns it, and reclaims it.
 
 The reclaim is not durable, and does not need to be — a restart rebuilds the bitmap from the live extents in etcd, which no longer include the deleted file's, so the space returns that way instead.
 
@@ -209,14 +240,14 @@ This is what makes file deletion actually return disk space. `AtomicUnlink` remo
 
 When the scrubber finds anomalies, it:
 1. Logs a WARN message with per-type counts: "scrub found anomalies: count=3 collisions=1 orphans=2".
-2. Increments the `etcfuse_scrub_anomalies_total` Prometheus counter with a `type` label (collision, orphan, range, generation, nlink).
+2. Increments the `etcfuse_scrub_anomalies_total` Prometheus counter with a `type` label (collision, orphan, dead, range, generation, nlink).
 3. Stores the anomaly in the in-memory list for Prometheus gauge queries.
 
-In the production deployment, a Prometheus alert rule fires on `etcfuse_scrub_anomalies_total > 0` for non-orphan types:
+In the production deployment, a Prometheus alert rule fires on `etcfuse_scrub_anomalies_total > 0` for the types that need human review. Orphan and dead findings are excluded: both are routine, and a dead extent in particular is the ordinary result of a truncate or an overwrite rather than a fault.
 ```
 alert: ScrubAnomalyDetected
 expr: rate(etcfuse_scrub_anomalies_total[5m]) > 0
-  and on(type) (etcfuse_scrub_anomalies_total{type!="orphan"} > 0)
+  and on(type) (etcfuse_scrub_anomalies_total{type!~"orphan|dead"} > 0)
 for: 1m
 labels:
   severity: critical

@@ -30,7 +30,7 @@ All namespace mutations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK, MK
 | UNLINK | 7 | `fuse_reply_err` | `AtomicUnlink` | No |
 | RMDIR | 8 | `fuse_reply_err` | `LookupDirent` + `ListDirents` + `AtomicUnlink` | No |
 | RENAME | 9 | `fuse_reply_err` | `LookupDirent` + `AtomicRename` | No |
-| WRITE | 23 | `fuse_reply_write` | Arena allocate + device write + fsync + extent commit | Yes |
+| WRITE | 23 | `fuse_reply_write` | Arena allocate + device write + fsync + extent commit + reclaim of buried extents | Yes |
 | SETATTR | 12 | `fuse_reply_attr` | `GetInode` | No |
 | SYMLINK | 10 | `fuse_reply_entry` | `allocInode` + `CreateInode` + `Put` + `CreateDirent` | No |
 | LINK | 11 | `fuse_reply_entry` | `IncrementNlink` + `CreateDirent` | No |
@@ -98,7 +98,7 @@ UNLINK removes a name from a directory. It calls `AtomicUnlink`, which does the 
 
 This is atomic: if the daemon crashes after step 2 but before step 3–4, no corruption occurs because the transaction either committed all operations or none. The transaction includes a CAS on the dirent key to prevent concurrent double-unlink.
 
-If the inode's extent list is non-empty at nlink zero (meaning there are allocated blocks but no directory entry), the extend keys remain orphaned. The scrubber eventually detects these orphans and reclaims the blocks.
+If the inode's extent list is non-empty at nlink zero (meaning there are allocated blocks but no directory entry), the extent keys remain orphaned. The scrubber eventually detects these orphans and reclaims the blocks — each node reclaiming the ones inside its own arenas.
 
 ### RMDIR
 
@@ -144,13 +144,14 @@ WRITE is called when the kernel has data to write to a file. The Go backend rece
 
 1. Read the inode record from etcd. If the inode does not exist, return `ENOENT`.
 2. If no arena is acquired yet, acquire one from the global pool via CAS.
-3. Call `alloc.Allocate(dataLen)` to reserve contiguous disk blocks. Returns the byte offset on the block device.
-4. Write the data bytes to the block device via `pwrite()` at the allocated disk offset.
-5. Call `sync_file_range()` on the written range to ensure data durability.
+3. Call `alloc.Allocate(dataLen)` to reserve disk blocks. Returns a list of runs — free space that is merely fragmented is still usable, so one write may be spread over several device ranges.
+4. Write the data bytes to the block device via `pwrite()`, one call per run.
+5. Call `sync_file_range()` on each written range to ensure data durability.
 6. Read the node's current fencing generation from `gen:<node_id>` in etcd.
-7. Store an extent entry in etcd at `extent:<ino>/<chunk>` with the value `"logical_off,disk_off,length,generation"`. The chunk number is auto-incremented for each new extent.
-8. If the write extends beyond the current file size, update the inode size in etcd.
-9. Return the number of bytes written.
+7. Store one extent entry per run in etcd at `extent:<ino>/<chunk>` with the value `"logical_off,disk_off,length,generation"`, in logical order. Chunk numbers continue from one past the highest currently in use.
+8. If the write extends beyond the current file size, update the inode size in etcd. Steps 7 and 8 are one generation-guarded transaction.
+9. Reclaim any extent this write has fully buried (see below).
+10. Return the number of bytes written.
 
 ### Data-Then-Metadata Ordering
 
@@ -164,7 +165,17 @@ If the order were reversed (extent before data), a crash would leave a metadata 
 
 ### Partial and Sequential Writes
 
-Multiple writes to the same file create separate extent keys (`extent:<ino>/0`, `extent:<ino>/1`, ...). The read handler scans all extents for the inode, finds the ones covering the requested range, and concatenates the data from each. Allocation is sequential within the arena's free bitmap — blocks are contiguous unless the arena is fragmented.
+Multiple writes to the same file create separate extent keys (`extent:<ino>/0`, `extent:<ino>/1`, ...). The read handler scans all extents for the inode, finds the ones covering the requested range, and concatenates the data from each. Allocation is sequential within the arena's free bitmap — blocks are contiguous unless the arena is fragmented, in which case the write becomes several extents instead of failing.
+
+### Overwrites
+
+A write is never an in-place update. Overwriting a range allocates fresh blocks and appends a new extent, so two extents end up covering the same logical bytes. Two consequences follow.
+
+**Reads must resolve to the newer one.** Extents are ordered by logical offset and then by *descending* chunk number, and the read handler takes the first extent covering the offset it wants — so the later write is the one it sees. Chunk numbers are handed out in ascending order, which is what makes "later" well defined.
+
+**The buried extent's blocks are dead.** Once the commit lands, any extent the new one fully covers is unreadable, and its blocks are returned to the free-list. As with truncation this applies only to extents in an arena this node owns; the rest are left for their owner's scrubber. An extent that is only *partly* covered survives — its uncovered bytes are still live, and the read ordering above is what keeps the result correct.
+
+Reclamation happens after the commit, never before: a transaction rejected by the generation guard must not have freed blocks the file still refers to.
 
 ### Generation Stamp
 
@@ -172,7 +183,7 @@ Every extent carries the node's current fencing generation at write time. The ge
 
 ### Alignment
 
-The block device is opened with buffered I/O (no O_DIRECT). This means the write path accepts arbitrarily sized and offset writes from the kernel without alignment constraints. The `sync_file_range()` call flushes the kernel page cache for the written range.
+The block device is opened `O_DIRECT` where the device allows it, falling back to buffered I/O otherwise. Under `O_DIRECT` the payload is copied into a sector-aligned buffer padded out to whole blocks, which is also what lets a multi-run write slice one buffer per run: every run begins and ends on a block boundary. The padding past the end of the data is written but never described by an extent, so it is never read back. The `sync_file_range()` call flushes the written range.
 
 ## Attribute Setting (SETATTR)
 
@@ -200,6 +211,10 @@ Truncation (size change) follows the **metadata-then-data** ordering invariant:
 3. Update the inode size in etcd.
 
 Metadata-then-data ordering ensures the inode size shrinks before the freed blocks are returned to the arena free-list. If the node crashes between steps 2 and 3, the blocks are still allocated (not reusable) but the inode still has the old size — the blocks are wasted but no reader can access them because the extent was removed.
+
+Steps 1 and 2 apply only to the extents whose device range **this node's arenas own**. A file's bytes may sit in several nodes' arenas — a write always allocates from the writer's own arena, so a file written by two nodes is spread across both — and only an arena's owner may remove one of its extent records. Deleting a peer's record would strip the reference that peer's in-memory free-list is rebuilt from, stranding those blocks as allocated until it restarted. Extents belonging to another node are therefore left in place, and its scrubber reclaims them (see [Continuous Scrubber](../reliability/continuous-scrubber.md#3-dead-extent-detection)).
+
+Leaving them costs nothing in correctness. Step 3 is what truncation actually means to a reader: the kernel clamps every read to the size it last saw, so bytes past the new end of file are unreachable whether or not an extent still describes them.
 
 ### Current SETATTR Behavior
 
