@@ -70,13 +70,19 @@ bitmap: [uint64 × 4096]
 | `markAllocated(block)` | Mark a block as allocated | `bitmap[block/64] |= 1 << (block%64)` |
 | `markFree(block)` | Mark a block as free | `bitmap[block/64] &^= 1 << (block%64)` |
 | `countAllocated()` | Count all allocated blocks | Linear scan of all bits |
-| `findContiguous(count)` | Find N contiguous free blocks | Linear scan, return first match |
+| `findRun(max)` | Find the next free run, at most `max` blocks | Scan from the rotating hint, wrapping once |
 
 ### Contiguous Block Search
 
-`findContiguous` scans the bitmap from block 0 to the end, counting consecutive free blocks. When it finds a run of at least the requested length, it returns the starting block index. If no run of the required length exists, it returns `BlocksPerArena` (a sentinel value outside the valid block range).
+`findRun` returns the next free run of at most the requested length, or a zero length when the arena has none. Fully-allocated 64-bit words are skipped whole; within a word the scan is bit by bit.
 
-The scan is a simple linear scan with a single counter. It resets the counter to zero whenever it encounters an allocated block. This is O(N) per allocation (N = BlocksPerArena = 262,144). For small allocations (single 4 KiB blocks), the worst case is scanning past all allocated blocks to find a free one near the end.
+The search starts from a rotating hint left where the previous one finished, and wraps to the beginning exactly once before giving up. Scanning from block 0 every time made a nearly-full arena cost a sweep of the whole bitmap per allocation, and a fragmented one cost several. Freeing a range moves the hint back to it, so blocks just returned are reused before the search moves on.
+
+The hint is only a hint: because the search wraps, nothing is missed if it points past space that has since been freed.
+
+### Double Frees
+
+`Free` refuses to clear a bit that is already clear, and counts the attempt. Freeing an already-free block means two callers believe they own it, and the next allocation would hand a live range to a second writer — the write path, the scrubber's reclamation and the failed-allocation undo all call `Free`, so the count (`DoubleFrees`) names the bug where it happens rather than at the corruption it would cause later.
 
 ## Arena Acquisition
 

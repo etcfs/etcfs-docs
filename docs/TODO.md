@@ -197,23 +197,17 @@ every check takes that `Snapshot`, which also removes the per-extent `Get`.
 `CheckExtentCollisions` compares overlapping device ranges rather than equal
 offsets, so a partial overlap is no longer missed.
 
-## 28. Block allocation is a linear bit scan under one global lock
+## 28. Block allocation is a linear bit scan under one global lock — CLOSED
 
-`findRun` skips fully-allocated 64-bit words but still walks the rest of the
-bitmap a bit at a time from block 0 on every call, and `Allocate` holds `a.mu`
-across all arenas while it does. A nearly-full arena costs a sweep per
-allocation, and a fragmented one costs several.
+Each arena keeps a rotating start hint, so a search resumes where the last one
+finished and wraps rather than restarting at block 0; a free moves the hint back
+to what it returned. `Free` counts blocks that were already free — a double free
+is two callers believing they own a range — and `DoubleFrees` exposes the count.
 
-`AcquireArena` compounds it: recycling an arena triggers `AllExtents()`, a scan
-of every extent in the filesystem, on the write path.
-
-- [ ] Keep a rotating start hint so allocation does not restart from block 0
-      each time.
-- [ ] Read only the extents in the arena's disk range when rebuilding a
-      recycled arena's bitmap.
-- [ ] `Free` does not check that the range was allocated; a double free
-      silently re-issues live blocks. Worth an assertion at minimum, given the
-      write path, the scrubber, and the failed-allocation undo all call it.
+Not done, deliberately: reading only the extents in a recycled arena's disk
+range. Extent keys are `extent:<ino>/<chunk>`, so etcd cannot range-scan them by
+device offset, and an index keyed on disk offset would be a second source of
+truth for the allocator to keep consistent. The full scan stays.
 
 ## 29. Each write costs a flush, a sync, a full readback, and an fsync
 
