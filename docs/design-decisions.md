@@ -120,3 +120,9 @@ The checks live in `pkg/scrub` as functions over a `Snapshot`; `pkg/fsck` calls
 them and keeps only what is genuinely its own (undecodable records, dirents
 pointing at missing inodes, arena ownership). Two implementations had drifted to
 different thresholds and severities for the same invariant.
+
+## Arena rebalancing is not wired up
+
+`RebalanceArena` stays harness-only. Imbalance has not been observed at the
+cluster sizes this runs at, and the trigger condition and manual-vs-automatic
+posture would have to be decided before the mechanism means anything.

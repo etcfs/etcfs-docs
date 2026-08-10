@@ -261,13 +261,12 @@ cursor (`struct rbuf`) carrying the response length, so a short response is an
 
 # OPEN QUESTIONS
 
-- **Does a fenced node un-fence itself by restarting?** `InitGeneration` reads
-  the node's current generation and adopts it as `startGen`
-  (`service.go:121`), so a node that was fenced and restarts writes again
-  immediately. With a `Fencer` configured the device access is already severed,
-  so this is safe. In single-signal mode it is not obvious that it is, and I
-  could not find the intended behaviour written down. Worth stating explicitly
-  in `docs/architecture/fencing/fencing-generation-protocol.md` either way.
+- **Does a fenced node un-fence itself by restarting?** ANSWERED — yes, by
+  design, and the reasoning is now in
+  `docs/architecture/fencing/fencing-generation-protocol.md`. A fence is an
+  epoch boundary; in single-signal mode what protects the filesystem is that the
+  fenced node's arenas are never reclaimed, so no peer is handed a range it may
+  still be writing into.
 - **Is whole-arena reclamation granular enough?** An arena only returns to the
   pool once *every* block in it is free, so one surviving file pins a whole GiB.
   Nothing has measured how often that happens under a real delete workload. If
@@ -301,15 +300,12 @@ Three of the leaks it would find are already identified above — the anomaly
 list, the WAL, and the keepalive goroutine — so it is worth fixing those first
 and spending the run on what is left.
 
-## 37. Should `RebalanceArena` be wired to a production caller at all?
+## 37. Should `RebalanceArena` be wired to a production caller at all? — CLOSED, not built
 
-Guarded and atomic, but `RebalanceArena` and `pkg/membership.Manager` have no
-production caller — only the harness uses them.
-
-- [ ] Decide if it's worth building. At current cluster sizes (3-5 nodes),
-      arena imbalance hasn't been an observed problem.
-- [ ] If yes: nail down the trigger condition and manual-vs-automatic posture
-      first — those decisions shape everything else.
+No. At 3-5 nodes arena imbalance has never been observed, and the trigger
+condition and manual-vs-automatic posture would have to be settled before any of
+it means anything. `RebalanceArena` and `pkg/membership.Manager` stay as harness
+fixtures; revisit if a real workload shows imbalance.
 
 ## 38. Features the POSIX surface is missing
 

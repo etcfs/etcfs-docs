@@ -243,4 +243,14 @@ Node permanently decommissioned:
   (or left in place for audit trail)
 ```
 
+### A restarted node adopts its current generation
+
+A fenced node that restarts reads `gen:<node_id>` and adopts whatever it finds as the generation every one of its transactions is guarded against. It therefore writes again immediately: the fence is an epoch boundary, not a permanent ban.
+
+That is the intended behaviour, and it is safe where fencing is device-enforced. The `Fencer` has already severed the node's access to the shared device before the generation was ever bumped, so a restarted node that regains device access does so as a new epoch, with a fresh membership lease and a generation nothing else is still writing under.
+
+In single-signal mode (no `Fencer`) it is weaker, and deliberately so. The bump stopped the node publishing metadata, but nothing stopped its kernel writing bytes; on restart it resumes both. What protects the filesystem there is that its arenas were never reclaimed — the controller only returns a fenced node's arenas to the pool when a `Fencer` confirmed the severance — so no peer has been handed the range it may still have been writing into. The cost is leaked space; the alternative would be two live writers in one range.
+
+Refusing to start after a fence was considered and rejected: it would turn every transient lease expiry into an operator-attended outage, and the epoch separation the generation provides is exactly what makes restarting safe without one.
+
 The generation is never reset. A node that is permanently decommissioned and replaced by a new node with the same ID should have its generation reset by deleting the key manually — but even without deletion, the generation would just start from the existing value, which is correct.
