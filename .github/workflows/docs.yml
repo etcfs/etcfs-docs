@@ -6,6 +6,14 @@ on:
     paths:
       - "docs/**"
       - "mkdocs.yml"
+      - "README.md"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "README.md"
       - ".github/workflows/docs.yml"
   workflow_dispatch: {}
 
@@ -19,6 +27,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Catches links that mkdocs --strict does not: relative paths in README.md
+  # (outside the docs tree) and links to source files rather than pages.
+  # Five architecture links rotted this way when the docs were reorganised
+  # into subdirectories.
+  links:
+    name: Link check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --no-progress
+            --include-fragments
+            --exclude-path site
+            README.md AGENTS.md 'docs/**/*.md'
+          fail: true
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -33,7 +59,9 @@ jobs:
           path: site
 
   deploy:
-    needs: build
+    needs: [build, links]
+    # Pull requests get the build and the link check, but must not publish.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
