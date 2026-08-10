@@ -155,24 +155,13 @@ Both sockets default to `/run/etcfuse/`, the notify path is a flag on both
 daemons, and `ListenPrivate` creates the directory 0700 and binds under a 0177
 umask instead of chmod-ing afterwards.
 
-## 23. Miscellaneous error handling
+## 23. Miscellaneous error handling — CLOSED
 
-- `wal.Open` failure is swallowed (`main.go:151`): `if err == nil` with no
-  `else`, so a missing `/var/lib/etcfuse/` disables the WAL silently.
-- `StartNotifyServer`'s error is discarded into a goroutine (`main.go:242`).
-- `Membership.Run` returns without logging on every failure path
-  (`metadata/membership.go:67`, `:73`, `:89`, `:94`) — the heartbeat can be
-  dead with nothing said.
-- `truncate` (`datapath.go:320`) discards the result of every delete and put.
-  A fenced node's truncate reports success while leaving the extents in place.
-- `Watchdog.trigger` calls `os.Exit(77)` from inside a library
-  (`pkg/fencing/watchdog.go:117`), so `main`'s `membership.Leave` never runs and
-  a self-fenced node's arenas leak — permanently, in single-signal mode, since
-  `Controller` only reclaims arenas when a `Fencer` is configured
-  (`controller.go:236`).
-
-- [ ] Log or propagate each of these; make the watchdog signal `main` rather
-      than exit under it.
+The WAL open is gone with the WAL; `StartNotifyServer`'s error is logged; the
+membership heartbeat takes a logger and reports every path it returns on;
+`truncate` returns its failures and `setattr` answers with an errno instead of
+success; and the watchdog closes `Fenced()` for `main` to act on, so a
+self-fenced node still releases its arenas.
 
 # PERFORMANCE AND SCALE
 

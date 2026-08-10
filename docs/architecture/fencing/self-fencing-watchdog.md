@@ -47,7 +47,8 @@ The watchdog is a polling loop that checks the health of the node's etcd members
 │ 1. Set IsFenced = true      │
 │ 2. Close Fenced() channel   │
 │ 3. Log diagnostic context   │
-│ 4. Exit process (code 77)   │
+│ 4. Signal main; it shuts    │
+│    down and exits (code 77) │
 └─────────────────────────────┘
 ```
 
@@ -88,8 +89,11 @@ trigger():
   close Fenced channel
   log: "SELF-FENCED: lease expired beyond grace period"
   log: node_id, last_alive timestamp, dead_for duration
-  os.Exit(77)
 ```
+
+Closing the `Fenced()` channel is the whole signal. `main` waits on it alongside SIGTERM and runs the same shutdown either way — stopping the IPC server, then releasing this node's arenas — before exiting with code 77.
+
+The watchdog used to call `os.Exit(77)` itself, from inside the library. That skipped the shutdown entirely, so a self-fenced node never released its arenas; in single-signal mode the leak was permanent, because the fencing controller only reclaims a fenced node's arenas when a `Fencer` is configured.
 
 Exit code 77 is a convention distinguishing self-fenced exits from crashes or normal shutdowns. The systemd unit can use this exit code to trigger a specific restart policy.
 
@@ -141,7 +145,7 @@ The self-fencing watchdog and the external fencing controller form a two-layer d
 | Self-fencing (watchdog) | Local lease health poll | Exit process (code 77) | 2–3 × TTL (~10–15s at TTL=5s) |
 | External fencing (controller) | etcd watch on membership key deletion | Generation bump | TTL + watch latency |
 
-The self-fencing watchdog is faster and independent of external services. It does **not** close the block device file descriptor or remount anything — `trigger()` sets the fenced flag, closes the `Fenced()` channel, logs, and calls `os.Exit(77)`. Process exit is what releases the descriptor, via the kernel. The distinction matters when reasoning about in-flight I/O: writes already handed to the kernel are not cancelled by the fence, they are simply no longer referenced once the generation guard rejects their metadata commit (see [Kleppmann's Stale-Write Hazard](../storage/kleppmann-stale-write-analysis.md)).
+The self-fencing watchdog is faster and independent of external services. It does **not** close the block device file descriptor or remount anything — `trigger()` sets the fenced flag, closes the `Fenced()` channel, and logs; `main` does the rest. Process exit is what releases the descriptor, via the kernel. The distinction matters when reasoning about in-flight I/O: writes already handed to the kernel are not cancelled by the fence, they are simply no longer referenced once the generation guard rejects their metadata commit (see [Kleppmann's Stale-Write Hazard](../storage/kleppmann-stale-write-analysis.md)).
 
 In the worst case (the self-fencing watchdog fails to fire — e.g., the daemon is stuck in an infinite loop), the external fencing controller still fences the node once the membership lease expires. The generation guard on every etcd transaction is the ultimate backstop: even if neither layer fires correctly, the fenced node's metadata commits are rejected because its generation is stale.
 
