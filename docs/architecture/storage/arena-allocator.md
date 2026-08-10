@@ -234,7 +234,7 @@ After an unclean shutdown, the arena allocator's local state (the in-memory bitm
 
 2. The node's local bitmap is rebuilt by scanning the extent keys in etcd. Every `extent:<ino>/<chunk>` entry that falls within the node's arena range is decoded, and the corresponding blocks are marked allocated.
 
-3. The WAL replay (if any) marks any uncommitted WAL entries' blocks as free (they were written to disk but never committed to etcd).
+3. Blocks written to the device but never committed to etcd are free by construction: no extent references them, so the rebuilt bitmap leaves them clear.
 
 4. After the bitmap is reconstructed, the node can resume allocating from its arenas.
 

@@ -41,7 +41,6 @@ A write operation follows this sequence to guarantee cross-node visibility:
 6. Call sync_file_range to flush kernel page cache to EBS backend
 7. Wait for data to become visible via read-back verify
 8. Commit extent metadata to etcd (logical_off, disk_off, length, generation)
-9. Mark WAL entry as committed
 10. Update inode size in etcd
 11. Release exclusive lock
 ```

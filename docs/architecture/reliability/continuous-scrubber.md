@@ -300,10 +300,10 @@ The current implementation checks against `s.nodeID`'s generation only. A cross-
 
 After an unclean shutdown, the scrubber's role is to detect any invariant violations that may have been introduced by the crash:
 
-1. **Orphaned extents from the data-then-metadata window.** If the node crashed between writing an extent to the block device and committing the extent to etcd, the WAL replay returns the blocks to the free-list. The scrubber's orphan check catches any extents that made it to etcd but lost their inode (inode key deleted by a concurrent transaction that also created a conflicting extent — this should not happen, but the scrubber checks anyway).
+1. **Orphaned extents from the data-then-metadata window.** If the node crashed between writing an extent to the block device and committing the extent to etcd, arena reconstruction at startup returns the blocks to the free-list. The scrubber's orphan check catches any extents that made it to etcd but lost their inode (inode key deleted by a concurrent transaction that also created a conflicting extent — this should not happen, but the scrubber checks anyway).
 
 2. **Nlink mismatches from incomplete deletion.** If the crash occurred between the dirent deletion and the nlink decrement (in the non-atomic paths like SYMLINK and LINK), the nlink check detects the mismatch.
 
 3. **Extent collisions from stale arena free-lists.** If the bitmap reconstruction after a crash incorrectly marks a block as free that is still referenced by an inode, a subsequent allocation may collide. The extent collision check detects this.
 
-The scrubber does not run automatically after a crash. It runs in the background at its configured interval. If the crash occurred and the scrubber happens to be mid-pass, it may detect transient anomalies that are resolved by the WAL replay. The scrubber's next pass will reflect the corrected state.
+The scrubber does not run automatically after a crash. It runs in the background at its configured interval. If the crash occurred and the scrubber happens to be mid-pass, it may detect transient anomalies that are resolved by arena reconstruction. The scrubber's next pass will reflect the corrected state.

@@ -137,25 +137,12 @@ share a key space, and cleanup is one prefix delete.
 rejects a lease TTL whose self-fencing window (`2x TTL`, shared with the
 watchdog) does not clear it.
 
-## 20. Unbounded growth in three background paths
+## 20. Unbounded growth in three background paths — CLOSED
 
-- `Scrubber.anomalies` (`scrubber.go:136`) is appended to on every pass and
-  never trimmed. A permanent anomaly — the generation false positive above is
-  exactly one — is re-added every 30 seconds forever.
-- The WAL is truncated once at startup and never again (`main.go:159`), while
-  every write appends two 49-byte records. At 1000 writes/second that is
-  ~8 GB/day of local disk.
-- `lockInode` (`retry.go:111`) starts a goroutine draining the keepalive
-  channel and relies on `ReleaseLock` to end it. If the revoke fails, the
-  keepalive keeps renewing, so the goroutine leaks *and* the inode lock is held
-  until the process exits, blocking every writer to that inode cluster-wide.
-
-These are what the long-duration fuzz item further down is meant to catch, and
-they are worth fixing before spending the run.
-
-- [ ] Cap or window the anomaly list, and deduplicate by key.
-- [ ] Truncate the WAL periodically — or delete the WAL entirely, see below.
-- [ ] Bound the keepalive drain and log a failed release loudly.
+The anomaly list is deduplicated by type and key and capped at 1000; the WAL is
+gone (below); and a lock's keepalive stream is cancelled by `ReleaseLock`, so a
+failed revoke leaves the lease to expire rather than being renewed forever, and
+the drain goroutine ends with it.
 
 ## 21. Backoff sleeps ignore context cancellation — CLOSED
 
@@ -268,9 +255,8 @@ of every extent in the filesystem, on the write path.
 ## 29. Each write costs a flush, a sync, a full readback, and an fsync
 
 `handleWriteBlock` does `FlushDevice`, `SyncRange`, and reads the whole written
-range back to discard it (`datapath.go:131`, `:145`, `:152`), and the WAL
-append fsyncs (`walgo/wal.go:58`). Four device round trips per write, three of
-them on the critical path.
+range back to discard it. Three device round trips per write, all on the
+critical path. (A fourth, the WAL fsync, went with the WAL.)
 
 The readback's purpose is documented — making the write visible to other
 Multi-Attach attachers — but doing it per write, at full length, is the
@@ -282,23 +268,12 @@ expensive way to get it.
 
 # SIMPLIFICATION
 
-## 30. Does the WAL earn its place?
+## 30. Does the WAL earn its place? — CLOSED
 
-The WAL's stated job is to free blocks that were allocated and written but
-never committed to etcd. Arena reconstruction already achieves that: `Reconstruct`
-(`allocator.go:205`) rebuilds each bitmap from the live extents in etcd, so any
-block no extent references is free again after a restart, whether or not the
-WAL recorded it.
-
-That makes `pkg/walgo` — 108 lines, an fsync on every write, and unbounded
-growth — a candidate for deletion rather than for the truncation and checksums
-`docs/architecture/storage/write-ahead-log.md` lists as future work.
-
-Two smaller problems if it stays: `Replay` ignores read errors and treats any
-short read as end-of-file (`wal.go:72`), and `writeEntry` allocates 49 bytes to
-write 41.
-
-- [ ] Decide: delete it, or give it a job reconstruction cannot do.
+Deleted. `Reconstruct` rebuilds each arena bitmap from the live extents in
+etcd, so a block no extent references is free after a restart whether or not
+anything recorded it — which was the WAL's only job. Its removal takes an fsync
+off every write.
 
 ## 31. Two implementations of the same consistency checks
 

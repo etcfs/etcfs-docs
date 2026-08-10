@@ -91,3 +91,18 @@ selects `OpenBuffered` for unshared devices. Detecting "is this device shared?"
 from configuration was the alternative, but none of the existing flags actually
 answer it — `--volume-id` is set on single-node runs too — so the safe default
 plus an explicit opt-out is the honest version.
+
+## The write-ahead log was deleted rather than fixed
+
+Its stated job was returning blocks that were allocated and written but never
+committed. `Reconstruct` already does that from the live extents in etcd, which
+have to be correct anyway, so the log was a second source of truth costing an
+fsync per write and growing without bound. Truncation and checksums would have
+made a redundant mechanism cheaper, not necessary.
+
+## A lock's keepalive is cancelled by the release, not by the revoke
+
+`ReleaseLock` cancels the stream's context before revoking. Relying on the
+revoke to end the stream made a failed revoke unrecoverable: renewals continued,
+so the lock was held until the process exited and the drain goroutine leaked
+with it. Cancelling first degrades a failed revoke to "expires at its TTL".

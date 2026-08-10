@@ -170,11 +170,9 @@ The C daemon creates a fresh FUSE session. The kernel assigns a new mount point.
 
 The Go daemon has no in-memory inode cache at startup (the cache was lost in the process death). The first LOOKUP for each path fetches from etcd. The cache warms up over time as the OS workload accesses files.
 
-### 5. WAL Replay (if applicable)
+### 5. Arena Reconstruction
 
-If the block device was in use and the WAL file exists, it is replayed to reconcile in-flight writes:
-- Committed entries: the extent is in etcd, nothing to do.
-- Uncommitted entries: the data was written to the block device but never committed to etcd. The blocks are returned to the arena free-list.
+If a block device is configured, each arena this node owns has its bitmap rebuilt from the live extents in etcd. Blocks reserved by a write that never committed are free again afterwards, which is what makes an unclean shutdown cost nothing but the bytes already on the device.
 
 ### 6. File System Check
 
@@ -193,7 +191,6 @@ After a crash, the following state is reconstructed from durable storage:
 | Membership | etcd (`membership:<node_id>`) | Re-created at startup |
 | Fencing generation | etcd (`gen:<node_id>`) | Read on demand via GetGeneration |
 | Arena ownership | etcd (`arena:<node_id>/<arena_id>`) | Read at startup by the allocator |
-| WAL | Local file | Replayed at startup |
 | Inode number counter | etcd (`inode_alloc_counter`) | Read on first allocation (CAS) |
 
 The key insight is that the etcd cluster holds all durable metadata except the block device content. Crash recovery is primarily about reconnecting to etcd and re-reading the current state, not about replaying a journal or repairing a filesystem.
@@ -230,7 +227,7 @@ Data Write:
     → IPC: op WRITE, ino=42, offset=0, data_len=4096, [data bytes]
     → Go: GetInode(42) → current size=0
     → metadata update: size=4096, Put(inode:42, update_size)
-    → data path: reserve arena block, WAL append, pwrite+fsync, etcd commit, mark committed
+    → data path: reserve arena blocks, pwrite+fsync, etcd commit, reclaim what the write buried
     → Go: return write response with written=4096
     → C: fuse_reply_write(req, 4096)
     → kernel: write acknowledged

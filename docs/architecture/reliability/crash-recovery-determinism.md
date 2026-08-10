@@ -47,7 +47,7 @@ After the crash recovery completes, the simulator is ready for further operation
 
 ## Store Replay
 
-Store replay is the MockStore's equivalent of reading metadata from etcd on startup. The simulator does not maintain a write-ahead log (WAL) — the WAL is a C-side concept for block device I/O ordering. Store replay reconstructs the metadata layer's view of the world.
+Store replay is the MockStore's equivalent of reading metadata from etcd on startup. The simulator has no block device to reconcile. Store replay reconstructs the metadata layer's view of the world.
 
 ### What Survives a Crash
 

@@ -98,7 +98,7 @@ The replay correctly handles:
 - Dirents that point to inodes that were deleted (if the crash occurred between the dirent delete and the inode delete).
 - Lock keys that survived the crash.
 
-The simulator does **not** simulate the WAL replay. The local write-ahead log is a C-side facility that does not exist in the Go harness.
+The simulator does **not** simulate arena reconstruction: it has no block device, so there are no bitmaps to rebuild.
 
 ## Deterministic Replay
 

@@ -113,7 +113,7 @@ The guard is NOT needed for:
 
 When a generation guard fails, the transaction returns `false` (the success path was not executed). The caller receives an error with context about the generation mismatch. The typical response is:
 
-- **For extent writes:** The write data is already on the block device, but the metadata commit failed. The data becomes an orphaned extent. The WAL replay on the next restart (if the node is still alive) discovers the uncommitted write and returns the blocks to the arena free-list.
+- **For extent writes:** The write data is already on the block device, but the metadata commit failed. The data becomes an orphaned extent. Arena reconstruction at the next restart rebuilds the bitmap from the committed extents, which returns those blocks to the free-list.
 
 - **For lock acquisitions:** The guarding node retries with an exponential backoff. If the generation was bumped by a concurrent fence, the retry will re-read the new generation and include it in the guard, allowing the transaction to succeed.
 

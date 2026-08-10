@@ -4,6 +4,6 @@ A cluster filesystem where **etcd/Raft is the only source of durable truth**, an
 
 Sections:
 
-- **Architecture** — one page per subsystem: FUSE dispatch, metadata schema, locking, block I/O, arenas, WAL, fencing, scrubbing, elasticity, crash recovery.
+- **Architecture** — one page per subsystem: FUSE dispatch, metadata schema, locking, block I/O, arenas, fencing, scrubbing, elasticity, crash recovery.
 - **Chaos Reports** — results from running the fault-injection harness against real AWS infrastructure.
 - **Research** — background research on etcd/Raft, VFS/FUSE internals, and cluster filesystem prior art that informed the design.

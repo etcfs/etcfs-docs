@@ -12,7 +12,6 @@ The raw block device access layer that performs reads and writes against the sha
 - [Buffer Management](#buffer-management)
 - [Go Block I/O Library](#go-block-io-library)
 - [Interaction with the Arena Allocator](#interaction-with-the-arena-allocator)
-- [Interaction with the Write-Ahead Log](#interaction-with-the-write-ahead-log)
 
 ## Architecture
 
@@ -147,10 +146,9 @@ The sync is called as part of the data-then-metadata ordering protocol:
 
 1. Write data to the block device (O_DIRECT pwrite).
 2. Fsync the written extent range (sync_file_range).
-3. Append to the write-ahead log (WAL).
-4. Commit the extent to etcd.
+3. Commit the extent to etcd.
 
-The fsync (step 2) guarantees that the data is durable on the block device before the metadata (step 4) is committed to etcd. If the node crashes between step 2 and step 4, the data is orphaned (on disk but not in etcd) but not lost — the WAL replay on restart discovers the orphan.
+The fsync guarantees that the data is durable on the block device before the metadata is committed to etcd. If the node crashes in between, the bytes are orphaned — on disk, referenced by nothing — and the blocks behind them come back when arena reconstruction rebuilds the bitmap from the committed extents at the next startup.
 
 ## io_uring (Planned)
 
@@ -182,14 +180,3 @@ The block device I/O substrate does not know about arenas. It reads and writes a
 - Freed blocks (from truncation) are returned to the arena free-list.
 
 The substrate enforces the device capacity limit but not the arena boundary. Arena boundary enforcement is the arena allocator's responsibility.
-
-## Interaction with the Write-Ahead Log
-
-The WAL sits between the block device I/O substrate and the metadata layer:
-
-1. The substrate writes data to the block device and fsyncs.
-2. Before committing the extent to etcd, the WAL records an uncommitted entry.
-3. The extent is committed to etcd.
-4. The WAL entry is marked committed.
-
-The WAL file path is independent of the block device path. It is a local filesystem file (e.g., `/var/lib/etcfuse/wal`), not a block device. The WAL does not use O_DIRECT — it is a small, append-only log of core metadata that benefits from the kernel page cache.
