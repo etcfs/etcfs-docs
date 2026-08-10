@@ -281,24 +281,10 @@ even though `metadata.MetadataStore` exists as an interface and `pkg/scrub` and
       does, and take it as an interface. That closes the concurrent-inode-
       allocation coverage gap as a side effect rather than as its own project.
 
-## 33. Stale comments that describe a system that no longer exists
+## 33. Stale comments that describe a system that no longer exists — CLOSED
 
-- `cmd/etcfuse-meta/main.go:4` — "runs a gRPC server on a Unix domain socket".
-  There is no gRPC anywhere in the wire path.
-- `pkg/fencing/watchdog.go:112` — "The gRPC server will detect the cancelled
-  context". Same.
-- `internal/ipc/service.go:7` — "Phase 2: read-only FUSE ops".
-- `handlers.go:198`, `socket.go:277`, `lock.go:141`, `handlers.go:475` — four
-  more references to implementation phases, matching the ones just removed from
-  the architecture docs.
-- `main.go:204` — the startup warning still describes GETLK and SETLK returning
-  "always free / always granted"; those handlers were deleted. The warning's
-  conclusion (node-local enforcement only) is still correct, the mechanism
-  described is not.
-- `metadata/dirent.go:314` — `func init() { _ = timeNow }`, guarding an import
-  that four functions in the same file already use.
-
-- [ ] Fix as encountered; none of these is worth its own commit.
+The gRPC references, the phase markers and the GETLK/SETLK startup warning now
+describe what the code does; `dirent.go`'s no-op `init` is gone.
 
 ## 34. Duplication in the C daemon
 
