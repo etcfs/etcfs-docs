@@ -129,11 +129,17 @@ posture would have to be decided before the mechanism means anything.
 
 ## Verification runs so far
 
-The docker chaos suites are the regression gate used during this work:
-single-cluster scenarios (7/7), arena reclamation (6/6) and a 240 s randomized
-fuzz run (19.6k ops, 8 injected faults) all pass on the current tree. Two real
-bugs came out of them — a read that never reported EOF, and extents stamped one
-generation ahead of their writer.
+The docker chaos suites are the regression gate used during this work, and all
+pass on the current tree: single-cluster scenarios 7/7, arena reclamation 6/6,
+arena collision 3/3, elastic scale 12/12, concurrent scale-out 9/9,
+fault-injection during join/leave 20/20, fencing reconciliation retry 10/10,
+namespace fencing guard 21/21, and a randomized fuzz run (28k ops, 13 injected
+faults) with no monotonic growth in memory, fd count or etcd DB size.
+
+Three real bugs came out of them — a read that never reported EOF, extents
+stamped one generation ahead of their writer, and etcd running without
+compaction — along with several harness assertions that had drifted from the
+system they were checking.
 
 AWS runs were **not** performed: `scripts/infra/create-infra.sh` provisions
 billable instances and a Multi-Attach volume, which is not something to leave
