@@ -100,7 +100,9 @@ The delete is conditioned on the key still existing, so when several nodes reach
 
 A freed arena is not necessarily an empty one. An arena released because its owner emptied it holds nothing, but one released by a departing or fenced node still holds whatever extents its files have, and the claimer cannot tell the two apart. A node that claims a recycled arena therefore rebuilds the arena's bitmap from the live extents in etcd (the same scan `Reconstruct` performs at startup) before allocating from it; a brand-new arena, which no node has ever owned, starts from an all-zero bitmap.
 
-A failed claim is not fatal — the allocator falls through to a new arena, which costs device space but always works. Surfacing an etcd hiccup here as an I/O error on the write that triggered the acquisition would be a worse trade.
+A new arena is refused when it would not fit on the device: an arena's offset is its ID multiplied by the arena size, and nothing else stops that running past the end. The allocator is told the device's size when the block device is attached, and answers `ENOSPC` rather than letting the write fail at the `pwrite` with a short write or `EINVAL`, which would surface as `EIO` — a disk error rather than a full filesystem. A refused ID is not returned to the pool: a device with no room left is stuck for the whole cluster until it grows, and `fsck` reports the unowned ID as an orphaned arena.
+
+A failed claim of a *recycled* arena is not fatal — the allocator falls through to a new arena, which costs device space but always works. Surfacing an etcd hiccup here as an I/O error on the write that triggered the acquisition would be a worse trade.
 
 ### Allocating a New Arena
 

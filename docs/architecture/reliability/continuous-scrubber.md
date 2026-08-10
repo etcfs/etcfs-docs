@@ -114,17 +114,17 @@ That trimming is why the check reads sequence numbers rather than chunk numbers:
 
 ### 4. Range Validity Check
 
-**What it checks:** Every extent's `disk_off + length` falls within the valid arena range. The global arena range is 0 to `maxArena * arenaSize` (default 1024 arenas × 1 GiB = 1 TB).
+**What it checks:** Every extent's `disk_off + length` falls on the device. The bound is the device's real size, as reported when the block device is attached — the same number the allocator refuses to hand out arenas past. The check is skipped entirely when the scrubber has no device size, rather than run against a guessed ceiling; it previously compared against a hardcoded 1 TiB that matched neither the device nor the limit `fsck` used.
 
 **How it works:**
 1. Scan all `extent:*` keys.
 2. Parse each value to extract `disk_off` and `length`.
-3. If `disk_off + length > maxArena * arenaSize`, the extent is out of range.
+3. If `disk_off + length` exceeds the device size, the extent is out of range.
 
 **Resolution:** Alert only. An out-of-range extent means the block device contains data that the filesystem cannot read or write. The only safe action is to restore from backup, unless the extent was placed outside the arena range by a bug that has been fixed and the extent can be relocated manually.
 
 **Likely causes:**
-- Arena allocator overflow (arena ID exceeded the maximum).
+- Arena allocator overflow, on a device that shrank or was replaced by a smaller one.
 - Manual corruption of an extent key's value.
 - Node configured with a different arena size than the rest of the cluster.
 

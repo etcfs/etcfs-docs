@@ -103,27 +103,13 @@ now reports only a stamp *above* that node's current generation — a condition
 the guard makes unreachable. A stamp below it is ordinary data written before
 the node's last fence.
 
-## 15. Nothing ties allocation to the actual size of the device
+## 15. Nothing ties allocation to the actual size of the device — CLOSED
 
-`AcquireArena` takes the next counter value and uses `arenaID * ArenaSizeBytes`
-as the offset (`pkg/arena/allocator.go:66`). Nothing compares that against
-`dev.TotalSize()`. On a device smaller than the arenas handed out, writes fail
-at the `pwrite` with `EINVAL` or a short write, surfacing as `EIO` rather than
-`ENOSPC`.
-
-The two places that do bound the range hardcode a different, unrelated limit:
-`maxArena = 1024` in `scrubber.go:242` and `maxArenaRange = 1024 * (1 << 30)`
-in `fsck/checker.go:224`.
-
-`handleStatfs` compounds it: with no arenas held, `LiveRatio` returns 1.0
-(`allocator.go:195`) and `df` reports the filesystem full before the first
-write.
-
-- [ ] Give the allocator the device size and refuse an arena past the end,
-      returning `ENOSPC`.
-- [ ] Derive the scrubber's and fsck's range checks from that same number
-      instead of two hardcoded copies.
-- [ ] Return 0.0, not 1.0, from `LiveRatio` when no arena is held.
+The allocator is given the device size and refuses an arena past the end with
+`ENOSPC`. The scrubber's range check uses that same number and is skipped when
+it has none; `fsck` takes it as a field and skips both range checks without
+one. `LiveRatio` reports 0.0 with no arenas held, so `df` no longer shows a
+fresh mount as full.
 
 ## 16. O_DIRECT silently degrades to a buffered open
 
