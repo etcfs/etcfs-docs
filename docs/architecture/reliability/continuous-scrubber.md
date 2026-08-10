@@ -55,7 +55,7 @@ The scrubber runs as a background goroutine within the Go daemon (etcfuse-meta).
 
 ### 1. Extent Collision Detection
 
-**What it checks:** No two inodes claim the same `disk_off` on the block device. An extent collision means two files think they own the same disk blocks — writing to one will corrupt the other.
+**What it checks:** No two extents' device ranges overlap. An extent collision means two files think they own the same disk blocks — writing to one will corrupt the other. Overlap, not an identical starting offset: comparing `disk_off` for equality, as this check originally did, missed every partial overlap, which is the same corruption one byte over.
 
 **How it works:**
 1. Scan all `extent:*` keys from etcd using a prefix scan.
@@ -192,7 +192,7 @@ t10: Log summary (clean or per-type anomaly counts)
 t11: Sleep until next interval
 ```
 
-The checks are sequential and read-only. They use `GetPrefix` for bulk scans, which is efficient for etcd's B-tree index. The scan results are snapshots at a point-in-time — concurrent mutations during the pass may cause transient inconsistencies that are detected and reported. Most such transient anomalies are benign (e.g., an inode created between the extent scan and the inode scan), and the next pass will not report them.
+The checks are sequential and read-only, and they share one snapshot: `Scan` reads the extent, inode, dirent and generation key spaces once at the start of the pass, and every check works from that. Each check used to scan for itself, so a pass read the whole extent space five times and the inode space twice, and the orphan check additionally issued one `Get` per extent to ask a question the inode scan already answered. The scan results are snapshots at a point-in-time — concurrent mutations during the pass may cause transient inconsistencies that are detected and reported. Most such transient anomalies are benign (e.g., an inode created between the extent scan and the inode scan), and the next pass will not report them.
 
 The scrubber stores all anomalies in an in-memory slice. Anomalies persist across passes until the scrubber is restarted or the anomalies are cleared by a separate call (planned). The `Anomalies()` method returns a copy of the current anomaly list for external querying.
 

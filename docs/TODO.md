@@ -200,22 +200,12 @@ count is then compared against a hardcoded 1,000,000 ceiling (`:180`).
 - [ ] Maintain a counter, or accept a stale count from the scrubber's pass,
       which already scans the same prefix.
 
-## 27. The scrubber makes four redundant full-filesystem scans and an N+1
+## 27. The scrubber makes four redundant full-filesystem scans and an N+1 — CLOSED
 
-`RunScrubPass` calls five checks that each independently `GetPrefix(PrefixExtent)`
-— collisions, orphans, dead, range, generation — so every 30 seconds the whole
-extent space is read five times, and the inode space twice. `CheckOrphanExtents`
-also issues one `Get` per extent to test whether its inode exists, which
-`CheckDeadExtents` already answers from a single prefix scan.
-
-- [ ] Scan once per pass and pass the result to each check.
-- [ ] Replace the per-extent `Get` with one `GetPrefix(PrefixInode)` into a set,
-      the way `CheckDeadExtents` already does. The two checks then share one
-      pair of scans and could merge outright — both answer "can anything still
-      read this extent?", one via the inode's existence and one via its size.
-- [ ] While there: `CheckExtentCollisions` (`:187`) compares `DiskOff` for exact
-      equality, so two extents that overlap at different offsets — the actual
-      invariant — are not detected.
+`Scan` reads the extent, inode, dirent and generation spaces once per pass and
+every check takes that `Snapshot`, which also removes the per-extent `Get`.
+`CheckExtentCollisions` compares overlapping device ranges rather than equal
+offsets, so a partial overlap is no longer missed.
 
 ## 28. Block allocation is a linear bit scan under one global lock
 
