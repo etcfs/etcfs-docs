@@ -136,6 +136,10 @@ fault-injection during join/leave 20/20, fencing reconciliation retry 10/10,
 namespace fencing guard 21/21, and a randomized fuzz run (28k ops, 13 injected
 faults) with no monotonic growth in memory, fd count or etcd DB size.
 
+An hour-scale fuzz run (279k ops, 158 injected faults) showed RSS settling at
+~40 MB and staying there, a flat fd count, and etcd's store flat at 15.4 MB once
+compaction began — which is also the evidence that the compaction setting works.
+
 Three real bugs came out of them — a read that never reported EOF, extents
 stamped one generation ahead of their writer, and etcd running without
 compaction — along with several harness assertions that had drifted from the
