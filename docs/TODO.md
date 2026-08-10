@@ -111,23 +111,11 @@ it has none; `fsck` takes it as a field and skips both range checks without
 one. `LiveRatio` reports 0.0 with no arenas held, so `df` no longer shows a
 fresh mount as full.
 
-## 16. O_DIRECT silently degrades to a buffered open
+## 16. O_DIRECT silently degrades to a buffered open — CLOSED
 
-`blockio.Open` (`pkg/blockio/device.go:27`) tries `O_RDWR|O_DIRECT` and, on any
-failure, retries without `O_DIRECT` and continues with `direct = false`.
-
-On a shared Multi-Attach volume that is not a fallback, it is a correctness
-change: buffered writes land in this node's page cache, and the readback in
-`handleWriteBlock` is served from that same cache, so the round trip that is
-supposed to make the write visible to other attachers proves nothing. Both
-nodes then believe they have consistent views of bytes only one of them has.
-
-`main.go:164` logs `direct_io` in the "block device opened" line, which is the
-only signal, and it reads as informational.
-
-- [ ] Fail the open when `O_DIRECT` is unavailable and a shared device is
-      configured. Keep the fallback only for the single-node and file-backed
-      test paths, and log it at warning level there.
+`blockio.Open` now fails when `O_DIRECT` is unavailable. `OpenBuffered`, behind
+`--allow-buffered-io`, keeps the fallback for single-node and file-backed test
+paths, and the daemon warns loudly when it is in use.
 
 ## 17. A write landing strictly inside an extent reclaims nothing — CLOSED
 

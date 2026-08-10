@@ -83,3 +83,11 @@ It does not make "stamped below the current generation" meaningful, though:
 that describes every extent written before that node's last fence. The only
 invariant worth checking is the one the guard enforces — no extent above its
 writer's current generation — so that is what the check reports.
+
+## Buffered device I/O is opt-in, not a fallback
+
+`blockio.Open` fails when `O_DIRECT` is unavailable; `--allow-buffered-io`
+selects `OpenBuffered` for unshared devices. Detecting "is this device shared?"
+from configuration was the alternative, but none of the existing flags actually
+answer it — `--volume-id` is set on single-node runs too — so the safe default
+plus an explicit opt-out is the honest version.
