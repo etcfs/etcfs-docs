@@ -131,16 +131,11 @@ share a key space, and cleanup is one prefix delete.
 
 # HARDENING
 
-## 19. The self-fence window and the request timeout are not checked against each other
+## 19. The self-fence window and the request timeout are not checked against each other — CLOSED
 
-`requestTimeout` is 10s (`internal/ipc/retry.go:35`) and its comment states the
-constraint: it must sit below the self-fencing window, which is 2-3× the
-membership lease TTL. Nothing enforces that. `--lease-ttl=3s` inverts it — the
-daemon exits before the request deadline can fire — and `Parse`
-(`internal/config/config.go:111`) accepts it.
-
-- [ ] Reject a lease TTL below `requestTimeout` at startup, or derive
-      `requestTimeout` from the TTL instead of hardcoding it.
+`requestTimeout` moved to `internal/config` as `RequestTimeout`, and `Parse`
+rejects a lease TTL whose self-fencing window (`2x TTL`, shared with the
+watchdog) does not clear it.
 
 ## 20. Unbounded growth in three background paths
 
@@ -162,14 +157,10 @@ they are worth fixing before spending the run.
 - [ ] Truncate the WAL periodically — or delete the WAL entirely, see below.
 - [ ] Bound the keepalive drain and log a failed release loudly.
 
-## 21. Backoff sleeps ignore context cancellation
+## 21. Backoff sleeps ignore context cancellation — CLOSED
 
-`retry` (`retry.go:54`) and `NextCounter` (`metadata/alloc.go:66`) both call
-`time.Sleep` between attempts. A request whose context is already cancelled
-still sits out the full backoff — up to ~2s in `NextCounter`'s case — before
-noticing.
-
-- [ ] `select` on `ctx.Done()` alongside the timer.
+Both `retry` and `NextCounter` now select on `ctx.Done()` alongside the timer,
+so a request whose deadline has passed stops instead of sitting out the delay.
 
 ## 22. Control-plane sockets live in `/tmp` with a permissions window
 

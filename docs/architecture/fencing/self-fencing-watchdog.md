@@ -61,7 +61,7 @@ The polling interval is set to the lease TTL (configurable, default 5 seconds). 
 
 ### The Two-TTL Margin
 
-The watchdog does not trigger self-fence immediately when `IsAlive()` returns false. Instead, it waits for **2 × lease TTL** of confirmed lease death. This margin prevents false positives from transient network blips:
+The watchdog does not trigger self-fence immediately when `IsAlive()` returns false. Instead, it waits for **2 × lease TTL** of confirmed lease death — `config.SelfFenceWindow`, which the daemon also uses at startup to reject a lease TTL whose window would close before a stalled request's own 10 s deadline could fire. This margin prevents false positives from transient network blips:
 
 - **First TTL gap:** The keepalive stream is lost (network hiccup, etcd leader election). The lease TTL counter starts ticking down.
 - **Second TTL gap:** If the stream hasn't re-established within one full TTL, the lease is now past its expiry point in etcd. The etcd cluster will have deleted the membership key. The watchdog waits one more TTL to confirm the condition is persistent.
