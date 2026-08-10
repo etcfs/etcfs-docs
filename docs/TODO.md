@@ -244,31 +244,24 @@ constants elsewhere.
 - [ ] One check library, two front ends: the offline `fsck` run and the online
       scrubber pass.
 
-## 32. `ipc.Service` cannot be tested against `MockStore`
+## 32. `ipc.Service` cannot be tested against `MockStore` — CLOSED, not done
 
-`Service` holds `*metadata.Store` concretely (`internal/ipc/service.go:26`),
-even though `metadata.MetadataStore` exists as an interface and `pkg/scrub` and
-`pkg/fsck` both take narrow interfaces of their own. This is the reason
-`NextCounter` is unreachable from the harness — the open item below.
-
-- [ ] Declare the slice of the store the IPC handlers use, the way the scrubber
-      does, and take it as an interface. That closes the concurrent-inode-
-      allocation coverage gap as a side effect rather than as its own project.
+Decided against. The slice of the store the IPC handlers use is essentially the
+whole store — every namespace transaction, the extent and lock APIs, the
+counters and the guard — so the interface would have one implementation and one
+consumer, and would buy only the ability to reach `NextCounter` from the
+harness. That is covered at the integration tier instead (item 35).
 
 ## 33. Stale comments that describe a system that no longer exists — CLOSED
 
 The gRPC references, the phase markers and the GETLK/SETLK startup warning now
 describe what the code does; `dirent.go`'s no-op `init` is gone.
 
-## 34. Duplication in the C daemon
+## 34. Duplication in the C daemon — CLOSED
 
-The `rb_*` response readers (`ops.c:121`) advance through the buffer with no
-reference to `rlen`, so a short response reads past the allocation. The Go side
-always sends fixed-width blocks, which is why it holds — but it is the same
-class of assumption that the `readdirplus` desync broke.
-
-- [x] One socket layer: the duplicate in `pool.c` went with the file.
-- [ ] Pass `rlen` to the readers and fail the request on a short response.
+The duplicate socket layer went with `pool.c`. The response readers are now a
+cursor (`struct rbuf`) carrying the response length, so a short response is an
+`EIO` on that request rather than a read past the allocation.
 
 # OPEN QUESTIONS
 
@@ -287,15 +280,12 @@ class of assumption that the `readdirplus` desync broke.
 
 # STILL OPEN FROM BEFORE
 
-## 35. Concurrent inode allocation has no harness coverage
+## 35. Concurrent inode allocation has no harness coverage — CLOSED, accepted
 
-`Store.NextCounter` isn't reachable from `MockStore`. Covered only at the
-integration tier (`TestIntegration_CounterIsUniqueUnderConcurrency`) and by
-`chaos-elastic-concurrent.sh`'s 20-way concurrent create.
-
-- [ ] Give `MockStore` an interface it can satisfy, or accept this belongs at
-      the integration tier only. See the `ipc.Service` item above — the same
-      change closes both.
+Accepted as integration-tier coverage: `TestIntegration_CounterIsUniqueUnderConcurrency`
+and `chaos-elastic-concurrent.sh`'s 20-way concurrent create. Every integration
+test now runs in its own etcd key space, so that tier is reliable enough to
+carry it. See item 32 for why the harness route was dropped.
 
 # MAYBE IN THE FUTURE
 

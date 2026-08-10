@@ -106,3 +106,10 @@ made a redundant mechanism cheaper, not necessary.
 revoke to end the stream made a failed revoke unrecoverable: renewals continued,
 so the lock was held until the process exited and the drain goroutine leaked
 with it. Cancelling first degrades a failed revoke to "expires at its TTL".
+
+## ipc.Service keeps its concrete store
+
+The interface it would need is the whole store surface, with one implementation
+and one consumer — an abstraction that buys only harness reach into
+`NextCounter`. Concurrent inode allocation stays covered at the integration
+tier, which is now reliable because every test has its own etcd key space.
