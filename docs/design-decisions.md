@@ -37,3 +37,14 @@ read-modify-write of the parent inode, which serialises concurrent creates in
 one directory for nothing. etcd compares `CreateRevision == 0` over a whole
 range, and an empty range is vacuously true, so emptiness is decidable inside
 the transaction with no extra state at all.
+
+## Integration tests are isolated by etcd namespace, not by serialised runs
+
+*Options:* (a) run the suites with `-p 1` and wipe the store in `TestMain`,
+(b) namespace every test's keys.
+
+*Chosen:* (b), via the `namespace` wrapper already shipped with the etcd
+client. (a) leaves the suites sharing a key space, so it only holds while
+nobody adds a `t.Parallel`, and it serialises runs that have no reason to be
+serial. Namespacing makes the isolation a property of the client rather than of
+how the test is invoked.

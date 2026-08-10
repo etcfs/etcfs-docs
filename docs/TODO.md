@@ -202,21 +202,11 @@ Ordering moved from the key into a sequence field in the extent value, which
 makes a middle split safe: head and tail keep the parent's sequence. A covered
 region smaller than one block is still unreclaimed until its extent dies.
 
-## 18. Integration suites clobber each other on a shared etcd
+## 18. Integration suites clobber each other on a shared etcd — CLOSED
 
-`pkg/arena`, `pkg/metadata` and `pkg/scrub` all carry `//go:build integration`
-tests that hit one etcd at `ETCD_ENDPOINTS`, with no key namespacing and no
-cleanup between suites. `go test -tags=integration ./...` runs the three package
-binaries in parallel, so they delete and recreate each other's inodes: observed
-as `TestGuard_FencedNodeLeavesStateIntact` failing on a missing inode, and a
-scrub test finding its extents already reclaimed as orphans.
-
-Each suite passes on its own against a clean store, which is what the per-package
-invocation in each file's header comment prescribes — but nothing enforces it,
-and the failure reads as a product bug rather than a harness one.
-
-- [ ] Namespace every integration test's keys by test name, or make the suites
-      run under `-p 1` with a store wipe in `TestMain`.
+`test/etcdtest.Client` wraps every test's client in an etcd namespace named
+after the test, so no two tests — in one package or across parallel binaries —
+share a key space, and cleanup is one prefix delete.
 
 # HARDENING
 
