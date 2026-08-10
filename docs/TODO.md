@@ -59,6 +59,13 @@ correctness problem; nothing is.
 33. **Stale comments** — CLOSED.
 34. **Duplication in the C daemon** — CLOSED. Duplicate socket layer went with `pool.c`; response readers are a bounded cursor.
 
+# FOUND WHILE CLOSING THE ABOVE
+
+39. **A read never reported EOF** — CLOSED. Reads answer the whole requested range, so one past the end returned a buffer of zeroes; `cat` on a 7-byte file produced hundreds of megabytes. Clamped to the inode size.
+40. **Extents were stamped one generation ahead of their writer** — CLOSED. `writeGeneration` floored at 1 for a never-fenced node, which the scrubber's generation check correctly reported as impossible.
+41. **etcd kept every revision forever** — CLOSED. Revision-based auto-compaction and an 8 GiB quota in all three deployments; the fencing watch restarts from the current revision when its resume point has been compacted.
+42. **Chaos harness left added nodes behind** — CLOSED. Teardown removes them, so the next run's `member add` does not fail with "Peer URLs already exists". Its arena assertion also still expected the pre-split `arena:<node>` key.
+
 # OPEN QUESTIONS
 
 - **Does a fenced node un-fence itself by restarting?** ANSWERED — yes, by design; see `docs/architecture/fencing/fencing-generation-protocol.md`.
