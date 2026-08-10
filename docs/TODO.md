@@ -1,322 +1,73 @@
 # TODO
 
-Closed items stay, marked **CLOSED** with a line on how they were resolved —
-the list is meant to show what was settled as well as what is left. The full
-story lives in git log, `docs/chaos-reports/`, and the architecture docs each
-item touched. This is a tracking doc, not a design doc — for the "why", follow
-the links.
+Closed items stay, marked **CLOSED** with a one-line note on how they were
+settled. The full story lives in git log, `docs/design-decisions.md`, and the
+architecture docs each item touched. This is a tracking list, not a design doc.
 
-Ordered by severity, not by area. Everything still open above "Hardening" is a
-live correctness problem on the default configuration; items marked CLOSED are
-kept for the record.
+Ordered by severity. Everything still open above "Hardening" would be a live
+correctness problem; nothing is.
 
 # BLOCKING — silent data loss or corruption
 
-## 1. The compactor repointed extents at data it never copied — CLOSED
-
-`pkg/compaction` deleted outright: an extent-based file needs no contiguity, so
-multi-run allocation plus background arena reclamation replaced it.
-
-## 2. Overwriting a byte range returned the old or the new bytes at random — CLOSED
-
-Extents carry a sequence number and order by offset then descending sequence;
-buried extents are reclaimed at commit, and `CheckDeadExtents` covers the
-cross-node remainder.
-
-## 3. `rename` over an existing file orphans the target's inode — CLOSED
-
-`AtomicRename` replaces the target as an unlink, pinned on its `ModRevision`,
-and validates the move (subtree, type, non-empty directory) with distinct
-errnos.
-
-## 4. `CreateInode` gives every inode it creates `nlink = 0` — CLOSED
-
-`metadata.InitialNlink(mode)` is the single definition; the nlink checkers
-assert the fixed count for directories instead of counting dirents.
-
-## 5. Shared locks never share — CLOSED
-
-Key per holder with the mode in the key: `lock:<ino>/<mode>/<lease_id>`, so
-conflict is a range comparison inside the transaction and no lock value is
-parsed.
-
-## 6. `nlink` increment and decrement can lose updates — CLOSED
-
-Every read-modify-write of an inode is pinned to the revision it was read at
-(`InodeUnchanged`), with jittered context-aware backoff on the retry.
+1. **Compactor repointed extents at data it never copied** — CLOSED. `pkg/compaction` deleted; multi-run allocation and arena reclamation replaced it.
+2. **Overwrite returned old or new bytes at random** — CLOSED. Extents carry a sequence number; buried extents reclaimed at commit, the rest by `CheckDeadExtents`.
+3. **`rename` over an existing file orphaned the target's inode** — CLOSED. `AtomicRename` replaces the target as an unlink, pinned on its revision, with the POSIX checks and distinct errnos.
+4. **`CreateInode` gave every inode `nlink = 0`** — CLOSED. `metadata.InitialNlink(mode)` is the single definition.
+5. **Shared locks never shared** — CLOSED. Key per holder, mode in the key; conflict decided by a range comparison inside the transaction.
+6. **`nlink` updates could be lost** — CLOSED. Every read-modify-write of an inode is pinned to the revision it was read at, with jittered backoff.
 
 # SHOULD FIX — correctness gaps
 
-## 7. `chmod`, `chown`, `utimens` and growing truncate silently do nothing — CLOSED
-
-Every settable attribute is on the wire and applied under the kernel's `to_set`
-mask, with the stored type bits preserved. Fixed the sparse read path along the
-way: gaps now fill offset-relative over a zeroed buffer.
-
-## 8. Every file is owned by uid 1000 — CLOSED
-
-Caller `uid`/`gid`/`umask` carried on every creating operation; enforcement is
-the kernel's via `-o default_permissions`. Also bounded every name and symlink
-target in the C handlers (`ENAMETOOLONG`) — two of them overran their buffers.
-
-## 9. `symlink`, `link` and `mknod` are not atomic — CLOSED
-
-One transaction each: `AtomicCreateSymlink`, `AtomicCreateNode`, `AtomicLink`
-(which also refuses a hard link to a directory with `EPERM`). The scrubber and
-`fsck` now report an inode no dirent names.
-
-## 10. `rmdir`'s empty-directory check is a separate round trip — CLOSED
-
-`AtomicRmdir` asserts emptiness inside the transaction with a range comparison
-(`CreateRevision == 0` over `dirent:<ino>/`), so no counter is needed. The same
-comparison guards a rename replacing an empty directory. Two leaks turned up
-alongside: a replaced or unlinked symlink left its target key behind, and a
-directory removed by rename was decremented rather than deleted.
-
-## 11. A malformed IPC frame takes down the whole metadata daemon — CLOSED
-
-A checked `reader` over the payload replaced every unchecked slice, so a short
-or over-long field is `EINVAL` rather than a panic; `safeDispatch` recovers
-anything else into one failed request; and both sides of the socket cap a frame
-at 1 MiB before allocating for it.
-
-## 12. A membership deletion missed during a watch reconnect is never fenced — CLOSED
-
-The watch resumes from the revision after the last observed event, and the
-sweep is authoritative: it compares known nodes (`gen:` keys) against live
-membership and fences what is missing, using a `fence_done:<node>` mark —
-cleared when the node re-registers — to tell "already fenced" from "still
-owed".
-
-## 13. Dead and broken metadata APIs — CLOSED
-
-Deleted `UpdateInode`, `DecrementNlink`, `DeleteInode`, `EnsureGeneration`,
-`AtomicRmRf` and `ListDirentsPaginated`, the last two of which were also wrong.
-`IncrementNlink` went with them once `AtomicLink` replaced it. `AppendExtent`
-stays: it has no production caller but is the fixture every scrub and arena
-test plants extents with.
-
-## 14. The generation scrub check flags every healthy node after any fence — CLOSED
-
-The extent value carries the writer's node ID as a sixth field, and the check
-now reports only a stamp *above* that node's current generation — a condition
-the guard makes unreachable. A stamp below it is ordinary data written before
-the node's last fence.
-
-## 15. Nothing ties allocation to the actual size of the device — CLOSED
-
-The allocator is given the device size and refuses an arena past the end with
-`ENOSPC`. The scrubber's range check uses that same number and is skipped when
-it has none; `fsck` takes it as a field and skips both range checks without
-one. `LiveRatio` reports 0.0 with no arenas held, so `df` no longer shows a
-fresh mount as full.
-
-## 16. O_DIRECT silently degrades to a buffered open — CLOSED
-
-`blockio.Open` now fails when `O_DIRECT` is unavailable. `OpenBuffered`, behind
-`--allow-buffered-io`, keeps the fallback for single-node and file-backed test
-paths, and the daemon warns loudly when it is in use.
-
-## 17. A write landing strictly inside an extent reclaims nothing — CLOSED
-
-Ordering moved from the key into a sequence field in the extent value, which
-makes a middle split safe: head and tail keep the parent's sequence. A covered
-region smaller than one block is still unreclaimed until its extent dies.
-
-## 18. Integration suites clobber each other on a shared etcd — CLOSED
-
-`test/etcdtest.Client` wraps every test's client in an etcd namespace named
-after the test, so no two tests — in one package or across parallel binaries —
-share a key space, and cleanup is one prefix delete.
+7. **`chmod`, `chown`, `utimens`, growing truncate did nothing** — CLOSED. Every settable attribute is on the wire and applied under the kernel's mask; sparse reads fixed along the way.
+8. **Every file owned by uid 1000** — CLOSED. Caller uid/gid/umask carried on every create; enforcement is the kernel's via `default_permissions`. Also bounded every name and target in the C handlers.
+9. **`symlink`, `link`, `mknod` were not atomic** — CLOSED. One transaction each; the scrubber and `fsck` report an inode no dirent names.
+10. **`rmdir`'s emptiness check was a separate round trip** — CLOSED. A range comparison over `dirent:<ino>/` inside the transaction. Fixed two leaks alongside: a symlink's target key, and a directory replaced by rename.
+11. **A malformed IPC frame took down the daemon** — CLOSED. Checked payload cursor, `recover` per request, 1 MiB frame cap on both sides.
+12. **A membership delete missed during a watch reconnect was never fenced** — CLOSED. The watch resumes from its last revision and the sweep is authoritative, using a `fence_done:<node>` mark.
+13. **Dead and broken metadata APIs** — CLOSED. Six deleted, `IncrementNlink` with them; `AppendExtent` stays as a test fixture.
+14. **Generation scrub check flagged every healthy node** — CLOSED. Extents record their writer; only a stamp *above* that node's generation is an anomaly.
+15. **Allocation ignored the device size** — CLOSED. `ENOSPC` past the end, the same size used by the scrubber's and fsck's range checks, and `LiveRatio` is 0.0 with no arenas.
+16. **O_DIRECT degraded silently to buffered** — CLOSED. `Open` fails; `OpenBuffered` behind `--allow-buffered-io` for unshared devices.
+17. **A write inside an extent reclaimed nothing** — CLOSED. Ordering moved into the value, so a middle split is safe. Sub-block remainders still wait for the extent to die.
+18. **Integration suites clobbered each other** — CLOSED. `test/etcdtest.Client` gives every test its own etcd namespace.
 
 # HARDENING
 
-## 19. The self-fence window and the request timeout are not checked against each other — CLOSED
-
-`requestTimeout` moved to `internal/config` as `RequestTimeout`, and `Parse`
-rejects a lease TTL whose self-fencing window (`2x TTL`, shared with the
-watchdog) does not clear it.
-
-## 20. Unbounded growth in three background paths — CLOSED
-
-The anomaly list is deduplicated by type and key and capped at 1000; the WAL is
-gone (below); and a lock's keepalive stream is cancelled by `ReleaseLock`, so a
-failed revoke leaves the lease to expire rather than being renewed forever, and
-the drain goroutine ends with it.
-
-## 21. Backoff sleeps ignore context cancellation — CLOSED
-
-Both `retry` and `NextCounter` now select on `ctx.Done()` alongside the timer,
-so a request whose deadline has passed stops instead of sitting out the delay.
-
-## 22. Control-plane sockets live in `/tmp` with a permissions window — CLOSED
-
-Both sockets default to `/run/etcfuse/`, the notify path is a flag on both
-daemons, and `ListenPrivate` creates the directory 0700 and binds under a 0177
-umask instead of chmod-ing afterwards.
-
-## 23. Miscellaneous error handling — CLOSED
-
-The WAL open is gone with the WAL; `StartNotifyServer`'s error is logged; the
-membership heartbeat takes a logger and reports every path it returns on;
-`truncate` returns its failures and `setattr` answers with an errno instead of
-success; and the watchdog closes `Fenced()` for `main` to act on, so a
-self-fenced node still releases its arenas.
+19. **Self-fence window vs request timeout unchecked** — CLOSED. `config.RequestTimeout` and `SelfFenceWindow`; `Parse` rejects a TTL that inverts them.
+20. **Unbounded growth in three background paths** — CLOSED. Anomaly list deduplicated and capped, WAL deleted, keepalive cancelled by the release.
+21. **Backoff sleeps ignored cancellation** — CLOSED. Both select on `ctx.Done()`.
+22. **Control sockets in `/tmp`** — CLOSED. Both under `/run/etcfuse/`, directory 0700, bound under a umask.
+23. **Swallowed errors** — CLOSED. Membership logs its failures, `truncate` returns them, the watchdog signals `main` so a self-fenced node still releases its arenas.
 
 # PERFORMANCE AND SCALE
 
-## 24. The whole filesystem is single-threaded end to end
-
-`fuse_session_loop` plus a synchronous `ipc_sync` on one shared fd means one
-slow etcd operation blocks every other operation on the mount, for up to
-`requestTimeout`.
-
-- [x] Deleted the unreferenced `pool.c`/`pool.h`, and noted the constraint at
-      the `fuse_session_loop` call so the trap is visible from the line someone
-      would change: the fd has no mutex, so `_mt` alone corrupts the protocol.
-- [ ] When it matters: a connection per FUSE worker thread is a smaller change
-      than a response demultiplexer, and the Go side already handles a
-      connection per goroutine.
-
-## 25. `readdir` reads the whole directory and does one `GetInode` per entry — CLOSED
-
-The page starts at the kernel's cookie and stops at its buffer size, and the
-inode records for that page are fetched in one batched transaction
-(`Store.GetMany`) rather than one `Get` each.
-
-## 26. `statfs` scans every inode in the filesystem — CLOSED
-
-The file count comes from the inode allocation counter, an upper bound read in
-one `Get`. Free files are free blocks; the hardcoded 1,000,000 ceiling is gone,
-having never been a limit anything enforced.
-
-## 27. The scrubber makes four redundant full-filesystem scans and an N+1 — CLOSED
-
-`Scan` reads the extent, inode, dirent and generation spaces once per pass and
-every check takes that `Snapshot`, which also removes the per-extent `Get`.
-`CheckExtentCollisions` compares overlapping device ranges rather than equal
-offsets, so a partial overlap is no longer missed.
-
-## 28. Block allocation is a linear bit scan under one global lock — CLOSED
-
-Each arena keeps a rotating start hint, so a search resumes where the last one
-finished and wraps rather than restarting at block 0; a free moves the hint back
-to what it returned. `Free` counts blocks that were already free — a double free
-is two callers believing they own a range — and `DoubleFrees` exposes the count.
-
-Not done, deliberately: reading only the extents in a recycled arena's disk
-range. Extent keys are `extent:<ino>/<chunk>`, so etcd cannot range-scan them by
-device offset, and an index keyed on disk offset would be a second source of
-truth for the allocator to keep consistent. The full scan stays.
-
-## 29. Each write costs a flush, a sync, a full readback, and an fsync
-
-`handleWriteBlock` does `FlushDevice`, `SyncRange`, and reads the whole written
-range back to discard it. Three device round trips per write, all on the
-critical path. (A fourth, the WAL fsync, went with the WAL.)
-
-The readback's purpose is documented — making the write visible to other
-Multi-Attach attachers — but doing it per write, at full length, is the
-expensive way to get it.
-
-- [ ] Measure which of the four are actually required for cross-attacher
-      visibility on the target device; a single sector would establish the same
-      round trip as a full-length readback.
+24. **Single-threaded end to end.** `fuse_session_loop` plus a synchronous `ipc_sync` on one shared fd: one slow etcd operation blocks the whole mount.
+    - [x] `pool.c` deleted; the constraint noted at the `fuse_session_loop` call — the fd has no mutex, so `_mt` alone corrupts the protocol.
+    - [ ] When it matters: a connection per FUSE worker thread, not a response demultiplexer.
+25. **`readdir` read the whole directory, one `GetInode` per entry** — CLOSED. Paged from the kernel's cookie to its buffer size, inodes fetched with `Store.GetMany`.
+26. **`statfs` scanned every inode** — CLOSED. The inode allocation counter, read once.
+27. **Scrubber made five redundant scans and an N+1** — CLOSED. One `Snapshot` per pass; collisions compare overlapping ranges rather than equal offsets.
+28. **Allocation was a linear scan from block 0** — CLOSED. Rotating start hint that wraps, plus a double-free counter. A recycled arena still needs the full extent scan: extent keys cannot be range-scanned by device offset.
+29. **Each write costs a flush, a sync and a full readback.** Three device round trips, all on the critical path. The readback is what makes the write visible to other Multi-Attach attachers.
+    - [ ] Measure which are actually required on the target device; a single sector would establish the same round trip.
 
 # SIMPLIFICATION
 
-## 30. Does the WAL earn its place? — CLOSED
-
-Deleted. `Reconstruct` rebuilds each arena bitmap from the live extents in
-etcd, so a block no extent references is free after a restart whether or not
-anything recorded it — which was the WAL's only job. Its removal takes an fsync
-off every write.
-
-## 31. Two implementations of the same consistency checks — CLOSED
-
-One library, two front ends: the checks live in `pkg/scrub` over a shared
-`Snapshot`, and `pkg/fsck` runs the same functions offline, keeping only what is
-its own (undecodable inodes, dirents pointing at missing inodes, arena
-ownership). Its hand-rolled `decodeUint64`, `inoFromKey` and prefix literals are
-gone.
-
-## 32. `ipc.Service` cannot be tested against `MockStore` — CLOSED, not done
-
-Decided against. The slice of the store the IPC handlers use is essentially the
-whole store — every namespace transaction, the extent and lock APIs, the
-counters and the guard — so the interface would have one implementation and one
-consumer, and would buy only the ability to reach `NextCounter` from the
-harness. That is covered at the integration tier instead (item 35).
-
-## 33. Stale comments that describe a system that no longer exists — CLOSED
-
-The gRPC references, the phase markers and the GETLK/SETLK startup warning now
-describe what the code does; `dirent.go`'s no-op `init` is gone.
-
-## 34. Duplication in the C daemon — CLOSED
-
-The duplicate socket layer went with `pool.c`. The response readers are now a
-cursor (`struct rbuf`) carrying the response length, so a short response is an
-`EIO` on that request rather than a read past the allocation.
+30. **Did the WAL earn its place?** — CLOSED. No: arena reconstruction already frees uncommitted blocks. Deleted, taking an fsync off every write.
+31. **Two implementations of the same checks** — CLOSED. One library in `pkg/scrub`, two front ends.
+32. **`ipc.Service` untestable against `MockStore`** — CLOSED, not done. The interface would be the whole store with one implementation; coverage stays at the integration tier (35).
+33. **Stale comments** — CLOSED.
+34. **Duplication in the C daemon** — CLOSED. Duplicate socket layer went with `pool.c`; response readers are a bounded cursor.
 
 # OPEN QUESTIONS
 
-- **Does a fenced node un-fence itself by restarting?** ANSWERED — yes, by
-  design, and the reasoning is now in
-  `docs/architecture/fencing/fencing-generation-protocol.md`. A fence is an
-  epoch boundary; in single-signal mode what protects the filesystem is that the
-  fenced node's arenas are never reclaimed, so no peer is handed a range it may
-  still be writing into.
-- **Is whole-arena reclamation granular enough?** An arena only returns to the
-  pool once *every* block in it is free, so one surviving file pins a whole GiB.
-  Nothing has measured how often that happens under a real delete workload. If
-  it turns out to be common, the answer is a smaller arena, not a defragmenter —
-  but the measurement should come first.
-
-# STILL OPEN FROM BEFORE
-
-## 35. Concurrent inode allocation has no harness coverage — CLOSED, accepted
-
-Accepted as integration-tier coverage: `TestIntegration_CounterIsUniqueUnderConcurrency`
-and `chaos-elastic-concurrent.sh`'s 20-way concurrent create. Every integration
-test now runs in its own etcd key space, so that tier is reliable enough to
-carry it. See item 32 for why the harness route was dropped.
+- **Does a fenced node un-fence itself by restarting?** ANSWERED — yes, by design; see `docs/architecture/fencing/fencing-generation-protocol.md`.
+- **Is whole-arena reclamation granular enough?** One surviving file pins a whole GiB. Unmeasured. If it turns out to be common the answer is a smaller arena, not a defragmenter — but measure first.
 
 # MAYBE IN THE FUTURE
 
-## 36. Long-duration fuzz
-
-Longest run to date: 240s / ~20k ops (`docs/chaos-reports/2026-07-31-single-cluster-and-fuzz.md`).
-Too short to catch slow leaks (lease/keepalive goroutines, fd/watch-channel
-leaks, arena fragmentation drift, etcd DB growth).
-
-- [ ] Multi-hour fuzz run (start 4h, target 24h), sampling goroutine count,
-      RSS, fd count, etcd DB size, live-data ratio per arena.
-- [ ] Fail on monotonic growth in any sampled metric, not just on a liveness
-      violation.
-- [ ] Docker first; AWS only once the sampling harness is proven.
-
-Three of the leaks it would find are already identified above — the anomaly
-list, the WAL, and the keepalive goroutine — so it is worth fixing those first
-and spending the run on what is left.
-
-## 37. Should `RebalanceArena` be wired to a production caller at all? — CLOSED, not built
-
-No. At 3-5 nodes arena imbalance has never been observed, and the trigger
-condition and manual-vs-automatic posture would have to be settled before any of
-it means anything. `RebalanceArena` and `pkg/membership.Manager` stay as harness
-fixtures; revisit if a real workload shows imbalance.
-
-## 38. Features the POSIX surface is missing
-
-Not bugs, just unbuilt. Listed so the gap is explicit rather than discovered by
-an application:
-
-- Extended attributes (`getxattr`/`setxattr`/`listxattr`) — `ENOSYS`.
-- `fallocate`, `copy_file_range`, `lseek(SEEK_HOLE/SEEK_DATA)`.
-- `O_APPEND` atomicity across nodes — the offset comes from the kernel, and two
-  nodes appending to one file will pick the same offset.
-- Cross-node byte-range locking, deliberately dropped
-  (`docs/architecture/metadata/posix-lock-operations.md`). Nothing depends on
-  it today; the generation guard, not the lock layer, protects metadata during
-  a fence.
+35. **Concurrent inode allocation harness coverage** — CLOSED, accepted at the integration tier.
+36. **Long-duration fuzz.** Longest run to date is 240 s / ~20k ops.
+    - [ ] Multi-hour run (start 4h, target 24h) sampling goroutine count, RSS, fd count, etcd DB size, live-data ratio per arena; fail on monotonic growth, not only on a liveness violation. Docker first.
+37. **Wire up `RebalanceArena`?** — CLOSED, not built. No observed imbalance at 3-5 nodes; it stays a harness fixture.
+38. **POSIX surface still missing.** Xattrs (`ENOSYS`); `fallocate`, `copy_file_range`, `lseek(SEEK_HOLE/SEEK_DATA)`; cross-node `O_APPEND` atomicity; cross-node byte-range locking (deliberately dropped, see `docs/architecture/metadata/posix-lock-operations.md`).
