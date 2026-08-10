@@ -96,22 +96,12 @@ Deleted `UpdateInode`, `DecrementNlink`, `DeleteInode`, `EnsureGeneration`,
 stays: it has no production caller but is the fixture every scrub and arena
 test plants extents with.
 
-## 14. The generation scrub check flags every healthy node after any fence
+## 14. The generation scrub check flags every healthy node after any fence — CLOSED
 
-`CheckGenerationConsistency` (`pkg/scrub/scrubber.go:262`) takes the maximum
-generation across all nodes and reports every extent stamped below it. Because
-generations are per-node, one node ever being fenced raises the cluster maximum
-and turns every extent written by every other node into an anomaly.
-
-The check cannot be made correct as designed: an extent records the generation
-it was written at but not *which node* wrote it, so there is nothing to compare
-the stamp against.
-
-- [ ] Record the writer's node ID alongside the generation in the extent value,
-      and compare each extent against that node's generation.
-- [ ] Until then, drop the check rather than leave it emitting false positives
-      — it currently feeds an unbounded anomaly list (below) and would fire the
-      `etcfuse_scrub_anomalies_total` alert continuously after the first fence.
+The extent value carries the writer's node ID as a sixth field, and the check
+now reports only a stamp *above* that node's current generation — a condition
+the guard makes unreachable. A stamp below it is ordinary data written before
+the node's last fence.
 
 ## 15. Nothing ties allocation to the actual size of the device
 

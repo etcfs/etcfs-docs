@@ -75,3 +75,11 @@ whose revision was compacted away, or that happened while no controller ran.
 The mark is what makes (b) idempotent: the intent is gone after a fence, and a
 raised generation cannot distinguish this departure from an earlier one. It is
 cleared when the node is seen alive, so departures are fenced once each.
+
+## The generation check reports stamps from the future, not from the past
+
+Recording the writer's node ID in the extent makes the stamp comparable at all.
+It does not make "stamped below the current generation" meaningful, though:
+that describes every extent written before that node's last fence. The only
+invariant worth checking is the one the guard enforces — no extent above its
+writer's current generation — so that is what the check reports.

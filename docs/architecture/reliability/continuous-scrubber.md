@@ -130,20 +130,21 @@ That trimming is why the check reads sequence numbers rather than chunk numbers:
 
 ### 5. Generation Consistency Check
 
-**What it checks:** Every extent's generation stamp matches the current fencing generation of the node that wrote it. A stale generation stamp means the extent was written before a fence event — the write may have been part of an incomplete post-fence sequence.
+**What it checks:** No extent carries a generation its writer has never reached. Every commit is guarded by the writer's generation, so a stamp above that node's current value means the guard admitted a write it should have rejected, or the record was written outside the daemon.
 
 **How it works:**
-1. Read the current fencing generation from `gen:<nodeID>`.
+1. Read every node's current generation from the `gen:` prefix.
 2. Scan all `extent:*` keys.
-3. For each key, parse the `generation` field from the extent value.
-4. If `extent.generation < currentNodeGeneration`, the extent's generation is stale.
+3. For each, compare the stamped generation against the current generation of the node named in the same value.
+4. Report only a stamp strictly greater than that node's current generation.
 
-**Resolution:** Alert only. A stale generation stamp does not necessarily mean the data is corrupt — the node may not have been the target of the fence. The alert triggers an administrator to verify the data by comparing against a known-good copy or running a more detailed check.
+An extent stamped *below* its writer's generation is not an anomaly: it is simply older than that node's last fence, which describes every extent written before one. Comparing against the maximum generation across the cluster — as this check originally did — turned every extent written by every healthy node into an anomaly the moment any one node was ever fenced, and fired the `etcfuse_scrub_anomalies_total` alert continuously thereafter.
+
+**Resolution:** Alert only. The condition is unreachable through the ordinary write path, so it points at a guard bug or at direct manipulation of etcd rather than at data that can be repaired mechanically.
 
 **Likely causes:**
-- A fencing event occurred while a write was in flight. The data reached the block device before the fence, but the metadata commit was blocked by the generation guard. The extent was never committed — but this check runs against etcd, so if the extent is in etcd, it must have passed the guard. A stale generation here indicates a bug in the generation guard itself.
-- The generation counter was manually reset or deleted.
-- The node's generation was bumped by a concurrent fence on a different controller replica that the metadata store was not aware of at commit time (impossible with the CAS guarantee, but worth checking).
+- A bug in the generation guard, which is the only thing standing between a fenced node and a committed extent.
+- The generation counter was reset, deleted, or written by hand.
 
 ### 6. Nlink Consistency Check
 
