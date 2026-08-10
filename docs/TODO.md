@@ -73,33 +73,12 @@ comparison guards a rename replacing an empty directory. Two leaks turned up
 alongside: a replaced or unlinked symlink left its target key behind, and a
 directory removed by rename was decremented rather than deleted.
 
-## 11. A malformed IPC frame takes down the whole metadata daemon
+## 11. A malformed IPC frame takes down the whole metadata daemon — CLOSED
 
-Every handler reads a length from the payload and slices with it unchecked:
-`name := string(rest[:nameLen])` (`handlers.go:36`, and the same pattern at
-`:208`, `:236`, `:263`, `:280`, `:311`, `:375`, `:413`, `:439`), and
-`data := rest[:dataLen]` (`datapath.go:60`). The leading `len(payload) < N`
-guards only cover the fixed-size prefix, not the variable part.
-
-A length field larger than the remaining buffer panics. `handleConn`
-(`socket.go:58`) runs each connection in a goroutine with no `recover`, so an
-unrecovered panic kills the process — every mount served by that daemon, not
-just the request.
-
-The socket is mode 0600 and the peer is the local C daemon, so this is a
-robustness problem rather than a remote attack surface. It is still the
-difference between one `EINVAL` and a whole node going down on a protocol
-desync — and a desync of exactly this kind has happened before, in the
-`readdirplus` parser (`docs/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md`).
-
-- [ ] Bounds-check every variable-length read; return `EINVAL` on a short
-      payload. A small `reader` type over the payload would do this once
-      instead of at seventeen call sites.
-- [ ] `recover` in `handleConn` and fail the single request.
-- [ ] Cap the frame length in `recvReq` (`socket.go:100`) — it currently
-      allocates whatever `plen` says, up to 4 GiB. Mirror the cap in the C
-      side's `ipc_sync` and `do_ipc_exchange`, which `malloc` the response
-      length just as blindly.
+A checked `reader` over the payload replaced every unchecked slice, so a short
+or over-long field is `EINVAL` rather than a panic; `safeDispatch` recovers
+anything else into one failed request; and both sides of the socket cap a frame
+at 1 MiB before allocating for it.
 
 ## 12. A membership deletion missed during a watch reconnect is never fenced
 
@@ -285,24 +264,13 @@ remove-then-bind is racy against anything else that can write `/tmp`.
 
 ## 24. The whole filesystem is single-threaded end to end
 
-`fuse.c:263` runs `fuse_session_loop`, the single-threaded loop. `ops.c` does a
-synchronous `ipc_sync` on one shared fd. The Go side reads, dispatches and
-replies in a loop per connection (`socket.go:63`). So one slow etcd operation —
-up to `requestTimeout`, 10 seconds — blocks every other operation on the mount,
-including reads of unrelated files.
+`fuse_session_loop` plus a synchronous `ipc_sync` on one shared fd means one
+slow etcd operation blocks every other operation on the mount, for up to
+`requestTimeout`.
 
-`pool.c` (245 lines) exists to decouple submission from reply, and is entirely
-unreferenced: `ipc_worker_new` and `ipc_worker_submit` are declared in
-`pool.h` and called from nowhere.
-
-There is a trap here for whoever tries the obvious fix: switching to
-`fuse_session_loop_mt` alone would corrupt the protocol, because `ipc_sync`
-shares one fd across threads with no mutex, and two concurrent exchanges would
-interleave their frames and steal each other's replies.
-
-- [ ] Delete `pool.c` and `pool.h` unless the design is being picked up now.
-- [ ] Note the single-threading constraint at the `fuse_session_loop` call, so
-      the trap is visible from the line someone would change.
+- [x] Deleted the unreferenced `pool.c`/`pool.h`, and noted the constraint at
+      the `fuse_session_loop` call so the trap is visible from the line someone
+      would change: the fd has no mutex, so `_mt` alone corrupts the protocol.
 - [ ] When it matters: a connection per FUSE worker thread is a smaller change
       than a response demultiplexer, and the Go side already handles a
       connection per goroutine.
@@ -443,17 +411,12 @@ even though `metadata.MetadataStore` exists as an interface and `pkg/scrub` and
 
 ## 34. Duplication in the C daemon
 
-`send_full` and `recv_full` are defined identically in `pkg/fuse/ops.c:51` and
-`pkg/fuse/pool.c:43`, as are the frame encode/decode halves of `ipc_sync` and
-`do_ipc_exchange`. If `pool.c` goes (above), this goes with it; if it stays,
-the socket layer belongs in one file.
+The `rb_*` response readers (`ops.c:121`) advance through the buffer with no
+reference to `rlen`, so a short response reads past the allocation. The Go side
+always sends fixed-width blocks, which is why it holds — but it is the same
+class of assumption that the `readdirplus` desync broke.
 
-The `rb_*` response readers (`ops.c:121`) also advance through the buffer with
-no reference to `rlen`, so a short response reads past the allocation. The Go
-side always sends fixed-width blocks, which is why it holds — but it is the
-same class of assumption that the `readdirplus` desync broke.
-
-- [ ] One socket layer.
+- [x] One socket layer: the duplicate in `pool.c` went with the file.
 - [ ] Pass `rlen` to the readers and fail the request on a short response.
 
 # OPEN QUESTIONS

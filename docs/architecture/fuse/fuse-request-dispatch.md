@@ -45,7 +45,11 @@ ipc_sync(fd, opcode, payload, plen, &resp, &rlen):
   return 0 on success
 ```
 
-The handler blocks inside `recv_full()` until the Go backend has processed the request and sent the response. During this time, no other FUSE requests can be processed (single-threaded loop). This is acceptable because the typical metadata operation completes in 5–20ms (etcd round-trip).
+The handler blocks inside `recv_full()` until the Go backend has processed the request and sent the response. During this time, no other FUSE requests can be processed (single-threaded loop). This is acceptable because the typical metadata operation completes in 5–20 ms (etcd round-trip).
+
+The single threading is load-bearing, not incidental: every handler shares one IPC file descriptor with no mutex around it, so two concurrent exchanges would interleave their frames and read each other's replies. Making the mount concurrent means giving each FUSE worker its own connection — the Go side already serves one goroutine per connection — not switching to `fuse_session_loop_mt()`.
+
+A response length is bounded before it is allocated, on both sides of the socket: the Go daemon refuses a request frame above 1 MiB and the C daemon refuses a response above the same cap, rather than allocating whatever the length field claims.
 
 ### 4. Response is parsed directly
 

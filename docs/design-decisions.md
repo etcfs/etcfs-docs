@@ -48,3 +48,18 @@ client. (a) leaves the suites sharing a key space, so it only holds while
 nobody adds a `t.Parallel`, and it serialises runs that have no reason to be
 serial. Namespacing makes the isolation a property of the client rather than of
 how the test is invoked.
+
+## The IPC payload parser is a cursor, not per-handler length checks
+
+Seventeen call sites each sliced with an unchecked length field. A `reader`
+that refuses to run past the end and latches a failure flag replaces all of
+them, so a handler tests one boolean before it acts. `safeDispatch` recovers
+anything the cursor cannot prevent into a single `EIO` rather than a dead
+daemon. Frames are capped at 1 MiB on both sides before allocation.
+
+## pool.c deleted rather than picked up
+
+The asynchronous IPC worker (245 lines) was never referenced. Concurrency on
+the mount needs a connection per FUSE worker thread, which the Go side already
+supports; a response demultiplexer would be the larger change, and neither
+needs the dead code kept around in the meantime.
