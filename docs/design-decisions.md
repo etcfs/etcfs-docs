@@ -165,3 +165,43 @@ The fencing controller resumes its membership watch from the last revision it
 saw, so it has to handle that revision being compacted away: it restarts from
 the current revision and lets the authoritative sweep cover the gap, rather than
 retrying a revision that will never come back.
+
+## The AWS setup path was rewritten to match chaos-lib.sh's proven bootstrap, not fixed in place
+
+*Context:* `setup-compute.sh` (TLS + systemd, for a persistent hand-poked test
+cluster) had never actually finished a real multi-node bootstrap. Investigating
+it turned up five independent bugs: a cert-reuse check whose `grep` pattern
+never matched openssl's actual SAN format, so it silently re-signed a new CA on
+every run; `systemctl start` being a no-op on an already-active unit, so neither
+a new binary nor new certs were ever picked up on a re-run; a killed FUSE daemon
+leaving a stale mount that made the next `ExecStartPre=mkdir -p` fail with
+ENOTCONN; no `etcd member add` step before starting a joining node, so a staged
+bootstrap could never reach quorum; and, in the validation script, `((PASS++))`
+under `set -e` aborting after the first passing test (post-increment from 0
+evaluates to `((0))`, exit code 1). None of these are related to each other —
+they just all sat on a path nothing had exercised end to end before.
+
+*Options considered:* (a) fix each bug in place, keeping the TLS+systemd model;
+(b) replace that model with the one `scripts/test/chaos-lib.sh`'s AWS path
+already uses — no TLS, no systemd, every node started fresh together, raw
+nohup'd processes — and share one implementation between the two.
+
+*Chosen:* (b). Every bug above except the last was a symptom of the same
+thing: state left running between invocations that a re-run had to reconcile
+against, and TLS certs plus systemd units are exactly the state that needs
+reconciling. chaos-lib.sh's model has no such state — every run tears down and
+restarts everything itself — and it has been proven under real fault injection
+across many chaos runs. The shared implementation now lives in
+`scripts/infra/bootstrap-cluster.sh`; `setup-compute.sh` is a thin wrapper
+around it, and `chaos-lib.sh`'s AWS `provision_cluster()` calls it too instead
+of carrying its own ~80-line copy. `add-compute-node.sh` (joining a cluster
+that already has quorum, which does need `etcd member add`) was rewritten to
+match, mirroring chaos-lib.sh's own `add_node()`. `chaos-test.sh`, a separate,
+independently-proven harness with its own inlined bootstrap, was left
+untouched — out of scope, not broken, and re-verifying it costs a real AWS run.
+
+Verified by clearing the partially-bootstrapped nodes and running the new
+`setup-compute.sh` → `run-full-test.sh` end to end (16/16 passed, first time
+that script has run to completion), and by running `chaos-test-single-cluster.sh
+aws` — real scenario S1 — against the refactored `chaos-lib.sh` to confirm the
+shared script didn't change its proven behavior.
