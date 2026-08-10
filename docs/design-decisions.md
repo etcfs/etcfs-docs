@@ -113,3 +113,10 @@ The interface it would need is the whole store surface, with one implementation
 and one consumer — an abstraction that buys only harness reach into
 `NextCounter`. Concurrent inode allocation stays covered at the integration
 tier, which is now reliable because every test has its own etcd key space.
+
+## fsck and the scrubber share one check library
+
+The checks live in `pkg/scrub` as functions over a `Snapshot`; `pkg/fsck` calls
+them and keeps only what is genuinely its own (undecodable records, dirents
+pointing at missing inodes, arena ownership). Two implementations had drifted to
+different thresholds and severities for the same invariant.

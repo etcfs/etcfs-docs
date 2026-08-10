@@ -232,17 +232,13 @@ etcd, so a block no extent references is free after a restart whether or not
 anything recorded it — which was the WAL's only job. Its removal takes an fsync
 off every write.
 
-## 31. Two implementations of the same consistency checks
+## 31. Two implementations of the same consistency checks — CLOSED
 
-`pkg/fsck` and `pkg/scrub` each implement nlink consistency, orphan extents and
-extent range validity, separately, with different thresholds and different
-severities. `fsck` also rolls its own `decodeUint64` (`checker.go:251`) and
-`inoFromKey` alongside the ones in `pkg/metadata`, and hardcodes `"dirent:"` and
-`"inode:"` (`:84`, `:102`, `:110`) in a file that imports `metadata.Prefix*`
-constants elsewhere.
-
-- [ ] One check library, two front ends: the offline `fsck` run and the online
-      scrubber pass.
+One library, two front ends: the checks live in `pkg/scrub` over a shared
+`Snapshot`, and `pkg/fsck` runs the same functions offline, keeping only what is
+its own (undecodable inodes, dirents pointing at missing inodes, arena
+ownership). Its hand-rolled `decodeUint64`, `inoFromKey` and prefix literals are
+gone.
 
 ## 32. `ipc.Service` cannot be tested against `MockStore` — CLOSED, not done
 

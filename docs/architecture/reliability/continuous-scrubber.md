@@ -16,6 +16,8 @@ The background verification system that cross-checks etcd metadata against itsel
 - [Integration with the Fencing Generation Protocol](#integration-with-the-fencing-generation-protocol)
 - [Integration with Crash Recovery](#integration-with-crash-recovery)
 
+The checks themselves are shared with `fsck`: one library, two front ends. The scrubber runs them continuously against a live filesystem; `fsck` runs the same functions over the same snapshot offline. They were implemented twice, with different thresholds and severities, which is how an offline check and an online check come to disagree about whether a filesystem is healthy.
+
 ## Design Philosophy
 
 The scrubber exists because no software is bug-free. The metadata invariants defined in the schema — no two inodes claim the same block, every extent falls within an arena, every inode's nlink matches its dirent count — hold true after every correct operation, but a software bug, a partial writes after a crash, or a fencing race can silently violate them.
