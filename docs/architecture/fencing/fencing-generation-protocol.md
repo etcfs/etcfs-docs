@@ -99,8 +99,8 @@ Every metadata mutation that modifies extents or locks must include a generation
 |---|---|---|
 | `AppendExtent` | Writer's current generation | Prevents post-fence extent commits |
 | `UpdateInode` (size change) | Writer's current generation | Prevents post-fence attribute changes |
-| `IncrementNlink` | Writer's current generation | Prevents post-fence link creation |
-| `DecrementNlink` | Writer's current generation | Prevents post-fence link removal |
+| `AtomicLink` | Writer's current generation | Prevents post-fence link creation |
+| `AtomicUnlink` | Writer's current generation | Prevents post-fence link removal |
 | `AcquireLock` (from released lock) | Previous holder's bumped generation | Ensures old holder is truly fenced |
 | `BumpGeneration` (itself) | Self-CAS (see above) | Ensures at-most-once fence recording |
 

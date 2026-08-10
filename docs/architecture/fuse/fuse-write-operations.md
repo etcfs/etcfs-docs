@@ -32,9 +32,9 @@ All namespace mutations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK, MK
 | RENAME | 9 | `fuse_reply_err` | `LookupDirent` + `AtomicRename` | No |
 | WRITE | 23 | `fuse_reply_write` | Arena allocate + device write + fsync + extent commit + reclaim of buried extents | Yes |
 | SETATTR | 12 | `fuse_reply_attr` | `GetInode` | No |
-| SYMLINK | 10 | `fuse_reply_entry` | `allocInode` + `CreateInode` + `Put` + `CreateDirent` | No |
-| LINK | 11 | `fuse_reply_entry` | `IncrementNlink` + `CreateDirent` | No |
-| MKNOD | 25 | `fuse_reply_entry` | `allocInode` + `CreateInode` + `Put` + `CreateDirent` | No |
+| SYMLINK | 10 | `fuse_reply_entry` | `allocInode` + `AtomicCreateSymlink` | No |
+| LINK | 11 | `fuse_reply_entry` | `AtomicLink` | No |
+| MKNOD | 25 | `fuse_reply_entry` | `allocInode` + `AtomicCreateNode` | No |
 | OPEN | 13 | `fuse_reply_open` | None (acknowledge) | No |
 | RELEASE | 14 | `fuse_reply_err` | None (acknowledge) | No |
 | FLUSH | 26 | `fuse_reply_err` | None (acknowledge) | No |
@@ -287,11 +287,11 @@ SYMLINK creates a symbolic link — a special file whose content is interpreted 
 
 Note that these operations are **not** in a single transaction. If the daemon crashes between step 2 and step 4, an orphan inode exists with a symlink key but no directory entry. The fsck checker would flag this as an orphan inode; the scrubber would eventually reclaim it.
 
-The planned improvement is to wrap the inode creation, symlink target storage, and dirent creation in a single etcd transaction using the CAS pattern, but this requires the symlink key to be part of the same transaction as the inode and dirent keys.
+The inode record, the symlink target key and the dirent are written by one transaction, `AtomicCreateSymlink`. A symlink that loses the race for its name therefore leaves nothing behind — neither an inode nor a stray target key.
 
 ## Hard Links (LINK)
 
-LINK creates an additional directory entry pointing to an existing inode — a hard link. The handler increments the inode's nlink and creates a new dirent pointing to the same inode.
+LINK creates an additional directory entry pointing to an existing inode — a hard link. The new dirent and the raised link count are written by one transaction.
 
 ### IPC Payload
 
@@ -301,14 +301,14 @@ LINK creates an additional directory entry pointing to an existing inode — a h
 
 ### Handler Flow
 
-1. Call `IncrementNlink(ino)` to atomically bump the reference count. This is a read-modify-write on the inode key with a CAS guard to prevent lost updates.
-2. Call `CreateDirent(new_parent, new_name, ino)` to create the new directory entry. The CAS on the dirent key prevents overwriting an existing entry.
+1. Call `AtomicLink(ino, new_parent, new_name)`. The transaction asserts that the new name is free and that the inode still stands at the revision its link count was read at, then writes the dirent and the raised count together.
+2. A name that is already taken is reported as `EEXIST` with the count untouched; losing the revision comparison is contention, and the operation is redone against fresh state.
 
-Like SYMLINK, this is two separate operations. The planned improvement is to combine the nlink increment and dirent creation in one transaction. If the dirent creation fails after nlink has been incremented, the nlink is "leaked" — the inode appears to have more links than actual dirents. The fsck checker detects this discrepancy and reports a warning.
+Hard links to directories are refused with `EPERM`: one would let the namespace form a cycle that no unlink can break.
 
 ## Device Nodes (MKNOD)
 
-MKNOD creates a device node — a special file representing a character or block device. The handler allocates an inode, creates it with the specified mode (including `S_IFCHR` or `S_IFBLK`), stores the device number (`rdev`), and creates the directory entry.
+MKNOD creates a device node — a special file representing a character or block device. The handler allocates an inode number, then `AtomicCreateNode` writes the inode record — carrying the device number (`rdev`) and the umask-masked mode — and its directory entry in one transaction.
 
 ### IPC Payload
 

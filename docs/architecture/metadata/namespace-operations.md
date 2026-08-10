@@ -19,7 +19,9 @@ Every file and directory in EtcFS has an inode record stored at `inode:<ino>`. T
 
 ### Creation
 
-Inode creation is always paired with a directory entry that points to it — a file cannot exist without at least one name. The `AtomicCreateFile` method creates both the `dirent:<parent>/<name>` key and the `inode:<ino>` key in a single transaction. The transaction checks that neither key exists (CreateRevision == 0 on both).
+Inode creation is always paired with a directory entry that points to it — a file cannot exist without at least one name. Every creating operation writes both the `dirent:<parent>/<name>` key and the `inode:<ino>` key in a single transaction, checking that neither key exists (CreateRevision == 0 on both): `AtomicCreateFile` for regular files, `AtomicCreateDir` for directories, `AtomicCreateSymlink` for symlinks, and `AtomicCreateNode` for device nodes, FIFOs and sockets.
+
+An inode written without its name would be unreachable: no listing shows it, and the orphan check cannot see the space behind it, because that check looks for extents whose inode is *missing* rather than unreachable. The scrubber and `fsck` both report such an inode if one ever appears.
 
 The inode is initialised with:
 - `Nlink = 1` for regular files (one directory entry points to it)
@@ -40,9 +42,7 @@ In practice, inode deletion is handled by `AtomicUnlink`, which decrements nlink
 
 ### Attribute Updates
 
-`UpdateInode` persists modified inode metadata back to etcd. The update uses optimistic concurrency: it includes a comparison on the inode key's ModRevision to detect lost updates. If another node modified the same inode between the read and the write, the update fails and the caller must re-read and retry.
-
-`IncrementNlink` and `DecrementNlink` are convenience methods that atomically adjust the link count. They follow the same read-modify-write pattern with CAS protection.
+Attribute changes are written by the `setattr` handler as a CAS transaction pinned to the revision the record was read at, so a concurrent update to a different field is not silently overwritten. Link counts are never adjusted on their own: they move as part of the transaction that adds or removes the name responsible for them.
 
 ## Directory Entry Operations
 
@@ -52,7 +52,7 @@ In practice, inode deletion is handled by `AtomicUnlink`, which decrements nlink
 
 ### Create (Standalone)
 
-`CreateDirent` creates a directory entry in isolation. It checks that the entry does not already exist (CreateRevision == 0) and inserts it atomically. This is used by `AtomicCreateFile` and `AtomicCreateDir` to avoid duplicating the create logic.
+`CreateDirent` creates a directory entry in isolation. It checks that the entry does not already exist (CreateRevision == 0) and inserts it atomically. It is used where a name is added without an inode being created alongside it.
 
 ### Remove
 
@@ -74,7 +74,13 @@ The atomic create for a regular file is the canonical example of the etcd transa
 
 If either comparison fails (the name already exists, or the inode was concurrently allocated), the transaction does nothing and returns an error.
 
-Directory creation follows the same pattern but sets `Mode | S_IFDIR` and initialises `Nlink` to 2 (for `.` and `..`).
+Directory creation follows the same pattern but sets `Mode | S_IFDIR` and initialises `Nlink` to 2 (for `.` and `..`). A symlink adds a third operation to the same transaction — the `inode:<ino>/symlink` key holding its target — and a device node carries its `rdev` in the inode record it commits, rather than in a second write.
+
+## Atomic Link
+
+`AtomicLink` adds a second name for an existing inode. The new dirent and the raised link count commit together: the transaction asserts that the new name is free and that the inode still stands at the revision its count was read at. A link that loses either race writes nothing, so a name refused with `EEXIST` cannot leave the count permanently inflated.
+
+Hard links to directories are refused with `EPERM`. Allowing one would let the namespace form a cycle that no unlink can break, and POSIX reserves the right to refuse them.
 
 ## Atomic Unlink
 
@@ -92,7 +98,7 @@ The transaction first reads the dirent and the inode to determine the current nl
 
 The second comparison is the one that makes concurrent unlinks correct. Proving only that the inode exists lets two unlinks of two names for the same inode both read `nlink = 2`, both write `nlink = 1`, and leave a file referenced by nothing that is never freed. Losing either comparison is contention rather than failure, so the operation is redone against fresh state, with a jittered backoff between attempts — without the jitter, callers that lost the same race retry in lockstep and collide again on the next tick.
 
-The same pinning applies wherever a link count is read and written back: `IncrementNlink`, `DecrementNlink`, and the target replacement inside `AtomicRename`.
+The same pinning applies wherever a link count is read and written back: `AtomicLink` and the target replacement inside `AtomicRename`.
 
 ## Atomic Rename
 

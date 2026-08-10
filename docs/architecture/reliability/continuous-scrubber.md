@@ -51,7 +51,7 @@ The scrubber is a single goroutine that loops on a configurable interval (defaul
 
 The scrubber runs as a background goroutine within the Go daemon (etcfuse-meta). It shares the etcd connection with the metadata store — no separate connection is needed.
 
-## Six Invariant Checks
+## Seven Invariant Checks
 
 ### 1. Extent Collision Detection
 
@@ -158,14 +158,23 @@ That trimming is why the check reads sequence numbers rather than chunk numbers:
 **Resolution:** Alert only. Nlink mismatches are logged for human review. The inode may need manual nlink repair using `fsck --fix-nlink` or a custom tool. The filesystem remains operable — the mismatch does not affect reads or writes, but the inode may be prematurely deleted or leaked on the last unlink.
 
 **Likely causes:**
-- Bug in `IncrementNlink` or `DecrementNlink` (missed call, double call).
-- Crash between dirent creation and nlink increment (if these are not in the same transaction, which they currently are not for SYMLINK and LINK).
+- Bug in the transactions that move a link count (`AtomicLink`, `AtomicUnlink`, the target replacement inside `AtomicRename`).
 - Manual modification of the inode record via etcdctl.
 - Hard link corner case: if the same inodes is hard-linked in two directories and one directory is deleted without properly decrementing nlink, the mismatch appears.
 
+### 7. Unreferenced Inode Check
+
+**What it checks:** Every inode record is named by at least one directory entry. The root is exempt — it is where paths start, so nothing names it.
+
+**How it works:** Scan all `dirent:*` keys into a set of referenced inode numbers, then scan all `inode:*` keys and report any inode missing from that set.
+
+**Resolution:** Alert only. Deleting an inode is not reversible, and once it goes the orphan check reclaims the blocks behind it, so an operator decides. `fsck` reports the same condition.
+
+**Likely causes:** Every creating operation is a single transaction, so this should not appear at all. If it does, it is either a leak from an older write path or genuine corruption.
+
 ## Scrub Pass Lifecycle
 
-A single scrub pass executes the six checks in sequence:
+A single scrub pass executes the seven checks in sequence:
 
 ```
 t0: Lock, record lastRun = now
@@ -175,10 +184,11 @@ t3: CheckDeadExtents — scan all extent and inode keys, compare against size an
 t4: CheckRangeValidity — scan all extent keys, check disk_off+len
 t5: CheckGenerationConsistency — scan all extent keys, check gen stamp
 t6: CheckNlinkConsistency — scan all dirent keys, scan all inode keys, compare
-t7: Lock, append all results to anomaly list, increment totalChecked
-t8: Reclaim the owned orphan and dead extents found above
-t9: Log summary (clean or per-type anomaly counts)
-t10: Sleep until next interval
+t7: CheckUnreferencedInodes — scan all dirent keys, scan all inode keys, compare
+t8: Lock, append all results to anomaly list, increment totalChecked
+t9: Reclaim the owned orphan and dead extents found above
+t10: Log summary (clean or per-type anomaly counts)
+t11: Sleep until next interval
 ```
 
 The checks are sequential and read-only. They use `GetPrefix` for bulk scans, which is efficient for etcd's B-tree index. The scan results are snapshots at a point-in-time — concurrent mutations during the pass may cause transient inconsistencies that are detected and reported. Most such transient anomalies are benign (e.g., an inode created between the extent scan and the inode scan), and the next pass will not report them.
@@ -203,7 +213,7 @@ Each anomaly has a `Type`, a `Detail` string, an optional `Ino` and `DiskOff`, a
 
 ```
 Result:
-  Type:    string   ("collision", "orphan", "range", "generation", "nlink")
+  Type:    string   ("collision", "orphan", "dead", "range", "generation", "nlink", "unreferenced")
   Detail:  string   (human-readable description)
   Ino:     uint64   (the affected inode, if applicable)
   DiskOff: uint64   (the affected disk offset, if applicable)
@@ -211,7 +221,7 @@ Result:
 ```
 
 The `Type` determines the severity:
-- **collision, range, generation, nlink** — require human review. These are logged as WARN and emitted as metrics, but no automatic action is taken.
+- **collision, range, generation, nlink, unreferenced** — require human review. These are logged as WARN and emitted as metrics, but no automatic action is taken.
 - **orphan, dead** — safe to auto-remediate. The blocks are freed and the extent key is deleted.
 
 ## Automatic Remediation

@@ -14,215 +14,56 @@ kept for the record.
 
 ## 1. The compactor repointed extents at data it never copied — CLOSED
 
-**Resolved** by deleting `pkg/compaction` outright.
-
-`CompactArena` rewrote every extent's `disk_off` to a destination arena and never
-copied a byte — there was no device I/O anywhere in the package. It ran hourly
-from `main.go` against any arena under 50% usage, which a normally-occupied
-arena always is, so a node up for an hour corrupted its own files.
-
-It was not rebuilt, because an extent-based filesystem does not need it. A file
-is a list of extents, so its bytes never had to be contiguous: `Allocate` now
-returns several runs when no single one is large enough, which removes the only
-failure compaction was there to prevent. There is no seek-locality argument
-either — the shared device is NVMe or EBS.
-
-- [x] Unwire and delete the compactor.
-- [x] Multi-run allocation, so fragmented free space stays usable.
-- [x] Return emptied arenas to the global pool on a background sweep, which is
-      the reclamation the compactor was nominally providing.
+`pkg/compaction` deleted outright: an extent-based file needs no contiguity, so
+multi-run allocation plus background arena reclamation replaced it.
 
 ## 2. Overwriting a byte range returned the old or the new bytes at random — CLOSED
 
-**Resolved** by ordering extents on a stored sequence number and reclaiming what
-a write buries.
-
-Every write appends a fresh extent, so overwriting a range left two extents
-covering it, and `DecodeExtents` ordered them with an unstable sort on offset
-alone — the same file could read back differently from one call to the next. The
-buried extent was never freed either, and the orphan check could not see it,
-because the inode was still alive.
-
-- [x] Deterministic ordering: offset ascending, then sequence descending.
-- [x] Reclaim buried extents at commit, for the ranges this node owns.
-- [x] Scrubber `CheckDeadExtents` for the cross-node remainder, covering both
-      overwritten extents and those left past EOF by a truncate.
+Extents carry a sequence number and order by offset then descending sequence;
+buried extents are reclaimed at commit, and `CheckDeadExtents` covers the
+cross-node remainder.
 
 ## 3. `rename` over an existing file orphans the target's inode — CLOSED
 
-**Resolved** in `AtomicRename`, which now validates the move and replaces the
-target as an unlink rather than overwriting its dirent.
-
-The replaced inode's link count drops in the same transaction, and the inode
-record goes with it at zero. Its extents are left as orphans on purpose — the
-scrubber reclaims them on the node owning their arena, the only node that may.
-
-The target is pinned on its `ModRevision` (or on still being absent), so a
-concurrent write to that name aborts the rename instead of vanishing under it.
-
-- [x] Decrement the replaced target's nlink in the same transaction, deleting
-      its inode when that reaches zero.
-- [x] Return `EINVAL` for `RENAME_EXCHANGE` rather than silently doing
-      something else.
-- [x] Reject a directory rename whose destination is under its own source, and
-      a non-empty directory target. Also a directory over a file (`ENOTDIR`)
-      and a file over a directory (`EISDIR`).
-- [x] Distinct errnos out of the handler — `errnoFor` had collapsed everything
-      to `EEXIST`.
-
-The subtree check needs a parent walk, and inodes record none, so it builds a
-reverse index from one scan of the `dirent:` prefix. Only on directory renames.
-A per-inode parent pointer would be a second source of truth for no benefit at
-this scale; revisit if directory renames ever become hot.
+`AtomicRename` replaces the target as an unlink, pinned on its `ModRevision`,
+and validates the move (subtree, type, non-empty directory) with distinct
+errnos.
 
 ## 4. `CreateInode` gives every inode it creates `nlink = 0` — CLOSED
 
-**Resolved** with `metadata.InitialNlink(mode)`: 2 for a directory, 1 for
-everything else, now the single definition of the rule and used by
-`CreateInode`, `AtomicCreateFile` and `AtomicCreateDir` alike.
-
-The old `(mode >> 12) & 1` returned 0 for directories, regular files and
-symlinks — only FIFOs came out right — so every symlink, device node and
-hardlink target was stored as if nothing referenced it.
-
-- [x] Correct initial link count, single-sourced.
-- [x] Assert it in a test for each inode type, plus the hardlink and unlink
-      lifecycle.
-- [x] Stop the nlink checkers flagging directories. They counted dirents for
-      every inode, but a directory has one dirent and carries 2, so every
-      directory in the filesystem was reported. Both `pkg/scrub` and `pkg/fsck`
-      now assert the fixed value for directories and count only for the rest.
-
-EtcFS does not model the `..` link a subdirectory contributes to its parent, so
-a directory's count stays 2 for its whole life. That is what makes asserting it
-correct rather than a workaround.
+`metadata.InitialNlink(mode)` is the single definition; the nlink checkers
+assert the fixed count for directories instead of counting dirents.
 
 ## 5. Shared locks never share — CLOSED
 
-**Resolved** by giving every holder its own key and moving the mode into the
-key: `lock:<ino>/<mode>/<lease_id>`, value the holder's node ID.
-
-The mode being in the key means a transaction can ask "is any writer holding
-this?" as a range comparison — `CreateRevision == 0` over `lock:<ino>/` for a
-writer, over `lock:<ino>/exclusive/` for a reader. Etcd reads an empty range as
-vacuously true, so that is exactly "no blocking holder", decided inside the
-transaction rather than by a preceding read a competitor could slip through.
-
-No lock value is parsed anywhere now, so the `Sscanf` that never matched is
-gone rather than fixed.
-
-- [x] Stop parsing the lock value. The mode is in the key; `GetLockInfo`
-      assembles a `LockRecord` from the holder keys instead.
-- [x] A key per shared holder, so one release cannot revoke another's hold.
-- [x] Membership value encoded and decoded with `encoding/json`, replacing the
-      hand-rolled string and the `InstanceIDFromMembership` substring scan.
-- [x] Tests: two concurrent shared acquisitions both succeed and survive one
-      of them releasing; readers and writers exclude each other both ways; a
-      refused acquisition leaves no key behind.
+Key per holder with the mode in the key: `lock:<ino>/<mode>/<lease_id>`, so
+conflict is a range comparison inside the transaction and no lock value is
+parsed.
 
 ## 6. `nlink` increment and decrement can lose updates — CLOSED
 
-**Resolved** by pinning every read-modify-write of an inode to the revision it
-was read at, through `InodeUnchanged(ino, modRev)`.
-
-`putInodeWithCAS` compared `CreateRevision > 0` — "the inode exists" — which
-proves nothing about the value the new record was computed from. It is now
-`putInodeCAS`, comparing `ModRevision`, and the name is true.
-
-`AtomicUnlink` pins the dirent as well as the inode: without that, a name
-replaced by a concurrent rename would be unlinked as if it were still the
-original. `AtomicRename` pins the inode of the target it replaces, for the same
-reason it already pinned that target's dirent.
-
-- [x] Condition these transactions on the inode's `ModRevision` as read, and
-      retry on mismatch.
-- [x] Jittered, context-aware backoff between attempts. Sixteen concurrent hard
-      links to one inode exhausted a plain retry budget — the losers all retried
-      on the same tick and collided again. `NextCounter` had grown its own copy
-      of this by hand and now shares the helper, which also makes its wait stop
-      early on a cancelled context instead of sleeping the full delay.
+Every read-modify-write of an inode is pinned to the revision it was read at
+(`InodeUnchanged`), with jittered context-aware backoff on the retry.
 
 # SHOULD FIX — correctness gaps
 
 ## 7. `chmod`, `chown`, `utimens` and growing truncate silently do nothing — CLOSED
 
-**Resolved** by putting every settable attribute on the wire and applying the
-ones the kernel's mask selects.
-
-`ec_setattr` sent only `st_size` and discarded the rest of `struct stat`; the
-handler read only `st_size`. So `chmod`, `chown` and `utimensat` returned
-success, changed nothing, and handed back the old attributes for the kernel to
-cache as the truth.
-
-- [x] Carry mode, uid, gid and the timestamps over the wire, and apply the ones
-      `to_set` selects, pinned to the inode's revision as read.
-- [x] Handle a growing truncate by updating `Size`.
-- [x] Define the real `FATTR_*` constants rather than the lone `fattrSize`.
-
-Two things the fix turned up:
-
-- The mode has to be masked. The kernel sends a whole `st_mode`, so storing it
-  as-is would let a `chmod` on a symlink or a device node turn it into a regular
-  file. The stored type bits are kept and only the permission bits replaced.
-- The read path did **not** in fact return zeroes for a gap, which the plan for
-  this item had assumed. Its gap branch was unreachable, and an extent following
-  a hole was copied to the running output position instead of the offset it
-  belonged to, so everything after a gap came back shifted; a tail hole came
-  back as a short read. Rewritten to fill offset-relative over a zeroed buffer
-  and return the whole requested range. The new integration tests fail against
-  the old path and pass against this one.
+Every settable attribute is on the wire and applied under the kernel's `to_set`
+mask, with the stored type bits preserved. Fixed the sparse read path along the
+way: gaps now fill offset-relative over a zeroed buffer.
 
 ## 8. Every file is owned by uid 1000 — CLOSED
 
-**Resolved** by carrying `fuse_req_ctx(req)->uid/gid/umask` on every creating
-operation and storing what the caller actually had.
+Caller `uid`/`gid`/`umask` carried on every creating operation; enforcement is
+the kernel's via `-o default_permissions`. Also bounded every name and symlink
+target in the C handlers (`ENAMETOOLONG`) — two of them overran their buffers.
 
-The permission question is answered by mounting with `-o default_permissions`.
-The kernel evaluates the mode, uid and gid the daemon reports against the
-calling process and rejects the syscall before it reaches us. EtcFS implements
-no access checks of its own on purpose: a second copy of those rules in the
-daemon is one that can diverge from the kernel's.
+## 9. `symlink`, `link` and `mknod` are not atomic — CLOSED
 
-- [x] Send the caller's uid, gid and umask with create, mkdir, mknod and
-      symlink, and store them.
-- [x] Apply the umask instead of discarding it. A symlink is exempt: its own
-      permission bits are not meaningful.
-- [x] Permission enforcement decided and wired: `default_permissions`, with the
-      reasoning recorded in the FUSE architecture doc.
-
-Two memory-safety bugs turned up in the handlers this touched, both reachable
-from an unprivileged process on the mount:
-
-- `ec_create` sized its payload buffer at 276 bytes and wrote 279 at the maximum
-  name length, and no handler except `ec_lookup` bounded the name at all.
-- `ec_symlink` sized for a 255-byte target. A symlink target is a path, so it
-  can reach `PATH_MAX` — roughly 3.5 KiB past the end of the stack buffer.
-
-Every handler that copies a name or a target now checks its length and returns
-`ENAMETOOLONG`, and every payload buffer is sized from the same constants rather
-than a rounded-up guess.
-
-## 9. `symlink`, `link` and `mknod` are not atomic
-
-`AtomicCreateFile` puts the dirent and the inode in one transaction. The other
-three creation paths do not:
-
-- `handleSymlink` (`handlers.go:366`): `CreateInode`, then `Put` the target,
-  then `CreateDirent` — three round trips. A failure at the second or third
-  leaves an inode, and possibly a symlink target, with no dirent.
-- `handleMknod` (`handlers.go:433`): `CreateInode`, `Put` the record again to
-  set `Rdev`, then `CreateDirent`. Same exposure, plus a pointless second write
-  that `CreateInode` could have taken as a parameter.
-- `handleLink` (`handlers.go:406`): `IncrementNlink` then `CreateDirent`. If
-  the dirent creation fails — `EEXIST` is the expected case — `nlink` stays
-  incremented permanently.
-
-The orphaned inodes are invisible to the scrubber, whose orphan check looks for
-extents without inodes, not inodes without dirents.
-
-- [ ] Fold each into a single transaction, the way `AtomicCreateFile` already
-      does.
-- [ ] Add an "inode with no dirent" check to the scrubber and to `fsck`.
+One transaction each: `AtomicCreateSymlink`, `AtomicCreateNode`, `AtomicLink`
+(which also refuses a hard link to a directory with `EPERM`). The scrubber and
+`fsck` now report an inode no dirent names.
 
 ## 10. `rmdir`'s empty-directory check is a separate round trip
 
@@ -364,28 +205,9 @@ only signal, and it reads as informational.
 
 ## 17. A write landing strictly inside an extent reclaims nothing — CLOSED
 
-**Resolved** by moving write ordering out of the key and into the value.
-
-Extents carry a sequence number as a fifth field, `<log_off>,<disk_off>,<length>,
-<generation>,<sequence>`. Reads order by offset, then by descending sequence.
-The chunk number in the key is now only an identifier.
-
-That is what makes a middle split safe: an overwrite trims the extent into a
-head under the original key and a tail under a fresh one, in one transaction,
-and *both keep their parent's sequence*. Neither can outrank a genuinely newer
-extent overlapping it — which was the hazard that blocked this, and is reachable,
-since extents in another node's arena are never trimmed and so do overlap.
-
-The four-field form is no longer accepted: the system is pre-deployment, so the
-decoder requires all five fields rather than carrying a compatibility path for
-records nothing has written.
-
-- [x] Sequence field in the extent value, defaulting to the chunk number when
-      absent. Reads ordered by it; a split carries the parent's into both pieces.
-- [x] Split down the middle: two records, blocks between them freed.
-- [x] Still unreclaimed: a covered region smaller than one block, since blocks
-      are the unit of reuse. Bounded and read-correct; the block comes back when
-      its extent is fully covered or the file is deleted.
+Ordering moved from the key into a sequence field in the extent value, which
+makes a middle split safe: head and tail keep the parent's sequence. A covered
+region smaller than one block is still unreclaimed until its extent dies.
 
 ## 18. Integration suites clobber each other on a shared etcd
 
