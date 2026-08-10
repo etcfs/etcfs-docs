@@ -64,7 +64,7 @@ correctness problem; nothing is.
 39. **A read never reported EOF** — CLOSED. Reads answer the whole requested range, so one past the end returned a buffer of zeroes; `cat` on a 7-byte file produced hundreds of megabytes. Clamped to the inode size.
 40. **Extents were stamped one generation ahead of their writer** — CLOSED. `writeGeneration` floored at 1 for a never-fenced node, which the scrubber's generation check correctly reported as impossible.
 41. **etcd kept every revision forever** — CLOSED. Revision-based auto-compaction and an 8 GiB quota in all three deployments; the fencing watch restarts from the current revision when its resume point has been compacted.
-42. **Chaos harness left added nodes behind** — CLOSED. Teardown removes them, so the next run's `member add` does not fail with "Peer URLs already exists". Its arena assertion also still expected the pre-split `arena:<node>` key.
+42. **Chaos harness bugs, not product bugs** — CLOSED. Teardown now removes nodes added mid-run (a leftover etcd member made the next run's `member add` fail); `add_node` recovers from an add that succeeded but could not be read back; two suites still expected the pre-split `arena:<node>` key; FJ3 expected an arena leak that `Membership.Leave` no longer causes; and FJ5 stat-ed the mount root, which the C daemon answers locally without IPC.
 
 # OPEN QUESTIONS
 
