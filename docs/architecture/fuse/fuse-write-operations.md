@@ -28,7 +28,7 @@ All namespace mutations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK, MK
 | CREATE | 5 | `fuse_reply_create` | `allocInode` + `AtomicCreateFile` | No |
 | MKDIR | 6 | `fuse_reply_entry` | `allocInode` + `AtomicCreateDir` | No |
 | UNLINK | 7 | `fuse_reply_err` | `AtomicUnlink` | No |
-| RMDIR | 8 | `fuse_reply_err` | `LookupDirent` + `ListDirents` + `AtomicUnlink` | No |
+| RMDIR | 8 | `fuse_reply_err` | `AtomicRmdir` | No |
 | RENAME | 9 | `fuse_reply_err` | `LookupDirent` + `AtomicRename` | No |
 | WRITE | 23 | `fuse_reply_write` | Arena allocate + device write + fsync + extent commit + reclaim of buried extents | Yes |
 | SETATTR | 12 | `fuse_reply_attr` | `GetInode` | No |
@@ -95,7 +95,7 @@ UNLINK removes a name from a directory. It calls `AtomicUnlink`, which does the 
 1. Read the current inode's nlink.
 2. Delete the dirent key (checking it exists via `CreateRevision > 0`).
 3. Decrement nlink on the inode.
-4. If nlink reaches zero, also delete the inode key.
+4. If nlink reaches zero, also delete the inode key — and, for a symlink, the key holding its target.
 
 This is atomic: if the daemon crashes after step 2 but before step 3–4, no corruption occurs because the transaction either committed all operations or none. The transaction includes a CAS on the dirent key to prevent concurrent double-unlink.
 
@@ -103,13 +103,11 @@ If the inode's extent list is non-empty at nlink zero (meaning there are allocat
 
 ### RMDIR
 
-RMDIR removes a directory. It performs three steps before the final Delete:
+RMDIR removes a directory through `AtomicRmdir`, a single transaction. It reads the dirent and the inode to confirm the target is a directory — returning `ENOTDIR` if it is not — and then commits with three comparisons: the dirent and the inode still at the revisions they were read at, and a range comparison asserting that `dirent:<ino>/` holds no keys. An entry created under the directory between the read and the commit therefore aborts the removal (`ENOTEMPTY`) instead of stranding the subtree.
 
-1. Look up the target to confirm it exists and is a directory (`S_IFDIR` in mode). Returns `ENOTDIR` if it is not a directory.
-2. List the directory's contents via `ListDirents`. Returns `ENOTEMPTY` if any entries exist.
-3. Call `AtomicUnlink` to remove the dirent and decrement nlink.
+The directory's inode is deleted outright rather than decremented: its link count is fixed at 2 for its whole life, so it never reaches zero on its own.
 
-Note that RMDIR does **not** delete the parent directory's nlink. The parent directory's nlink tracks only the number of subdirectories, not the total number of entries. This is a simplification from standard POSIX: the nlink variable tracks all entries, but RMDIR only adjusts the child inode's nlink.
+RMDIR does **not** adjust the parent directory's nlink. EtcFS does not model the `..` link a subdirectory contributes to its parent, so a directory's count stays 2 regardless of how many subdirectories it holds.
 
 ## Rename (RENAME)
 

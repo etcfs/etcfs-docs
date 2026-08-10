@@ -65,20 +65,13 @@ One transaction each: `AtomicCreateSymlink`, `AtomicCreateNode`, `AtomicLink`
 (which also refuses a hard link to a directory with `EPERM`). The scrubber and
 `fsck` now report an inode no dirent names.
 
-## 10. `rmdir`'s empty-directory check is a separate round trip
+## 10. `rmdir`'s empty-directory check is a separate round trip — CLOSED
 
-`handleRmdir` (`handlers.go:274`) does `LookupDirent`, `GetInode`,
-`ListDirents`, and only then `AtomicUnlink`. Another node can create an entry
-in the directory between the listing and the unlink, and the subtree is
-orphaned — the parent dirent is gone but the children remain, reachable by
-nothing.
-
-etcd cannot express "no keys under this prefix" as a comparison, so this needs
-either a per-directory child counter maintained in the same transactions that
-create and delete entries, or a comparison on the directory's own `ModRevision`
-with the child count folded into the inode record.
-
-- [ ] Pick one and make `rmdir` a single transaction.
+`AtomicRmdir` asserts emptiness inside the transaction with a range comparison
+(`CreateRevision == 0` over `dirent:<ino>/`), so no counter is needed. The same
+comparison guards a rename replacing an empty directory. Two leaks turned up
+alongside: a replaced or unlinked symlink left its target key behind, and a
+directory removed by rename was decremented rather than deleted.
 
 ## 11. A malformed IPC frame takes down the whole metadata daemon
 

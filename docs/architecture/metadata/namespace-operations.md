@@ -100,6 +100,14 @@ The second comparison is the one that makes concurrent unlinks correct. Proving 
 
 The same pinning applies wherever a link count is read and written back: `AtomicLink` and the target replacement inside `AtomicRename`.
 
+## Atomic Rmdir
+
+Removing a directory has to prove it is empty *inside* the transaction that removes it. etcd cannot compare "no keys under this prefix" as a value, but it can compare a whole range: every key under `dirent:<ino>/` having creation revision 0 is true only when the range holds no keys, since an existing key never has one. `AtomicRmdir` adds that comparison alongside the pins on the dirent and the inode, and deletes both keys.
+
+Listing the directory first and deleting afterwards would leave a window in which another node creates an entry: the parent's name disappears and the children become unreachable from the root, indistinguishable afterwards from ordinary data. The same range comparison guards the rename that replaces an empty directory.
+
+A directory is deleted outright rather than decremented. Its link count is fixed at 2 for its whole life — EtcFS does not model the `..` link a subdirectory contributes — so the count says nothing about whether anything still refers to it.
+
 ## Atomic Rename
 
 `AtomicRename` moves a file or directory from one name to another, possibly across directories. The transaction:
@@ -110,7 +118,7 @@ The same pinning applies wherever a link count is read and written back: `Atomic
 4. Creates the destination dirent with the same inode number
 5. When the destination was already taken, unlinks what was there: its inode's link count drops, and the inode record is deleted once nothing points at it
 
-Step 5 is what keeps a replaced file from being orphaned. Its extents are deliberately left behind as orphans, which the scrubber reclaims on the node owning their arena — the only node that may.
+When the replaced inode is a symlink, its target key is deleted in the same transaction — nothing else references it, and no check looks for a stray one. Step 5 is what keeps a replaced file from being orphaned. Its extents are deliberately left behind as orphans, which the scrubber reclaims on the node owning their arena — the only node that may.
 
 Several renames are refused outright: `RENAME_EXCHANGE` (unimplemented, and an ordinary rename would lose the source's data rather than swap it), a directory over a non-directory or the reverse, a non-empty directory target, and a destination lying inside the directory being moved. The last would detach a whole subtree into a cycle no path reaches; the ancestor check walks up a reverse index built from one scan of the `dirent:` prefix, and only when a directory is the thing being moved. See [FUSE Write Operations](../fuse/fuse-write-operations.md#rejected-renames) for the errno each maps to.
 

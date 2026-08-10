@@ -25,3 +25,15 @@ rename ancestor-walk would then have to tolerate.
 The scrubber and `fsck` both report an inode no dirent names. Deleting one is
 irreversible and takes its extents with it on the next orphan pass, so the
 decision stays with an operator.
+
+## rmdir proves emptiness with a range comparison, not a child counter
+
+*Options:* (a) a per-directory child counter maintained by every create and
+unlink in that directory, (b) fold the count into the inode record and compare
+its `ModRevision`, (c) an etcd range comparison over `dirent:<ino>/`.
+
+*Chosen:* (c). Both counter designs put every create in a directory into a
+read-modify-write of the parent inode, which serialises concurrent creates in
+one directory for nothing. etcd compares `CreateRevision == 0` over a whole
+range, and an empty range is vacuously true, so emptiness is decidable inside
+the transaction with no extra state at all.
