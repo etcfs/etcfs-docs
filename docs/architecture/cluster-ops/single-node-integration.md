@@ -81,7 +81,7 @@ The Go binary owns all stateful subsystems: the etcd connection, the metadata ca
 
 ### 1. Go Daemon Start
 
-The Go daemon parses CLI flags for etcd endpoints, TLS certificates, node ID, cluster name, and lease TTL. It connects to etcd, creates the metadata `Store`, initialises the membership heartbeat, and starts the self-fencing watchdog as background goroutines. Then it listens on the Unix socket path (default `/tmp/etcfuse.sock`, permissions 0600) and enters the accept loop.
+The Go daemon parses CLI flags for etcd endpoints, TLS certificates, node ID, cluster name, and lease TTL. It connects to etcd, creates the metadata `Store`, initialises the membership heartbeat, and starts the self-fencing watchdog as background goroutines. Then it listens on the Unix socket path (default `/run/etcfuse/etcfuse.sock`, permissions 0600) and enters the accept loop. The sockets live under `/run` rather than `/tmp` because both are removed and re-bound at startup, and only root can write that directory; the mode comes from a umask around the bind rather than a chmod after it, which would leave a window in which the socket carried the process umask.
 
 The daemon does nothing else until the C daemon connects. It does not create filesystem state at startup — the root inode is a synthetic construct in the FUSE layer, not a stored inode in etcd.
 

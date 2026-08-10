@@ -18,7 +18,7 @@ EtcFS runs as two cooperating processes, not one monolithic binary:
 
 2. **`etcfuse-meta` (Go daemon)** — Talks to the etcd cluster, manages the metadata store, and performs block device I/O. It listens on a Unix domain socket and processes binary IPC requests from the C daemon.
 
-The processes communicate over a Unix stream socket (`/tmp/etcfuse.sock` by default, configurable via `ETCFS_IPC_SOCKET`). The C daemon connects to the Go daemon at startup. All FUSE operations from the kernel are forwarded over this socket as structured binary messages; responses come back the same way.
+The processes communicate over a Unix stream socket (`/run/etcfuse/etcfuse.sock` by default, set with `--socket` on the C daemon and `--listen` on the Go one; the C side also reads `ETCFS_IPC_SOCKET`). A second socket, `/run/etcfuse/etcfuse-notify.sock` (`--notify-socket`), carries cache-invalidation notifications in the other direction. The C daemon connects to the Go daemon at startup. All FUSE operations from the kernel are forwarded over this socket as structured binary messages; responses come back the same way.
 
 ### Why Two Processes
 

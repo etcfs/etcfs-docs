@@ -149,17 +149,11 @@ the drain goroutine ends with it.
 Both `retry` and `NextCounter` now select on `ctx.Done()` alongside the timer,
 so a request whose deadline has passed stops instead of sitting out the delay.
 
-## 22. Control-plane sockets live in `/tmp` with a permissions window
+## 22. Control-plane sockets live in `/tmp` with a permissions window — CLOSED
 
-`--listen` defaults to `/tmp/etcfuse.sock` and the notify socket is hardcoded
-to `/tmp/etcfuse-notify.sock` (`main.go:242`). Both do `os.Remove` then
-`net.Listen` then `os.Chmod(0600)` (`socket.go:294`, `notify.go:92`), so
-between bind and chmod the socket carries the process umask, and the
-remove-then-bind is racy against anything else that can write `/tmp`.
-
-- [ ] Default to a directory only root can write (`/run/etcfuse/`), make the
-      notify path configurable, and set the umask around the bind rather than
-      chmod after it.
+Both sockets default to `/run/etcfuse/`, the notify path is a flag on both
+daemons, and `ListenPrivate` creates the directory 0700 and binds under a 0177
+umask instead of chmod-ing afterwards.
 
 ## 23. Miscellaneous error handling
 
