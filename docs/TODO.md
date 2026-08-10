@@ -67,7 +67,8 @@ correctness problem; nothing is.
 # MAYBE IN THE FUTURE
 
 35. **Concurrent inode allocation harness coverage** — CLOSED, accepted at the integration tier.
-36. **Long-duration fuzz.** Longest run to date is 240 s / ~20k ops.
-    - [ ] Multi-hour run (start 4h, target 24h) sampling goroutine count, RSS, fd count, etcd DB size, live-data ratio per arena; fail on monotonic growth, not only on a liveness violation. Docker first.
+36. **Long-duration fuzz.** Longest run to date is 300 s / ~28k ops.
+    - [x] Sampling harness: `chaos-fuzz.sh` records each daemon's RSS and fd count and etcd's DB size every 30 s, and the summary names any metric that rose at *every* sample.
+    - [ ] Multi-hour run (start 4h, target 24h) on that harness; add live-data ratio per arena to the samples.
 37. **Wire up `RebalanceArena`?** — CLOSED, not built. No observed imbalance at 3-5 nodes; it stays a harness fixture.
 38. **POSIX surface still missing.** Xattrs (`ENOSYS`); `fallocate`, `copy_file_range`, `lseek(SEEK_HOLE/SEEK_DATA)`; cross-node `O_APPEND` atomicity; cross-node byte-range locking (deliberately dropped, see `docs/architecture/metadata/posix-lock-operations.md`).
