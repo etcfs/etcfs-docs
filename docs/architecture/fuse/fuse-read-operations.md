@@ -110,9 +110,9 @@ The `offset` is a cookie from a previous READDIR response indicating where to re
 
 ### Processing
 
-The Go backend calls `ListDirents(ino)` to fetch all entries in the directory. For very large directories, the paginated listing method is used to limit etcd response sizes.
+The Go backend calls `ListDirents(ino)`, drops the entries the kernel already has — the cookie of an entry is its 1-based position, so the offset is the count already returned — and keeps only as many of the rest as the kernel's buffer can hold. At least one entry is always returned, because an empty reply is how a listing ends.
 
-For each entry, the handler determines the dirent type (DT_REG, DT_DIR, DT_LNK) by reading the target inode's mode field. This is required by `readdir` — the kernel needs the type to populate `d_type` in `struct dirent`.
+The inode records for that page are fetched in a single batched transaction rather than one `Get` per entry, which is what made a listing of a thousand-file directory a thousand sequential etcd round trips, repeated on every `ls`. Each record supplies the entry's dirent type (DT_REG, DT_DIR, DT_LNK), which the kernel needs to populate `d_type` in `struct dirent`.
 
 ### Response
 
@@ -163,7 +163,7 @@ STATFS is called by `statvfs()` and `df` to report filesystem-level statistics.
 
 ### Processing
 
-STATFS does not query etcd. In the current implementation, the response is synthetic — it reports a filesystem with 1 GiB total blocks, 512 MiB free, 1,000,000 total files, and 900,000 free files. These values are placeholders; a production implementation would compute actual values from the arena allocator and inode counter state in etcd.
+Total and free blocks come from the device's size and the allocator's live ratio. The file count comes from the inode allocation counter — one read, where a full scan of the inode space used to be performed for nothing but its length. The counter counts numbers handed out rather than inodes alive, so it over-reports after deletions; an upper bound is the right error to make for a number no caller can act on. Free files are reported as free blocks, since inode numbers are 64-bit and every file needs at least one block.
 
 ### Response
 

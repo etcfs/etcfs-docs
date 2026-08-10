@@ -178,27 +178,17 @@ slow etcd operation blocks every other operation on the mount, for up to
       than a response demultiplexer, and the Go side already handles a
       connection per goroutine.
 
-## 25. `readdir` reads the whole directory and does one `GetInode` per entry
+## 25. `readdir` reads the whole directory and does one `GetInode` per entry — CLOSED
 
-`readdirResp` (`handlers.go:86`) ignores the offset and size the kernel sent,
-lists every dirent, and calls `s.store.GetInode` per entry (`:105`) — one etcd
-round trip per file, on every `readdir`, and again on every `readdirplus`.
-The full listing is then returned in a single IPC frame regardless of the
-kernel's buffer size.
+The page starts at the kernel's cookie and stops at its buffer size, and the
+inode records for that page are fetched in one batched transaction
+(`Store.GetMany`) rather than one `Get` each.
 
-- [ ] Fetch the inode records with one `GetPrefix` and join in memory, as
-      `CheckNlinkConsistency` already does.
-- [ ] Honour the offset and size so a large directory is paged rather than
-      materialised whole.
+## 26. `statfs` scans every inode in the filesystem — CLOSED
 
-## 26. `statfs` scans every inode in the filesystem
-
-`handleStatfs` (`handlers.go:178`) does `GetPrefix(ctx, "inode:")` and uses only
-`len(...)`. Every `df` is a full range read over the whole namespace. The file
-count is then compared against a hardcoded 1,000,000 ceiling (`:180`).
-
-- [ ] Maintain a counter, or accept a stale count from the scrubber's pass,
-      which already scans the same prefix.
+The file count comes from the inode allocation counter, an upper bound read in
+one `Get`. Free files are free blocks; the hardcoded 1,000,000 ceiling is gone,
+having never been a limit anything enforced.
 
 ## 27. The scrubber makes four redundant full-filesystem scans and an N+1 — CLOSED
 
