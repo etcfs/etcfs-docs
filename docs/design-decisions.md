@@ -63,3 +63,15 @@ The asynchronous IPC worker (245 lines) was never referenced. Concurrency on
 the mount needs a connection per FUSE worker thread, which the Go side already
 supports; a response demultiplexer would be the larger change, and neither
 needs the dead code kept around in the meantime.
+
+## The fencing sweep is authoritative, with a per-node "already fenced" mark
+
+*Options:* (a) keep the sweep a retry queue over recorded intents and rely on
+the revision-resuming watch alone, (b) make the sweep compare known nodes
+against live membership.
+
+*Chosen:* (b), plus a `fence_done:<node>` key. (a) still loses a departure
+whose revision was compacted away, or that happened while no controller ran.
+The mark is what makes (b) idempotent: the intent is gone after a fence, and a
+raised generation cannot distinguish this departure from an earlier one. It is
+cleared when the node is seen alive, so departures are fenced once each.

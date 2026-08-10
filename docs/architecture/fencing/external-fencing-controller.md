@@ -34,7 +34,7 @@ With neither flag the controller degrades to single-signal fencing — bumping t
 
 ## Controller Architecture
 
-The controller runs as a background goroutine within the Go daemon (etcfuse-meta). It watches the etcd membership prefix for DELETE events, and runs a second goroutine — the reconciliation sweep — that retries any fence the watch path did not carry to completion. Both paths share the same two etcd keys: a durable record of the fence that is owed, and a lease-bound claim that stops two controllers performing it at once.
+The controller runs as a background goroutine within the Go daemon (etcfuse-meta). It watches the etcd membership prefix for DELETE events, and runs a second goroutine — the reconciliation sweep — which is authoritative: every 30 seconds it compares the nodes the cluster knows of against live membership and fences whatever is missing, whether or not any controller ever saw an event for it. The two paths share three etcd keys: a durable record of a fence that is owed, a lease-bound claim that stops two controllers performing it at once, and a mark recording that a departed node has already been fenced.
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -47,17 +47,21 @@ The controller runs as a background goroutine within the Go daemon (etcfuse-meta
 │      go fenceNode(node, instance)              │
 │                                                │
 │  reconciliation sweep (every 30s):             │
-│    for each fence_pending:<node>:              │
+│    for each known node (gen:<node>) and each   │
+│      fence_pending:<node>:                     │
 │      membership:<node> present? drop the       │
-│        intent — the node re-registered         │
-│      otherwise: fenceNode(node, instance)      │
+│        intent and the mark — it re-registered  │
+│      already marked fenced? nothing owed       │
+│      otherwise: record the intent, then        │
+│        fenceNode(node, instance)               │
 │                                                │
 │  fenceNode:                                    │
 │    claim fence_claim:<node> (CAS + lease)      │
 │    from the sweep? re-check the intent still   │
 │      exists — the snapshot may have aged       │
 │    sever device access, bump generation        │
-│    delete fence_pending:<node>                 │
+│    put fence_done:<node>, delete               │
+│      fence_pending:<node>                      │
 └────────────────────────────────────────────────┘
 ```
 
@@ -66,6 +70,12 @@ The controller runs as a background goroutine within the Go daemon (etcfuse-meta
 The membership watch is edge-triggered: it fires once, on the DELETE of a key that is already gone, so a fence that fails, times out, or dies with its controller has no event left to re-trigger it. `fence_pending:<node_id>` is the durable record that closes that gap. It is written on the watch goroutine, before the fence is attempted, and deleted only after the generation bump succeeds — so anything left behind is by definition an incomplete fence. Its value is the expired node's instance ID, stored because that value lives only inside the membership key, which is already deleted by the time a retry runs.
 
 The key is not lease-bound. An owed fence must survive the death of whichever controller happened to observe the expiry.
+
+### Fence Mark (`fence_done:<node_id>`)
+
+Because the sweep decides from current state rather than from a recorded intent, it needs to tell a node that is gone and still owed a fence from one that is gone and already fenced. The intent is deleted on completion, and the generation alone cannot answer the question: a node fenced during an earlier departure it has since recovered from carries a raised generation too. `fence_done:<node_id>` records the generation the fence bumped it to, and is deleted the moment the node is seen alive in membership again — so a node that leaves twice is fenced twice, and a node that leaves once is fenced once however many sweeps run.
+
+The mark is written before the intent is cleared. Between the two a sweep sees a node that is both marked and owed, and treats it as owed: one harmless retry, rather than skipping a fence that never completed.
 
 ### Fence Claim (`fence_claim:<node_id>`)
 
@@ -81,16 +91,16 @@ When a node starts, it creates a membership key bound to an etcd lease. When the
 
 ### Watch Reconnection
 
-If the watch channel is closed unexpectedly (etcd connection loss, compaction), the controller detects this and re-establishes the watch:
+If the watch channel is closed unexpectedly (etcd connection loss, compaction), the controller re-establishes it from the revision after the last event it observed:
 
 ```
 if the watch channel is closed:
     log: "fencing watch channel closed, reconnecting"
-    watch = store.Watch(ctx, PrefixMembership, WithPrefix)
+    watch = store.Watch(ctx, PrefixMembership, WithPrefix, WithRev(lastRevision+1))
     continue the loop
 ```
 
-The new watch starts from the current etcd revision, so no membership events are lost during the reconnection window. If a membership key was deleted and re-created while the watch was down, the controller sees the current state of the key on reconnect — but because the key was deleted (the node fenced), any subsequent creation (node restart) generates a PUT event that the controller processes normally.
+Reconnecting from "now" instead silently dropped everything that happened during the gap. That mattered because a fence was only ever triggered by an event: a DELETE arriving in the reconnection window was fenced by nothing at all. Resuming from the last revision closes the routine case, and the authoritative sweep covers what remains — a revision compacted away, or a controller that was not running at the time.
 
 ## Fence Protocol
 
@@ -112,12 +122,12 @@ The claim is cluster-wide, not per-process: the same node's expiry is observed b
 
 ```
 if the caller is the reconciliation sweep:
-    if fence_pending:<node_id> is gone:
+    if node_id is not among the recorded intents:
         log: "fence already completed by another controller, nothing owed"
         return
 ```
 
-Winning the claim proves no one else is fencing this node *now*; it does not prove the fence is still owed. The sweep chooses what to fence from a `ListFenceIntents` snapshot, and that snapshot ages while the call waits on a contended claim: two sweeps can list the same intent, the first completes the fence and releases its claim, and the second then wins the now-free claim holding a view of the world from before any of that happened. Without this step it replays the whole fence — a second real preempt or detach against the device, and a second generation bump. Observed on Docker with three controllers on 2026-08-06.
+The check is a listing rather than a read of the single key: an intent recorded for a node whose instance ID was never known has an empty value, which a plain `Get` cannot distinguish from a missing key. Winning the claim proves no one else is fencing this node *now*; it does not prove the fence is still owed. The sweep chooses what to fence from a `ListFenceIntents` snapshot, and that snapshot ages while the call waits on a contended claim: two sweeps can list the same intent, the first completes the fence and releases its claim, and the second then wins the now-free claim holding a view of the world from before any of that happened. Without this step it replays the whole fence — a second real preempt or detach against the device, and a second generation bump. Observed on Docker with three controllers on 2026-08-06.
 
 The watch path skips the check. It acts on a single DELETE event it observed itself rather than a snapshot, so it has nothing stale to guard against; and making it conditional on the intent would mean an intent that failed to record silently disables fencing for that node, which trades a duplicate for a miss.
 

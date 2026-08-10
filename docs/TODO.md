@@ -80,19 +80,13 @@ or over-long field is `EINVAL` rather than a panic; `safeDispatch` recovers
 anything else into one failed request; and both sides of the socket cap a frame
 at 1 MiB before allocating for it.
 
-## 12. A membership deletion missed during a watch reconnect is never fenced
+## 12. A membership deletion missed during a watch reconnect is never fenced — CLOSED
 
-`Controller.Run` (`pkg/fencing/controller.go:96`) re-establishes the watch on
-channel close without a revision, so events between the close and the new watch
-are lost. Fencing intent is only ever recorded from a watch event
-(`controller.go:117`), and `reconcile` only retries intents that were already
-recorded — so a `DELETE` that arrives during the gap is never fenced by
-anything.
-
-- [ ] Resume the watch from the last observed revision instead of from "now".
-- [ ] Make the sweep authoritative rather than a retry queue: compare known
-      nodes against live membership keys, so a node that lost its lease gets
-      fenced whether or not its event was seen.
+The watch resumes from the revision after the last observed event, and the
+sweep is authoritative: it compares known nodes (`gen:` keys) against live
+membership and fences what is missing, using a `fence_done:<node>` mark —
+cleared when the node re-registers — to tell "already fenced" from "still
+owed".
 
 ## 13. Dead and broken metadata APIs
 
