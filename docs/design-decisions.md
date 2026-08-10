@@ -126,3 +126,17 @@ different thresholds and severities for the same invariant.
 `RebalanceArena` stays harness-only. Imbalance has not been observed at the
 cluster sizes this runs at, and the trigger condition and manual-vs-automatic
 posture would have to be decided before the mechanism means anything.
+
+## Verification runs so far
+
+The docker chaos suites are the regression gate used during this work:
+single-cluster scenarios (7/7), arena reclamation (6/6) and a 240 s randomized
+fuzz run (19.6k ops, 8 injected faults) all pass on the current tree. Two real
+bugs came out of them — a read that never reported EOF, and extents stamped one
+generation ahead of their writer.
+
+AWS runs were **not** performed: `scripts/infra/create-infra.sh` provisions
+billable instances and a Multi-Attach volume, which is not something to leave
+running unattended. `scripts/infra/create-infra.sh && scripts/infra/setup-compute.sh
+&& scripts/infra/run-full-test.sh` is still owed before trusting the
+device-enforced fencing paths, which docker cannot exercise.
