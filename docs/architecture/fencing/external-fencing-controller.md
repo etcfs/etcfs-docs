@@ -198,7 +198,7 @@ The generation bump is the authoritative record that a fence has occurred. It se
 
 2. **Lock reclamation gate.** When acquiring a lock that was held by the fenced node, the new holder checks that the generation has been bumped. This ensures the old holder's writes are definitively blocked before the new holder begins writing.
 
-3. **Metadata transaction guard.** Every `AppendExtent` and `UpdateInode` call includes `WithGenerationGuard`, which checks that the writer's generation matches the expected current value. After a bump, the fenced node (if it recovers and tries to resume) will find its generation stale and all its metadata transactions will be rejected.
+3. **Metadata transaction guard.** Every metadata mutation includes `WithGenerationGuard`, which checks that the writer's generation matches the expected current value. After a bump, the fenced node (if it recovers and tries to resume) will find its generation stale and all its metadata transactions will be rejected.
 
 The generation is monotonically non-decreasing. It never resets, never wraps, and never decreases. This is guaranteed by the CAS comparison in `BumpGeneration`.
 

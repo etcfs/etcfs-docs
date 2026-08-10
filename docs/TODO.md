@@ -88,29 +88,13 @@ membership and fences what is missing, using a `fence_done:<node>` mark —
 cleared when the node re-registers — to tell "already fenced" from "still
 owed".
 
-## 13. Dead and broken metadata APIs
+## 13. Dead and broken metadata APIs — CLOSED
 
-`UpdateInode` (`inode.go:72`) compares `ModRevision(key) = 0` with the comment
-"placeholder; caller provides correct rev" — no revision is passed, and
-`ModRevision = 0` means "key does not exist". It succeeds only for an inode
-that is not there and returns "conflict" for every real one.
-
-It has no non-test caller. Neither do `DecrementNlink`, `DeleteInode`,
-`EnsureGeneration`, `AtomicRmRf`, `ListDirentsPaginated`, or `AppendExtent`.
-Two of those are also wrong:
-
-- `AtomicRmRf` (`dirent.go:296`) deletes one directory's dirent prefix. It is
-  not recursive — grandchildren are keyed under *their* parent's inode — and it
-  leaves every inode and extent behind.
-- `ListDirentsPaginated` (`dirent.go:82`) ranges from `DirentPrefix(parent)` to
-  `DirentPrefix(parent+1)`. Those bounds are compared lexicographically, so for
-  parent 9 the range is `dirent:9/` to `dirent:10/`, which is empty. It only
-  works when the two inode numbers have the same digit count.
-
-- [ ] Delete all seven. They are ~150 lines that no production path reaches,
-      and the two broken ones are traps for whoever reaches for them first.
-- [ ] If pagination is wanted later (see the readdir item), write it against
-      `WithPrefix` + `WithLimit` rather than fixing this one.
+Deleted `UpdateInode`, `DecrementNlink`, `DeleteInode`, `EnsureGeneration`,
+`AtomicRmRf` and `ListDirentsPaginated`, the last two of which were also wrong.
+`IncrementNlink` went with them once `AtomicLink` replaced it. `AppendExtent`
+stays: it has no production caller but is the fixture every scrub and arena
+test plants extents with.
 
 ## 14. The generation scrub check flags every healthy node after any fence
 

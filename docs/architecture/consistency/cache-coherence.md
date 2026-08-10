@@ -195,7 +195,7 @@ When a watch event arrives:
 The watch-driven invalidation covers **all directory entry mutations** across all nodes. This includes:
 
 - `AtomicCreateFile` / `AtomicCreateDir` — new directory entry created
-- `AtomicUnlink` / `AtomicRmRf` — directory entry deleted
+- `AtomicUnlink` / `AtomicRmdir` — directory entry deleted
 - `AtomicRename` — old entry deleted, new entry created
 
 It does **not** cover:

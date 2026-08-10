@@ -58,9 +58,9 @@ The two-branch comparison handles the first bump (when the key does not exist ye
 
 If the CAS fails, the old value has changed (another controller replica bumped the generation concurrently). The caller must re-read the current generation and decide whether to retry or abort.
 
-### EnsureGeneration
+### EnsureGenerationKey
 
-Writes a generation key with at least the given value. If the key already exists with a higher or equal value, the write is skipped. This is used during node bootstrap to initialise the generation counter to a known starting point, overwriting a stale value from a previous incarnation.
+Creates `gen:<node_id>` at 0 if it does not exist, and returns the current generation either way. Every node calls it at startup, before serving anything: the guard compares the key's *value*, and a value comparison against a missing key always fails, which would reject every write rather than only a fenced node's.
 
 ### IsFenceActive
 
@@ -98,7 +98,7 @@ Every metadata mutation that modifies extents or locks must include a generation
 | Transaction | Guard Checks | Why |
 |---|---|---|
 | `AppendExtent` | Writer's current generation | Prevents post-fence extent commits |
-| `UpdateInode` (size change) | Writer's current generation | Prevents post-fence attribute changes |
+| `setattr` (size, mode, ownership, times) | Writer's current generation | Prevents post-fence attribute changes |
 | `AtomicLink` | Writer's current generation | Prevents post-fence link creation |
 | `AtomicUnlink` | Writer's current generation | Prevents post-fence link removal |
 | `AcquireLock` (from released lock) | Previous holder's bumped generation | Ensures old holder is truly fenced |
@@ -230,7 +230,7 @@ First fence event:
 Node restarts after first fence:
   gen:node-X exists, value = 1
   → generation = 1
-  EnsureGeneration(X, 1): no-op (already 1)
+  EnsureGenerationKey(X): key exists, returns 1
 
 Second fence event:
   BumpGeneration(X, 1):

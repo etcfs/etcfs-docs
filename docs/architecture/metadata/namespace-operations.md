@@ -36,9 +36,7 @@ The inode is initialised with:
 
 ### Deletion
 
-An inode is eligible for deletion when its `Nlink` reaches zero — meaning no directory entry points to it. `DeleterInode` is a safety-checked operation: it reads the current nlink and refuses to delete if the inode still has references. The deletion itself is a CAS transaction that verifies the inode still exists at the time of deletion.
-
-In practice, inode deletion is handled by `AtomicUnlink`, which decrements nlink and deletes the inode (if nlink reaches zero) in the same transaction as the dirent removal. A standalone `DeleteInode` is only used when an inode must be cleaned up after all links have been removed through other paths.
+An inode is deleted by the transaction that removes the last name referring to it. `AtomicUnlink` drops the link count and deletes the inode record in the same transaction as the dirent — and, for a symlink, the key holding its target. `AtomicRmdir` deletes a directory's record outright, since a directory's count never reaches zero on its own. There is no standalone delete: an inode removed without its name, or a name removed without its inode, is exactly the inconsistency these transactions exist to prevent.
 
 ### Attribute Updates
 
@@ -61,8 +59,6 @@ Attribute changes are written by the `setattr` handler as a CAS transaction pinn
 ### List
 
 `ListDirents` returns all entries in a directory as `(name, ino)` pairs. It performs a prefix scan over `dirent:<parent>/` and returns results sorted in key order.
-
-`ListDirentsPaginated` provides cursor-based pagination for very large directories. It supports a configurable page size limit and returns a cursor string (the last name seen) for fetching the next page. The pagination uses etcd's consistent-revision snapshot to guarantee a stable view of the directory — no entries are duplicated or omitted even if the directory is being modified during the listing.
 
 ## Atomic Create
 
