@@ -100,7 +100,9 @@ if the watch channel is closed:
     continue the loop
 ```
 
-Reconnecting from "now" instead silently dropped everything that happened during the gap. That mattered because a fence was only ever triggered by an event: a DELETE arriving in the reconnection window was fenced by nothing at all. Resuming from the last revision closes the routine case, and the authoritative sweep covers what remains — a revision compacted away, or a controller that was not running at the time.
+A revision that has been compacted away cannot be resumed from, and retrying it would spin: the watch reports the error, the controller starts again from the current revision, and the sweep covers the gap. That is exactly what the sweep is authoritative for.
+
+Reconnecting from "now" unconditionally instead silently dropped everything that happened during the gap. That mattered because a fence was only ever triggered by an event: a DELETE arriving in the reconnection window was fenced by nothing at all. Resuming from the last revision closes the routine case, and the authoritative sweep covers what remains — a revision compacted away, or a controller that was not running at the time.
 
 ## Fence Protocol
 

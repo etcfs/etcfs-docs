@@ -140,3 +140,18 @@ billable instances and a Multi-Attach volume, which is not something to leave
 running unattended. `scripts/infra/create-infra.sh && scripts/infra/setup-compute.sh
 && scripts/infra/run-full-test.sh` is still owed before trusting the
 device-enforced fencing paths, which docker cannot exercise.
+
+## etcd compacts on revisions, and the fencing watch tolerates it
+
+Nothing configured compaction, so every superseded revision was kept forever
+and a filesystem writing metadata constantly would grow the store until the
+backend quota tripped and etcd went read-only — stopping the mount. All three
+deployments now run `--auto-compaction-mode=revision
+--auto-compaction-retention=100000` with an 8 GiB quota. Revision mode over
+periodic: it bounds the store's size directly, which is the failure being
+avoided.
+
+The fencing controller resumes its membership watch from the last revision it
+saw, so it has to handle that revision being compacted away: it restarts from
+the current revision and lets the authoritative sweep cover the gap, rather than
+retrying a revision that will never come back.
