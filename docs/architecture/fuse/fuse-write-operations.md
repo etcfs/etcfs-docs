@@ -173,9 +173,14 @@ WRITE is called when the kernel has data to write to a file. The Go backend rece
 5. Call `sync_file_range()` on each written range to ensure data durability.
 6. Read the node's current fencing generation from `gen:<node_id>` in etcd.
 7. Store one extent entry per run in etcd at `extent:<ino>/<chunk>` with the value `"logical_off,disk_off,length,generation,sequence"`, in logical order. Chunk numbers continue from one past the highest currently in use, and every run of a single write shares one sequence — they are one write, over disjoint logical ranges.
-8. If the write extends beyond the current file size, update the inode size in etcd. Steps 7 and 8 are one generation-guarded transaction.
-9. Reclaim any extent this write has fully buried (see below).
-10. Return the number of bytes written.
+8. If the write extends beyond the current file size, update the inode size in etcd.
+9. Rewrite every extent this write buries to whatever it still leaves readable (see below).
+10. Delete this write's inode-lock key.
+11. Return the number of bytes written.
+
+Steps 7 through 10 are a **single** generation-guarded transaction. Each was once a round trip of its own after the commit, and each was a Raft commit on the critical path of every write — the dominant cost of a write, since the ceiling a write can reach is set by how many sequential Raft commits it pays for (see [Performance Benchmarks](../reliability/performance-benchmarks.md)). Folding them also makes the write atomic in a way it was not: a buried extent stops being referenced at the same revision the extent burying it appears, and the lock is dropped exactly when the work it protected becomes visible.
+
+etcd caps how many operations one transaction may carry, and a single write can bury many extents. What does not fit is reclaimed afterwards in round trips of its own — correct either way, only not free. When anything is left over, the lock release is left out of the transaction too and issued afterwards: a reclaim still to come needs the inode held, or another node could rewrite those extents in between and turn a leak into a lost update.
 
 ### Data-Then-Metadata Ordering
 
@@ -197,9 +202,11 @@ A write is never an in-place update. Overwriting a range allocates fresh blocks 
 
 **Reads must resolve to the newer one.** Every extent carries a sequence number in its value. Extents are ordered by logical offset and then by *descending* sequence, and the read handler takes the first extent covering the offset it wants — so the later write is the one it sees.
 
-**The buried bytes' blocks are dead.** Once the commit lands, each extent the write touched is rewritten to whatever it still leaves readable, and the blocks in between are returned to the free-list. As with truncation this applies only to extents in an arena this node owns; the rest are left for their owner's scrubber.
+**The buried bytes' blocks are dead.** Each extent the write touched is rewritten to whatever it still leaves readable in the same transaction that publishes the write, and the blocks in between are returned to the free-list once that transaction commits. As with truncation this applies only to extents in an arena this node owns; the rest are left for their owner's scrubber.
 
 An extent covered entirely is deleted. One covered at its front or its back is trimmed to the single surviving piece under the original key. One covered in the *middle* leaves two pieces: the head keeps the original key and the tail is written under a fresh one, both in the same transaction, so a crash cannot leave the middle described twice.
+
+Each of these rewrites is a blind put of a value derived from the extent list this write read. It therefore carries a comparison that the record is still at the revision it was read at. Without it a stale read could resurrect an extent that was deleted in between — a real possibility, because the write path's extent read is deliberately served by whichever etcd member the node is connected to rather than by the leader. A comparison that fails is not an error: the write re-reads from the leader and proposes again.
 
 Every surviving piece keeps its parent's sequence number. That is the reason the sequence lives in the value and not in the key: a piece ranked by its own key would claim to be newer than the extent it was cut from, and would then win over a genuinely newer extent overlapping it — reachable, because extents in another node's arena are never trimmed and so do overlap.
 
@@ -207,7 +214,7 @@ Trimming the front moves the survivor's device offset forward, and that distance
 
 What is still left unreclaimed is a covered region smaller than one block, since blocks are the unit of reuse. The bytes are buried and read correctly; their block stays allocated until the extent holding it is fully covered or the file is deleted.
 
-Reclamation happens after the commit, never before: a transaction rejected by the generation guard must not have freed blocks the file still refers to.
+The metadata rewrite rides in the write's own transaction, but the blocks are handed back to the free-list only once that transaction is known to have committed — never before, since a transaction rejected by the generation guard must not have freed blocks the file still refers to.
 
 ### Generation Stamp
 
@@ -254,7 +261,9 @@ Truncation (size change) follows the **metadata-then-data** ordering invariant:
 
 Metadata-then-data ordering ensures the inode size shrinks before the freed blocks are returned to the arena free-list. If the node crashes between steps 2 and 3, the blocks are still allocated (not reusable) but the inode still has the old size — the blocks are wasted but no reader can access them because the extent was removed.
 
-A truncate is an overwrite of everything from the new size to the end of the address space, so steps 1 and 2 run through the same path as [Overwrites](#overwrites) and inherit its rules — including the block-boundary rounding, and the fact that only whole blocks the survivor no longer reads from are handed back.
+A truncate is an overwrite of everything from the new size to the end of the address space, so steps 1 and 2 run through the same path as [Overwrites](#overwrites) and inherit its rules — including the block-boundary rounding, the revision comparison on each rewritten record, and the fact that only whole blocks the survivor no longer reads from are handed back.
+
+Unlike a write, a truncate takes no inode lock, so an extent it planned to rewrite can be rewritten under it by another node. The revision comparison is what catches that: the rewrite is refused rather than applied from a stale view, and the whole pass is retried from a fresh read, which is the only view a correct plan can be built from.
 
 They apply only to the extents whose device range **this node's arenas own**. A file's bytes may sit in several nodes' arenas — a write always allocates from the writer's own arena, so a file written by two nodes is spread across both — and only an arena's owner may rewrite one of its extent records. Deleting a peer's record would strip the reference that peer's in-memory free-list is rebuilt from, stranding those blocks as allocated until it restarted. Extents belonging to another node are therefore left in place, and its scrubber reclaims them (see [Continuous Scrubber](../reliability/continuous-scrubber.md#3-dead-extent-detection)).
 

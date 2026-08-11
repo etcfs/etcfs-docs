@@ -359,7 +359,7 @@ round-trip-bound ceiling to this one, not a Redis-level one — that comparison
 has not actually been run and would be worth doing before claiming an
 advantage either way.
 
-**[Done, unmeasured.]** Both cuts are implemented. The lock lease is now
+**[Done, measured.]** Both cuts are implemented. The lock lease is now
 scoped to the node rather than the write: one lease, granted on first
 acquisition and renewed for the life of the process, with each holder's key
 carrying a per-acquisition counter so two holders on the same node stay
@@ -372,8 +372,23 @@ the safety gap the item's reasoning leaves open closed explicitly: the guarded
 commit's only comparison was the fencing generation, so a stale read really
 could have proposed a chunk number that was still live. The commit now also
 compares each new extent key's create-revision against zero, and a rejection
-that is not a fence re-reads linearizably and proposes again. Neither change
-has been benchmarked.
+that is not a fence re-reads linearizably and proposes again.
+
+A re-run on a fresh 3-node cluster against a 1000-IOPS io2 volume gave 176
+randwrite / 149 randread IOPS, against the ~100-105 the earlier report
+measured. That is short of what removing round trips predicts, and tracing why
+turned up a cost neither this item nor the benchmark report had counted: the
+reclaim of the extents a write buries ran as its own transaction *after* the
+commit, and on a random-overwrite workload almost every write buries
+something. Two further cuts followed from that, and are also implemented: the
+reclaim and the lock release are now folded into the single transaction that
+publishes the write, which takes an overwriting write from four committed
+operations to two — the lock acquire, and one transaction carrying the
+extents, the size change, the reclaim and the release together. Folding the
+reclaim in also closed a latent hole the serializable read opened: a rewrite
+derived from a stale extent list could resurrect a record deleted in between,
+so each rewritten extent now carries a comparison on the revision it was read
+at. The folding has not been benchmarked.
 
 ## Features the current structure makes cheap
 

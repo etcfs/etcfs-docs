@@ -146,11 +146,13 @@ harness) answers that directly by live-modifying the data volume's
 provisioned IOPS mid-run: EtcFS's own throughput stays flat (~100-105 IOPS)
 across a 10x change in the device's ceiling, which raw throughput on the same
 volume tracks exactly. The bottleneck is etcd's per-write round-trip count,
-not the device or FUSE — since measured, the lock's per-write
-`GrantLease`/`RevokeLease` pair has been replaced by a per-node session lease
-and the write path's extent read made serializable, which removes two of the
-four Raft commits a write used to pay for; the harness has not been re-run
-against that build. See
+not the device or FUSE — since measured, the lock's per-write `GrantLease` has
+been replaced by a per-node session lease, the write path's extent read made
+serializable, and the reclaim of buried extents plus the lock release folded
+into the transaction that publishes the write, taking a write from four
+committed operations to two. A re-run at the 1000-IOPS tier after the first
+two of those changes measured 176 randwrite / 149 randread IOPS against the
+earlier ~100-105; the folding is not yet benchmarked. See
 [Benchmark Reports: IOPS Ceiling, EFS Throughput Modes, Contention (2026-08-11)](../../reports/benchmark-reports/2026-08-11-iops-ceiling-efs-throughput-contention.md),
 which also covers EFS provisioned-throughput mode (the fixed-budget analogue
 of `io2`'s `--iops`, since bursting mode has no such stated ceiling) and
