@@ -96,6 +96,33 @@ Both sides use consistent byte order (big-endian). The opcode identifies the FUS
 | 23 | WRITE | `fuse_reply_write` |
 | 24 | FSYNC | `fuse_reply_err` |
 | 25 | MKNOD | `fuse_reply_entry` |
+| 26 | FLUSH | `fuse_reply_err` |
+| 29 | READDIRPLUS | `fuse_reply_buf` (dirent + attr entries) |
+
+Codes 18 and 19 (ALLOC, COMMIT) are answered `ENOSYS`: block allocation happens
+inside the WRITE handler rather than as a request of its own. Codes 27 and 28
+were GETLK and SETLK, removed so the kernel handles `fcntl()` locks locally;
+they are deliberately not reused, so an old C daemon's lock request fails
+loudly instead of being served as something else.
+
+### Backend Dispatch
+
+On the Go side the opcode is looked up in a table (`ops` in
+`internal/ipc/socket.go`), one entry per operation, carrying the handler and
+the name the operation's metrics and logs use. An opcode with no entry is
+`ENOSYS` by construction, so adding an operation is one new entry rather than
+edits spread across a dispatch switch, a metrics label list, and a default
+branch that has to stay correct.
+
+The dispatch layer is also where the cross-cutting concerns live, each applied
+once for every operation rather than per handler: the request deadline, the
+panic barrier that keeps one bad request from ending every mount the daemon
+serves, and the operation counters and latency histogram.
+
+Payload bounds are not declared in the table. Every handler decodes through the
+bounded reader in the same file, which refuses to read past the payload it was
+given and leaves the handler to reply `EINVAL`; a declared arity would be a
+second copy of that fact, one that could disagree with the decoder.
 
 ### Payload Formats (represented)
 

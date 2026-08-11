@@ -166,7 +166,7 @@ Ordered by severity.
 
 ## SOLID
 
-- **Open/Closed — `internal/ipc/handlers.go` (591 lines).** Adding a FUSE
+- **[Done] Open/Closed — `internal/ipc/handlers.go` (591 lines).** Adding a FUSE
   operation means editing the central dispatch switch, its decode block, and
   the C-side mirror in `pkg/fuse/ops.c` (1,122 lines). That is three edits to
   already-tested code per new operation, which is why the missing POSIX surface
