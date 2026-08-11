@@ -92,6 +92,28 @@ from configuration was the alternative, but none of the existing flags actually
 answer it — `--volume-id` is set on single-node runs too — so the safe default
 plus an explicit opt-out is the honest version.
 
+## A connection per FUSE worker, not a response demultiplexer
+
+Making the mount concurrent needed a decision about the IPC protocol, because
+the protocol has no request identifiers: a reply is whatever arrives next on
+the socket. The obvious fix is to add an identifier and a demultiplexer — one
+connection, a table of outstanding requests, a reader thread that matches
+replies to waiters. That is a protocol change on both sides, plus a data
+structure with its own locking, to serve a daemon that already has a natural
+unit of concurrency.
+
+The cheaper answer is a connection per worker thread, kept in thread-local
+storage and opened on first use. The exchange in `ops.c` stays exactly as
+synchronous as it was, the wire format does not change, and the Go side needs
+nothing at all: it already serves a goroutine per connection, so N workers
+become N goroutines. What it costs is a file descriptor and a socket buffer
+per thread, which is a much better trade than a demultiplexer nobody has to
+debug at three in the morning.
+
+`clone_fd` is enabled alongside it. Without it every worker reads the same
+`/dev/fuse` descriptor, and the kernel request queue simply becomes the next
+place where the concurrency is lost.
+
 ## Write barriers are opt-in, and the readback is one sector
 
 Every write used to end with a `BLKFLSBUF` ioctl, a `sync_file_range`, and a

@@ -12,7 +12,7 @@ The synchronous IPC model used by every FUSE operation handler: how the C daemon
 
 ## Dispatch Model
 
-The FUSE daemon uses a single-threaded event loop (`fuse_session_loop`). Each kernel upcall is processed by one handler at a time. The handler:
+The FUSE daemon uses a multi-threaded event loop (`fuse_session_loop_mt`). Kernel upcalls are processed concurrently, one handler per worker thread. The handler:
 
 1. Builds the request payload as a binary buffer.
 2. Sends the payload over the Unix socket to the Go backend.
@@ -20,7 +20,7 @@ The FUSE daemon uses a single-threaded event loop (`fuse_session_loop`). Each ke
 4. Parses the response.
 5. Calls `fuse_reply_*` on the same thread.
 
-There is no IPC worker thread, no request queue, no callback indirection. The socket is accessed synchronously from the single FUSE reader thread, so there is never concurrent socket access. This eliminates the need for `clone_fd`, worker thread synchronization, and callback dispatch infrastructure.
+There is no IPC worker thread, no request queue, no callback indirection. Each worker thread owns its own socket to the backend, opened on that thread's first request and reused for every later one, so the exchange stays synchronous without a socket ever being shared. That is what removes the need for a response demultiplexer: a reply is still simply the next thing to arrive on the connection that sent the request.
 
 ## Request Lifecycle
 
@@ -45,9 +45,9 @@ ipc_sync(fd, opcode, payload, plen, &resp, &rlen):
   return 0 on success
 ```
 
-The handler blocks inside `recv_full()` until the Go backend has processed the request and sent the response. During this time, no other FUSE requests can be processed (single-threaded loop). This is acceptable because the typical metadata operation completes in 5–20 ms (etcd round-trip).
+The handler blocks inside `recv_full()` until the Go backend has processed the request and sent the response. Only that request waits: other FUSE workers continue serving on their own connections, so one slow etcd operation no longer stalls the mount. A typical metadata operation completes in 5–20 ms (etcd round-trip).
 
-The single threading is load-bearing, not incidental: every handler shares one IPC file descriptor with no mutex around it, so two concurrent exchanges would interleave their frames and read each other's replies. Making the mount concurrent means giving each FUSE worker its own connection — the Go side already serves one goroutine per connection — not switching to `fuse_session_loop_mt()`.
+A connection is never shared between threads. The protocol carries no request identifiers — a reply is whatever arrives next on the socket — so two threads on one descriptor would interleave their frames and read each other's replies, which is protocol corruption rather than a mere race. `etcfs_ipc_fd()` keeps each thread's connection in thread-local storage and connects on first use; the Go side already serves one goroutine per connection, so N workers become N goroutines with no change on that side. The loop also enables `clone_fd`, giving each worker its own `/dev/fuse` descriptor so the kernel request queue does not become the next serialisation point.
 
 A response length is bounded before it is allocated, on both sides of the socket: the Go daemon refuses a request frame above 1 MiB and the C daemon refuses a response above the same cap, rather than allocating whatever the length field claims.
 

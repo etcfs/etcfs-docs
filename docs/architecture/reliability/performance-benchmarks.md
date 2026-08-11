@@ -97,12 +97,18 @@ The resulting numbers — **~30 write IOPS, ~44 read IOPS, 35–94 ms p99
 latency** on 4 KiB ops — are consistent between the `dd` measurement and
 the final `psync` fio run. `benchmark.sh` now branches on the target:
 `libaio`/`iodepth=32`/`size=1G` for raw/ext4/EFS, `psync`/`iodepth=1`/`size=8M`
-for EtcFS. This isn't a handicap — `docs/NEXT_STEPS.md` item 24 already
-documents that the FUSE daemon is single-threaded end to end, one shared fd
-with no mutex, so `iodepth=1` and a syscall-blocking engine are the
-*honest* way to drive a target with no internal concurrency to hide queuing
-behind. A high-queue-depth run against a synchronous single-threaded server
-measures queue drain time (or, as above, file-layout time), not the server.
+for EtcFS. That was not a handicap when these numbers were taken: the FUSE
+daemon was then single-threaded end to end, one shared fd with no mutex, so
+`iodepth=1` and a syscall-blocking engine were the *honest* way to drive a
+target with no internal concurrency to hide queuing behind, and a
+high-queue-depth run would have measured queue drain time (or, as above,
+file-layout time) rather than the server.
+
+The daemon now runs `fuse_session_loop_mt` with a backend connection per
+worker thread, so that reasoning no longer holds and the single-job
+configuration now *understates* it: concurrency the daemon has is
+concurrency this job never asks for. Re-running EtcFS with `numjobs` above 1
+is what measures the change; the numbers below predate it.
 
 **`seqwrite-128k` is the most direct evidence for item 29's write-path
 theory.** 2.6 IOPS at 128 KiB is 335 KiB/s — roughly 1/75th of raw/ext4's

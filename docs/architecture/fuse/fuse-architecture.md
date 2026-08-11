@@ -42,11 +42,11 @@ The IPC protocol is request-response. The C side sends a request and blocks its 
 
 2. **Connect to Go backend.** A Unix stream socket is opened to the Go daemon's listener. If the connection fails, the C daemon exits with an error.
 
-3. **Initialize FUSE session.** `fuse_session_new` creates a session with the registered low-level operation table. A single-threaded event loop (`fuse_session_loop`) processes all kernel upcalls sequentially.
+3. **Initialize FUSE session.** `fuse_session_new` creates a session with the registered low-level operation table. A multi-threaded event loop (`fuse_session_loop_mt`) processes kernel upcalls concurrently.
 
 5. **Mount filesystem.** `fuse_session_mount` registers the mount with the kernel. From this point, the kernel can issue FUSE requests.
 
-6. **Enter event loop.** The daemon blocks in `fuse_session_loop`, processing kernel upcalls. Each call triggers an IPC exchange with the Go backend.
+6. **Enter event loop.** The daemon blocks in `fuse_session_loop_mt`, processing kernel upcalls. Each call triggers an IPC exchange with the Go backend over the calling worker's own connection.
 
 ### Shutdown Sequence
 
@@ -74,7 +74,7 @@ The mount is created with `-o default_permissions`, which hands access control t
 
 That is a deliberate division of labour. EtcFS implements no access checks of its own, because a second copy of those rules in the daemon would be one that can diverge from the kernel's — and getting them subtly wrong is how a filesystem ends up enforcing something other than what `ls -l` shows. What the daemon owes in return is accurate ownership: every creating operation carries `fuse_req_ctx(req)->uid/gid` and stores it, so the values the kernel checks against are the ones the caller actually had.
 
-The single-threaded event loop (`fuse_session_loop`) processes one kernel upcall at a time, making the session loop simpler and avoiding the threading issues of multi-threaded mode. Each handler does synchronous IPC with the Go backend — the loop serialises metadata operations naturally through the single-threaded execution model.
+The multi-threaded event loop (`fuse_session_loop_mt`) processes kernel upcalls concurrently. Each handler still does synchronous IPC with the Go backend, but on a connection private to its worker thread, so a request waits only for its own backend round trip. Nothing is serialised at the daemon any more: what orders concurrent operations on the same inode is the etcd-backed inode lock, which is cluster-wide and therefore has to do that job across nodes regardless of how many threads a single mount runs.
 
 ## IPC Binary Protocol
 
