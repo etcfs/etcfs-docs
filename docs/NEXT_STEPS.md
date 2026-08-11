@@ -177,7 +177,7 @@ Ordered by severity.
   instead of once per case. This is a real refactor, not a cleanup; it is worth
   doing before, not after, the next four operations land.
 
-- **Single Responsibility — `cmd/etcfuse-meta/main.go` (287 lines).** It parses
+- **[Done] Single Responsibility — `cmd/etcfuse-meta/main.go` (287 lines).** It parses
   config, runs `fsck`, runs `info`, joins membership, selects a fencing
   backend, starts the scrubber, the arena reaper, the metrics server, two IPC
   servers, and the signal handler, and owns the shutdown ordering — including
