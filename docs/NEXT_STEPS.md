@@ -55,7 +55,7 @@ Ordered by severity.
 
 ### Should fix
 
-- **[Should fix] `internal/config/config.go:15` — `Version` is documented as
+- **[Done] `internal/config/config.go:15` — `Version` is documented as
   "stamped at build time" and never stamped.** No `-ldflags -X` appears in the
   Makefile, the Dockerfile, or the release job, so `etcfuse-meta --version`
   prints `0.1.0` forever while `semantic-release` tags `v1.x.y`. Anyone
@@ -72,7 +72,7 @@ Ordered by severity.
   host) producing both binaries plus `SHA256SUMS`, attached via
   `@semantic-release/github`'s `assets`.
 
-- **[Should fix] `.github/workflows/ci.yml` — the integration job covers one
+- **[Done] `.github/workflows/ci.yml` — the integration job covers one
   package.** It runs `go test -tags=integration ./pkg/metadata/ -run
   Integration`. The integration suites in `pkg/fencing`
   (`controller_integration_test.go`), `pkg/arena`, `pkg/scrub`, `internal/ipc`
@@ -82,13 +82,6 @@ Ordered by severity.
   provisioned in that job; extending it to `./...` is close to free. If the
   full set is too slow for every push, split it into a nightly job rather than
   leaving it unrun.
-
-- **[Should fix] Eight files reference `docs/TODO-hardening.md`, which was
-  deleted in `098d276`.** `pkg/membership/membership.go:146` and five chaos
-  scripts cite section numbers in a file that no longer exists, so a reader
-  following the pointer — the exact reader those comments were written for —
-  finds nothing. Fix: repoint each to the `docs/TODO.md` item or the
-  architecture doc that absorbed it.
 
 - **[Should fix] `pkg/watch/` is dead code.** The package doc says so plainly
   ("nothing constructs a `Mux` yet, and cache invalidation currently goes over
@@ -100,7 +93,7 @@ Ordered by severity.
   pretending to be an implementation. If it is genuinely next on the roadmap,
   the honest version is a docs section plus a TODO item.
 
-- **[Should fix] The README describes subsystems that no longer exist.** It is
+- **[Done] The README describes subsystems that no longer exist.** It is
   the most-read file in the repository and it has drifted:
   - The "Journaling — what replaces it" section describes "a **small local
     WAL** (`pkg/walgo`)" as part of the current design. `pkg/walgo` does not
@@ -134,16 +127,16 @@ Ordered by severity.
 
 ### Consider
 
-- **[Consider] `.github/workflows/ci.yml` pins Go 1.22 while `go.mod` requires
+- **[Done] `.github/workflows/ci.yml` pins Go 1.22 while `go.mod` requires
   1.24.0.** CI is green because `GOTOOLCHAIN=auto` silently downloads 1.24 on
   every job, so the pin buys nothing and costs a download; `setup-go`'s module
   cache is also keyed to the wrong toolchain. Fix: `go-version-file: go.mod`.
 
-- **[Consider] `Makefile:12` — `GO_MODULE := github.com/anomalyco/etcfuse` is
+- **[Done] `Makefile:12` — `GO_MODULE := github.com/anomalyco/etcfuse` is
   stale** (the module is `github.com/MHS-20/EtcFS`) and unused. Delete it or
   correct it; a wrong constant is worse than no constant.
 
-- **[Consider] No coverage is measured anywhere.** For a project whose central
+- **[Done] No coverage is measured anywhere.** For a project whose central
   claim is correctness under fault injection, "which branches has nothing ever
   executed" is a question worth being able to answer. `go test
   -coverprofile` in CI and a coverage summary in the release notes is a small
@@ -206,7 +199,7 @@ reservation, no-op) is a genuine case of DIP done right, and item 32's decision
   the cache-coherence doc.
 - Replace `pkg/metrics`'s registry with `prometheus/client_golang` at the same
   time the call sites are instrumented — fewer lines, plus histograms.
-- Replace `Makefile`'s stale `GO_MODULE` with nothing.
+- Replace `Makefile`'s stale `GO_MODULE` with nothing. *(Done.)*
 - `scripts/infra/*.sh` reimplements VPC, security group, IAM and instance
   provisioning in bash. It works and it is well-tested, so this is not urgent —
   but a Terraform module is the version a user can adopt without reading, and
