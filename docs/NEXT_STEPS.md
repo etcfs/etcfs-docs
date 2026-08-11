@@ -151,8 +151,10 @@ Ordered by severity.
   an operator actually wants. Doing both at once means instrumenting the call
   sites exactly once.
 
-- **[Consider] No `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, or
-  issue templates.** The project has a strict, unusual, and genuinely good
+- **[Done, except the DCO] No `CONTRIBUTING.md`, `SECURITY.md`,
+  `CODE_OF_CONDUCT.md`, or issue templates.** The sign-off requirement is left
+  out until the copyright question below is settled, since it is part of that
+  decision rather than separate from it. The project has a strict, unusual, and genuinely good
   commit convention (header-only, past tense, ≤100 chars) enforced by a
   pre-push hook and consumed by `semantic-release`. It is documented nowhere a
   first-time contributor would look, so their first PR will get the message
