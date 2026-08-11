@@ -6,7 +6,7 @@ The background verification system that cross-checks etcd metadata against itsel
 
 - [Design Philosophy](#design-philosophy)
 - [Scrubber Architecture](#scrubber-architecture)
-- [Six Invariant Checks](#six-invariant-checks)
+- [Seven Invariant Checks](#seven-invariant-checks)
 - [Scrub Pass Lifecycle](#scrub-pass-lifecycle)
 - [Rate Limiting](#rate-limiting)
 - [Anomaly Classification](#anomaly-classification)

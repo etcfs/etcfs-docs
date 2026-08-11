@@ -4,13 +4,13 @@ The raw block device access layer that performs reads and writes against the sha
 
 ## Table of Contents
 
-- [Go Block I/O Library](#go-block-io-library)
+- [Go Block I/O Library](#go-block-io-library-pkgblockio)
 - [Architecture](#architecture)
 - [Device Discovery](#device-discovery)
 - [Synchronous I/O](#synchronous-io)
 - [Data Durability](#data-durability)
 - [Buffer Management](#buffer-management)
-- [Go Block I/O Library](#go-block-io-library)
+- [Go Block I/O Library](#go-block-io-library-pkgblockio)
 - [Interaction with the Arena Allocator](#interaction-with-the-arena-allocator)
 
 ## Architecture

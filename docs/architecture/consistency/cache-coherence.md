@@ -10,7 +10,7 @@ How EtcFS ensures that data written by one node is visible to reads from other n
 - [Per-Inode Locking](#per-inode-locking)
 - [Watch-Driven Cache Invalidation](#watch-driven-cache-invalidation)
 - [EBS Multi-Attach Propagation](#ebs-multi-attach-propagation)
-- [O_DIRECT and Kernel Page Cache](#odirect-and-kernel-page-cache)
+- [O_DIRECT and Kernel Page Cache](#o_direct-and-kernel-page-cache)
 - [Cache Coherence Guarantees](#cache-coherence-guarantees)
 - [Edge Cases and Limitations](#edge-cases-and-limitations)
 

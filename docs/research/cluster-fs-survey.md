@@ -22,7 +22,7 @@
 
 ## 1. GFS2 (Global File System 2)
 
-**Source:** [kernel.org docs](https://www.kernel.org/doc/html/latest/filesystems/gfs2.html), [Red Hat GFS2 documentation](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/managing_file_systems/assembly_overview-of-the-gfs2-file-system_managing-file-systems), [SUSE GFS2 guide](https://documentation.suse.com/sle-ha/15-SP4/html/SLE-HA-all/cha-ha-gfs2.html), [Wikipedia](https://en.wikipedia.org/wiki/GFS2), [landley.net GFS2 overview](https://landley.net/kdocs/htmldocs/gfs2.html)
+**Source:** [kernel.org docs](https://docs.kernel.org/filesystems/gfs2/index.html), [Red Hat GFS2 documentation](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/managing_file_systems/assembly_overview-of-the-gfs2-file-system_managing-file-systems), [SUSE GFS2 guide](https://documentation.suse.com/sle-ha/15-SP4/html/SLE-HA-all/cha-ha-gfs2.html), [Wikipedia](https://en.wikipedia.org/wiki/GFS2)
 
 GFS2 is a **symmetric, shared-disk cluster filesystem** where every node has direct, equal access to the same block storage. It relies on an external **Distributed Lock Manager (DLM)** for coordination and **STONITH fencing** for safety.
 

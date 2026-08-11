@@ -108,7 +108,7 @@ grows with node count. That is an accepted tradeoff at current scale, not an
 oversight — but it is the structure most likely to need reworking first if
 metadata-creation throughput becomes a target. A per-node-range scheme mirroring
 the arena allocator is the obvious direction; see
-[Possible future extensions](#possible-future-extensions) below.
+[Possible future extensions](../../../README.md#possible-future-extensions).
 
 An earlier iteration of this document described exactly that range-based scheme
 as though it were implemented. It was not: `ReserveInodeRange`/`InodeRange`

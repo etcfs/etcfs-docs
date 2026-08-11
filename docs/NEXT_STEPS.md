@@ -206,6 +206,10 @@ reservation, no-op) is a genuine case of DIP done right, and item 32's decision
   provisioning in bash. It works and it is well-tested, so this is not urgent —
   but a Terraform module is the version a user can adopt without reading, and
   it deletes the state-file handling (`infra-state-*.json`) entirely.
+  *(Deliberately deferred: the scripts work and are exercised by the chaos
+  suite, and the module's eventual home is the separate
+  `terraform-aws-etcfs` repository the repository-structure section describes,
+  which is downstream of the ownership decision.)*
 
 ---
 
