@@ -115,7 +115,7 @@ Ordered by severity.
   Worth a pass with a link checker wired into the docs CI workflow so it cannot
   recur.
 
-- **[Should fix] `make test-c` is a stub.** It echoes "C tests will be added in
+- **[Done] `make test-c` is a stub.** It echoes "C tests will be added in
   subsequent phases". `pkg/fuse/ops.c` alone is 1,122 lines and carries the
   whole FUSE operation surface, including the response-bounding and
   name-length checks that closed items 8, 11 and 34. Those checks are pure
