@@ -13,8 +13,8 @@
 3. [CephFS](#3-cephfs)
 4. [GlusterFS](#4-glusterfs)
 5. [Cloud-Native File Services (EFS, Filestore, Azure Files)](#5-cloud-native-file-services-efs-filestore-azure-files)
-6. [HPC Filesystems: Lustre & BeeGFS](#6-hpc-filesystems-lustre--beegfs)
-7. [AWS EBS Multi-Attach — Deep Dive](#7-aws-ebs-multi-attach--deep-dive)
+6. [HPC Filesystems: Lustre and BeeGFS](#6-hpc-filesystems-lustre-and-beegfs)
+7. [AWS EBS Multi-Attach: Deep Dive](#7-aws-ebs-multi-attach-deep-dive)
 8. [Common Failure Modes in Cluster Filesystems](#8-common-failure-modes-in-cluster-filesystems)
 9. [Summary of Design Lessons for EtcFS](#9-summary-of-design-lessons-for-etcfs)
 
@@ -453,7 +453,7 @@ Split-brain is a first-class concern in GlusterFS replicated volumes:
 
 ---
 
-## 6. HPC Filesystems: Lustre & BeeGFS
+## 6. HPC Filesystems: Lustre and BeeGFS
 
 ### 6.1 Lustre
 
@@ -480,7 +480,7 @@ Split-brain is a first-class concern in GlusterFS replicated volumes:
 
 ---
 
-## 7. AWS EBS Multi-Attach — Deep Dive
+## 7. AWS EBS Multi-Attach: Deep Dive
 
 **Source:** [AWS EBS Multi-Attach documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-volumes-multi.html), [AWS NVMe reservations docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nvme-reservations.html), [AWS re:Post](https://repost.aws), [AWS EBS best practices](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ebs-volumes.html)
 

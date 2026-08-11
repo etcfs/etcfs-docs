@@ -107,8 +107,8 @@ node, against one key. Unlike arena allocation it does not shard, so contention
 grows with node count. That is an accepted tradeoff at current scale, not an
 oversight — but it is the structure most likely to need reworking first if
 metadata-creation throughput becomes a target. A per-node-range scheme mirroring
-the arena allocator is the obvious direction; see
-[Possible future extensions](../../../README.md#possible-future-extensions).
+the arena allocator is the obvious direction, and is listed among the possible
+future extensions in the repository README.
 
 An earlier iteration of this document described exactly that range-based scheme
 as though it were implemented. It was not: `ReserveInodeRange`/`InodeRange`
