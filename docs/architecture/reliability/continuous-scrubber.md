@@ -255,8 +255,8 @@ This is what makes file deletion actually return disk space. `AtomicUnlink` remo
 
 When the scrubber finds anomalies, it:
 1. Logs a WARN message with per-type counts: "scrub found anomalies: count=3 collisions=1 orphans=2".
-2. Increments the `etcfuse_scrub_anomalies_total` Prometheus counter with a `type` label (collision, orphan, dead, range, generation, nlink).
-3. Stores the anomaly in the in-memory list for Prometheus gauge queries.
+2. Increments the `etcfuse_scrub_anomalies_total` Prometheus counter with a `type` label (collision, orphan, dead, range, generation, nlink, unreferenced).
+3. Stores the anomaly in the in-memory list, which `fsck` and the daemon's logs read.
 
 In the production deployment, a Prometheus alert rule fires on `etcfuse_scrub_anomalies_total > 0` for the types that need human review. Orphan and dead findings are excluded: both are routine, and a dead extent in particular is the ordinary result of a truncate or an overwrite rather than a fault.
 ```
@@ -274,16 +274,18 @@ Orphan anomalies generate a WARN-level alert rather than a critical alert, becau
 
 ## Metrics Output
 
-The scrubber exposes the following metrics through the metrics registry (or Prometheus in production):
+The scrubber exposes the following metrics on the `/metrics` endpoint served by `--metrics-addr`:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `etcfuse_scrub_anomalies_total` | Counter | `type` | Number of anomalies detected, by type |
 | `etcfuse_scrub_passes_total` | Counter | — | Number of completed scrub passes |
-| `etcfuse_scrub_last_run_seconds` | Gauge | — | Unix timestamp of the last scrub pass |
-| `etcfuse_scrub_anomaly_details` | Gauge | `type, ino` | Per-inode anomaly detail (1 = anomaly exists for this inode) |
+| `etcfuse_scrub_last_run_seconds` | Gauge | — | Unix timestamp of the last completed scrub pass |
 
-The metrics are thread-safe — the scrubber updates them under a mutex that protects the anomaly list and the pass counter.
+Per-anomaly detail is deliberately not a metric. A gauge labelled by inode grows a
+series per affected inode, which is how a metrics backend is made to fall over
+by a filesystem fault; the detail lives in the log line and in `fsck` output
+instead.
 
 ## Integration with the Fencing Generation Protocol
 

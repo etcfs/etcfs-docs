@@ -37,7 +37,7 @@ Ordered by severity.
 
 ### Blocking
 
-- **[Blocking] `cmd/etcfuse-meta/main.go:226` — the metrics registry is
+- **[Done] `cmd/etcfuse-meta/main.go:226` — the metrics registry is
   created and immediately orphaned.** `metrics.NewRegistry()` is passed to
   `metrics.StartServer` and then dropped; it is never handed to the IPC
   service, the allocator, the scrubber, the fencing controller, or membership.
@@ -143,7 +143,7 @@ Ordered by severity.
   change; a hard percentage gate is not recommended — it rewards testing the
   easy code.
 
-- **[Consider] `pkg/metrics` is a hand-rolled Prometheus.** It implements
+- **[Done] `pkg/metrics` is a hand-rolled Prometheus.** It implements
   counters and gauges, has no histograms, and its own doc says "in production
   it would be backed by the Prometheus client library". Since the metrics need
   wiring anyway (finding 1), wiring `prometheus/client_golang` costs less code
@@ -198,7 +198,7 @@ reservation, no-op) is a genuine case of DIP done right, and item 32's decision
 - Delete `pkg/watch/` (≈ one package, zero call sites). Move its reasoning to
   the cache-coherence doc.
 - Replace `pkg/metrics`'s registry with `prometheus/client_golang` at the same
-  time the call sites are instrumented — fewer lines, plus histograms.
+  time the call sites are instrumented — fewer lines, plus histograms. *(Done.)*
 - Replace `Makefile`'s stale `GO_MODULE` with nothing. *(Done.)*
 - `scripts/infra/*.sh` reimplements VPC, security group, IAM and instance
   provisioning in bash. It works and it is well-tested, so this is not urgent —
@@ -935,9 +935,10 @@ These could not be settled from the repository alone.
   operators, because the AGENTS.md and README framing reads as a real system
   rather than a paper artifact.
 - **Are the `pkg/metrics` metric names in `metrics_test.go` the intended
-  production surface?** The wiring fix should adopt them if so; if they were
-  sketches, the naming should be settled before instrumentation, because metric
-  names are an API and renaming them later breaks dashboards.
+  production surface?** *(Settled: the wiring adopted them, minus the
+  per-inode gauges — a series per affected inode is a way to take a metrics
+  backend down during a fault. The surface is documented in
+  `docs/architecture/cluster-ops/observability.md`.)*
 - **Was `pkg/watch` shelved or deferred?** If a watch multiplexer is genuinely
   planned, the recommendation to delete it changes to a TODO item plus a design
   doc. Nothing in the tracking list mentions it either way.
