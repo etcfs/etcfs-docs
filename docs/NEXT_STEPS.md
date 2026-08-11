@@ -317,7 +317,7 @@ The ceiling is round-trip count, not etcd throughput or FUSE overhead.
 
 Two concrete cuts, in the order they should be tried:
 
-- **Session-scoped lease instead of per-write grant/revoke.** `AcquireLock`
+- **[Done] Session-scoped lease instead of per-write grant/revoke.** `AcquireLock`
   (`pkg/metadata/lock.go`) grants a fresh lease and revokes it on every single
   write. A lease held across a file's open lifetime — granted once, kept
   alive the same way membership leases already are, writes become a plain
@@ -330,7 +330,7 @@ Two concrete cuts, in the order they should be tried:
   another node's write wait for this node's close, or the lease TTL, whichever
   comes first — worth stating explicitly before building it, not discovering
   it in a chaos run.
-- **Serializable, not linearizable, reads for `GetExtents`.** The read in
+- **[Done] Serializable, not linearizable, reads for `GetExtents`.** The read in
   `handleWriteBlock` (`internal/ipc/datapath.go`) that reconstructs the next
   chunk/sequence number goes through etcd's default linearizable read, which
   is a full leader round trip. The actual correctness check for the write
@@ -358,6 +358,22 @@ fairer comparison (TiKV is itself Raft-based), and should show a similar
 round-trip-bound ceiling to this one, not a Redis-level one — that comparison
 has not actually been run and would be worth doing before claiming an
 advantage either way.
+
+**[Done, unmeasured.]** Both cuts are implemented. The lock lease is now
+scoped to the node rather than the write: one lease, granted on first
+acquisition and renewed for the life of the process, with each holder's key
+carrying a per-acquisition counter so two holders on the same node stay
+distinct, and a release deleting its own key rather than revoking a lease that
+now backs every lock the node holds. The fairness question the item raises does
+not arise, because the delegation is of the *lease*, not of the lock — a lock
+is still taken and released within one operation, so no waiter waits on another
+node's `close()`. The extent read in `handleWriteBlock` is serializable, with
+the safety gap the item's reasoning leaves open closed explicitly: the guarded
+commit's only comparison was the fencing generation, so a stale read really
+could have proposed a chunk number that was still live. The commit now also
+compares each new extent key's create-revision against zero, and a rejection
+that is not a fence re-reads linearizably and proposes again. Neither change
+has been benchmarked.
 
 ## Features the current structure makes cheap
 

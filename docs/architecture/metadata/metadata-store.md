@@ -31,7 +31,7 @@ Comparisons (`Cmp`) test key attributes: whether a key exists (CreateRevision > 
 
 Etcd leases provide time-to-live (TTL) semantics on keys. A key created with a lease is automatically deleted when the lease expires. `GrantLease` creates a lease with a configurable TTL. `KeepAlive` maintains a stream that must be consumed to refresh the lease — if the stream breaks and is not re-established, the lease expires and all associated keys are deleted. `RevokeLease` immediately terminates a lease.
 
-Leases are the mechanism behind lock expiry and membership liveness detection. A node that crashes stops consuming its keepalive channel; after TTL + grace margin, etcd deletes its lock and membership keys.
+Leases are the mechanism behind lock expiry and membership liveness detection. A node that crashes stops renewing — its membership lease, and the single session lease every lock it holds is written under; after TTL + grace margin, etcd deletes its lock and membership keys.
 
 ### Watches
 

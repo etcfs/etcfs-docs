@@ -17,9 +17,9 @@ Lock operations, lease-backed lock expiry, fencing generations, and the safety p
 
 EtcFS provides two distinct lock classes:
 
-**Data locks** are per-inode locks that serialise concurrent access to file data. They support shared (read) and exclusive (write) modes. A lock is represented by one key *per holder* — `lock:<ino>/<mode>/<lease_id>` — each bound to that holder's own lease.
+**Data locks** are per-inode locks that serialise concurrent access to file data. They support shared (read) and exclusive (write) modes. A lock is represented by one key *per holder* — `lock:<ino>/<mode>/<holder>` — where the holder token is the node's session lease paired with a counter.
 
-A key each is what makes a shared lock possible at all. The key carries the lease that backs it, so a single key holding many readers would be dropped for all of them the moment any one released. Putting the mode in the key rather than the value also lets a transaction ask "is any writer holding this?" as a range comparison, with no value to parse.
+A key each is what makes a shared lock possible at all: a single key holding many readers would be dropped for all of them the moment any one released. The holder token has to distinguish two holders on the same node, which the lease alone no longer does — every lock a node takes is written under one shared session lease. Putting the mode in the key rather than the value also lets a transaction ask "is any writer holding this?" as a range comparison, with no value to parse.
 
 **Namespace operations** — file creation, deletion, rename — do not use locks at all. No directory is ever locked. Instead, every namespace mutation is a single atomic etcd transaction that succeeds or fails atomically. Two nodes simultaneously creating different files in the same directory execute independent transactions on different keys; neither blocks the other.
 
@@ -27,7 +27,7 @@ This design eliminates directory-level lock contention entirely. The only serial
 
 ## Lock Acquisition
 
-`AcquireLock` grants a lease and then writes this holder's key in a transaction guarded by a single range comparison: the range that must be empty for the acquisition to be allowed.
+`AcquireLock` writes this holder's key in a single transaction guarded by one range comparison: the range that must be empty for the acquisition to be allowed.
 
 **Exclusive lock.** The range is `lock:<ino>/` — every holder in any mode. A writer is blocked by anyone.
 
@@ -35,16 +35,24 @@ This design eliminates directory-level lock contention entirely. The only serial
 
 Etcd evaluates a comparison over a range as "true for every key in it", and an empty range is vacuously true, so `CreateRevision == 0` over the range reads as "no blocking holder exists". Deciding it inside the transaction rather than by a preceding read is what closes the window a competing acquisition would otherwise slip through.
 
-If the comparison fails, the acquisition fails with `ErrConflict` and its lease is revoked, leaving nothing behind. The caller can retry with backoff or report the conflict to the application.
+If the comparison fails, the acquisition fails with `ErrConflict` and writes nothing, leaving nothing behind. The caller can retry with backoff or report the conflict to the application.
 
-The lock is bound to an etcd lease. The production data path (`internal/ipc/datapath.go`, both the read and write handlers) calls this with a fixed 2-second TTL (`inodeLockTTL` in `internal/ipc/retry.go`) — not a configurable default; every caller of `AcquireLock` in the running system passes the same constant. The method returns a keepalive channel that the holder must continuously consume. A separate goroutine drains this channel; as long as the goroutine is running and the etcd connection is healthy, the lock stays held.
+### The session lease
+
+Every lock a node holds is written under one lease, granted on the node's first acquisition and renewed for the life of the process. A lock acquisition is therefore a single Raft commit rather than three: granting a lease per lock and revoking it on release put two further commits on the critical path of every write, which the benchmark work identified as the dominant cost of a write (see [Performance Benchmarks](../reliability/performance-benchmarks.md)).
+
+The safety argument is unchanged by the sharing. What releases a dead holder's lock is the lease TTL elapsing without a renewal, and that is equally true of a lease granted once as of one granted per operation: a node that stops renewing holds nothing, because expiry deletes every key written under the lease at once. The lock itself is still scoped to a single operation and released at the end of it, so no waiter is ever made to wait on another node's `close()` — the delegation is of the lease, not of the lock.
+
+Two consequences follow from the sharing, and both are handled explicitly. A holder is no longer identified by its lease, so the key carries a per-acquisition counter alongside it; without that, two concurrent readers on one node would write the same key and one would release the other's lock. And a release must delete its own key rather than revoke the lease, since revoking would drop every other lock the node holds.
+
+The production data path (`internal/ipc/datapath.go`, both the read and write handlers) acquires with a fixed 2-second TTL (`inodeLockTTL` in `internal/ipc/retry.go`) — not a configurable default; every caller of `AcquireLock` in the running system passes the same constant. The first acquisition fixes the session's TTL; later ones reuse the session. If the session's lease is ever lost — expired during a partition, or revoked — the next acquisition grants a new one, which is safe precisely because expiry has already removed every lock the old lease held.
 
 ## Lease-Backed Expiry
 
 This is the core safety mechanism. When the lock-holding node crashes or is partitioned from etcd:
 
-1. The keepalive goroutine stops consuming (or cannot reach etcd).
-2. After the lease TTL expires (2 seconds), etcd automatically deletes that holder's key.
+1. The session's keepalive stops being renewed (or cannot reach etcd).
+2. After the lease TTL expires (2 seconds), etcd automatically deletes every key that lease holds, including that holder's.
 3. Any other node watching the lock key receives a DELETE event.
 4. The watching node can then attempt to acquire the lock.
 
@@ -52,9 +60,9 @@ The lease mechanism is fundamentally safer than a "release on crash" protocol be
 
 ## Lock Release
 
-`ReleaseLock` revokes the lease backing one holder's key. Etcd deletes that key immediately, and any watchers receive a DELETE event. A shared lock survives with its remaining holders — only the last one to leave actually unlocks the inode.
+`ReleaseLock` deletes one holder's key. Any watchers receive a DELETE event. A shared lock survives with its remaining holders — only the last one to leave actually unlocks the inode.
 
-There is no explicit "unlock" key operation — the lease revocation is sufficient. The lock's own TTL (2 seconds) provides an upper bound on how long the lock itself can remain held after a crash. That is a different figure from the self-fencing watchdog's window: the watchdog gates on the node's *membership* lease (`gen:<node>`/`membership:<node>`, TTL configured separately via `--lease-ttl`, default 10 seconds — see `internal/config/config.go`) and fires at 2–3× that TTL, not the lock TTL. The two leases are independent and not proportional to each other; conflating them here previously understated the actual self-fence window by describing it as derived from the lock's 5-second TTL, a value that was itself wrong.
+The delete is retried, because a lock key now outlives a failed release for as long as the node does: the session lease that would otherwise have expired it is the one this node keeps renewing. A graceful shutdown ends the session (`CloseLockSession`), which clears anything a failed release left behind. The lock's own TTL (2 seconds) provides an upper bound on how long the lock itself can remain held after a crash. That is a different figure from the self-fencing watchdog's window: the watchdog gates on the node's *membership* lease (`gen:<node>`/`membership:<node>`, TTL configured separately via `--lease-ttl`, default 10 seconds — see `internal/config/config.go`) and fires at 2–3× that TTL, not the lock TTL. The two leases are independent and not proportional to each other; conflating them here previously understated the actual self-fence window by describing it as derived from the lock's 5-second TTL, a value that was itself wrong.
 
 ## Lock Watching
 

@@ -141,12 +141,27 @@ have to be correct anyway, so the log was a second source of truth costing an
 fsync per write and growing without bound. Truncation and checksums would have
 made a redundant mechanism cheaper, not necessary.
 
-## A lock's keepalive is cancelled by the release, not by the revoke
+## Locks share one lease per node, not one per acquisition
 
-`ReleaseLock` cancels the stream's context before revoking. Relying on the
-revoke to end the stream made a failed revoke unrecoverable: renewals continued,
-so the lock was held until the process exited and the drain goroutine leaked
-with it. Cancelling first degrades a failed revoke to "expires at its TTL".
+Granting a lease for a lock and revoking it on release put two Raft commits on
+the critical path of every write, out of the four the benchmark work attributed
+the write ceiling to. One lease per node, renewed for the life of the process,
+removes both: what releases a dead holder's lock is the TTL elapsing without a
+renewal, and that is as true of a lease granted once as of one granted per
+operation.
+
+Sharing the lease costs two things, both handled rather than traded away. A
+holder can no longer be identified by its lease, so its key carries a
+per-acquisition counter as well — without it, two concurrent readers on one
+node would write the same key. And a release deletes its own key instead of
+revoking, since revoking would drop every other lock the node holds; the delete
+is retried, because a lock key now outlives a failed release for as long as the
+node does.
+
+The lock itself stays scoped to a single operation. Holding it across a file's
+whole open lifetime would remove nothing further — the acquire and release are
+already one commit each — and would let one node's `close()` block another
+node's write, which is a fairness cost with no round trip to show for it.
 
 ## ipc.Service keeps its concrete store
 

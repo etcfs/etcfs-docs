@@ -45,6 +45,8 @@ etcd itself isn't slow. A single FUSE write commits 4 separate Raft entries in s
 
 4 × 2.2ms ≈ 8.8ms → 1/0.0088 ≈ 113 ops/sec. Measured: ~100-105. The RPC count per write, not etcd's raw speed or the device, sets the ceiling — and because it's a fixed multiplier, cutting round trips and speeding up etcd both raise the ceiling, multiplicatively. Two concrete reductions (a session-scoped lease instead of per-write grant/revoke, and a serializable rather than linearizable extent read) are filed in `docs/NEXT_STEPS.md` under "Metadata round-trip reduction."
 
+*Both reductions have since been implemented.* Locks are now written under a per-node session lease, so steps 1 and 4 are gone and a release is a delete folded into the same commit count as the revoke it replaces; the extent read is serializable and answered by whichever member the client is connected to. The count a write pays is therefore 2 Raft commits (the lock acquire and the guarded commit) plus a delete, against 4 here. The numbers in this report predate that change and are left as the measurement that motivated it — the re-run that would quantify it has not been done.
+
 ## Scenario 2: EFS throughput modes
 
 | Target | randwrite IOPS | randwrite p99 (ms) | randread IOPS | randread p99 (ms) |

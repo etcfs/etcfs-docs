@@ -23,7 +23,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 |---|---|---|
 | `inode:<ino>` | `InodeRecord` (72 bytes) | File or directory metadata |
 | `dirent:<parent>/<name>` | `<ino>` (8 bytes) | Directory entry resolving a name to an inode |
-| `lock:<ino>/<mode>/<lease_id>` | holder's node ID | One holder of an inode's lock, bound to that holder's lease |
+| `lock:<ino>/<mode>/<holder>` | holder's node ID | One holder of an inode's lock, written under that node's session lease |
 | `arena:<node_id>/<arena_id>` | `<arena_id>` (8 bytes) | One arena a node currently owns |
 | `arena_alloc_log` | counter (8 bytes) | Global arena-ID allocation counter |
 | `membership:<node_id>` | membership metadata | Lease-backed liveness key for cluster membership |
@@ -131,7 +131,7 @@ Each key family has a constructor function that builds the etcd key string from 
 - `InodeKey(ino)` — produces `"inode:<ino>"`
 - `DirentKey(parent, name)` — produces `"dirent:<parent>/<name>"`
 - `DirentPrefix(parent)` — produces `"dirent:<parent>/"` for prefix scans
-- `LockKey(ino, mode, leaseID)` — produces `"lock:<ino>/<mode>/<lease_id>"`; `LockPrefix(ino)` and `LockModePrefix(ino, mode)` produce the ranges a transaction compares against
+- `LockKey(ino, mode, holder)` — produces `"lock:<ino>/<mode>/<holder>"`, where the holder token is the node's session lease and a per-acquisition counter; `LockPrefix(ino)` and `LockModePrefix(ino, mode)` produce the ranges a transaction compares against
 - `ArenaOwnerKey(nodeID, arenaID)` — produces `"arena:<nodeID>/<arenaID>"`
 - `ArenaNodePrefix(nodeID)` — produces `"arena:<nodeID>/"` for prefix scans
 - `MembershipKey(nodeID)` — produces `"membership:<nodeID>"`
