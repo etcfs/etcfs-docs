@@ -300,7 +300,64 @@ raw `io2`, `ext4`, EFS, and EtcFS, all on the same node. EtcFS's
 row is still missing: FSx for Lustre (not attempted — provisioning
 cost/time is an order of magnitude higher for one comparison row).
 
----
+**[Done]** Items 24 and 29 are both shipped: the device round trips are
+behind `--write-barriers` (off by default), and the FUSE daemon runs
+`fuse_session_loop_mt` with a connection per worker thread. An IOPS-ceiling
+sweep (`scripts/bench/bench-iops-ceiling.sh`) that live-modifies the data
+volume's provisioned IOPS found the daemon, not the device, is now the
+bottleneck: raw throughput scaled 100 → 1033 IOPS across a 100 → 1000 IOPS
+tier change, EtcFS stayed flat at ~100-105. etcd's own metrics on the same
+run (`etcd_disk_backend_commit_duration_seconds`, mean ≈ 2.2ms/commit) show
+why: a single write commits 4 separate Raft entries in strict sequence
+(`GrantLease`, the lock `Txn`, the guarded commit `Txn`, `RevokeLease`) —
+4 × 2.2ms ≈ 8.8ms, which predicts the observed ~100-113 IOPS almost exactly.
+The ceiling is round-trip count, not etcd throughput or FUSE overhead.
+
+### Metadata round-trip reduction
+
+Two concrete cuts, in the order they should be tried:
+
+- **Session-scoped lease instead of per-write grant/revoke.** `AcquireLock`
+  (`pkg/metadata/lock.go`) grants a fresh lease and revokes it on every single
+  write. A lease held across a file's open lifetime — granted once, kept
+  alive the same way membership leases already are, writes become a plain
+  `Put`/`Delete` under it instead of a fresh `GrantLease`/`RevokeLease` pair —
+  removes 2 of the 4 committed Raft entries per write without weakening the
+  guarantee: the lease's TTL is still what releases the lock if the holder
+  dies, whether it was granted once or every time. This is the shape of an
+  NFSv4 write delegation, not a new idea. The real design question it opens
+  is fairness: a lease held for a whole open (rather than one write) can make
+  another node's write wait for this node's close, or the lease TTL, whichever
+  comes first — worth stating explicitly before building it, not discovering
+  it in a chaos run.
+- **Serializable, not linearizable, reads for `GetExtents`.** The read in
+  `handleWriteBlock` (`internal/ipc/datapath.go`) that reconstructs the next
+  chunk/sequence number goes through etcd's default linearizable read, which
+  is a full leader round trip. The actual correctness check for the write
+  already lives in the guarded commit `Txn`'s compare — the extent read is
+  only building the proposal, not enforcing the invariant — so it can use
+  `clientv3.WithSerializable()` and answer from whichever member the client
+  is already talking to, no leader hop, with no loss of safety.
+
+Neither of these needs a different metadata store. Splitting metadata into a
+faster store (Redis) with etcd kept only for locks/fencing was considered and
+set aside: it trades one round-trip problem for a two-system atomicity
+problem (a Redis write and an etcd fence decision can now disagree after a
+partial failure, which needs its own protocol to close), and it does not
+match what JuiceFS itself actually does — JuiceFS picks one backend (Redis,
+or TiKV, or a SQL database) and relies on that backend's own atomicity
+primitives, it does not pair two systems together. The honest comparison is
+Redis-backed JuiceFS vs. this project, and the difference is a real
+guarantee, not just an implementation choice: default Redis replication is
+asynchronous, so a primary failover can lose the last acknowledged writes —
+the exact failure mode Kleppmann's critique of Redlock describes, and the
+reason `docs/architecture/storage/kleppmann-stale-write-analysis.md` exists
+in this project's own design history. etcd's Raft-linearized leases are safe
+against that class of failure by construction. TiKV-backed JuiceFS is the
+fairer comparison (TiKV is itself Raft-based), and should show a similar
+round-trip-bound ceiling to this one, not a Redis-level one — that comparison
+has not actually been run and would be worth doing before claiming an
+advantage either way.
 
 ## Features the current structure makes cheap
 

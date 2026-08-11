@@ -68,17 +68,20 @@ nav:
           - Single-Node Integration: architecture/cluster-ops/single-node-integration.md
           - "MockStore: In-Memory etcd Simulation": architecture/cluster-ops/mock-store.md
           - Observability: architecture/cluster-ops/observability.md
-  - Chaos Reports:
-      - Fresh Cluster Per Scenario (2026-07-30): chaos-reports/2026-07-30-fresh-cluster-per-scenario.md
-      - Single-Cluster and Fuzz (2026-07-31): chaos-reports/2026-07-31-single-cluster-and-fuzz.md
-      - Elastic Scale-Out/In (2026-07-31): chaos-reports/2026-07-31-elastic-scale-out-in.md
-      - Namespace Fencing Guard (2026-08-04): chaos-reports/2026-08-04-namespace-fencing-guard.md
-      - Concurrent Scale-Out (2026-08-04): chaos-reports/2026-08-04-concurrent-scale-out.md
-      - Fault Injection During Join/Leave (2026-08-05): chaos-reports/2026-08-05-fault-injection-during-join-leave.md
-      - Dual-Confirmed External Fencing (2026-08-05): chaos-reports/2026-08-05-external-fencing-detach.md
-      - Fuzz, Fencing Retry, Arena, NVMe (2026-08-10): chaos-reports/2026-08-10-fuzz-fencing-retry-arena-nvme.md
-  - Research:
-      - etcd/Raft Internals: etcd_raft_research.md
-      - Cluster Filesystem Survey: research/cluster-fs-survey.md
-      - VFS/FUSE/Block Research: research/vfs_fuse_block_research.md
-      - Userspace Filesystem Research: research/userspace_filesystem_research.md
+  - Reports:
+      - Chaos Reports:
+          - Fresh Cluster Per Scenario (2026-07-30): reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md
+          - Single-Cluster and Fuzz (2026-07-31): reports/chaos-reports/2026-07-31-single-cluster-and-fuzz.md
+          - Elastic Scale-Out/In (2026-07-31): reports/chaos-reports/2026-07-31-elastic-scale-out-in.md
+          - Namespace Fencing Guard (2026-08-04): reports/chaos-reports/2026-08-04-namespace-fencing-guard.md
+          - Concurrent Scale-Out (2026-08-04): reports/chaos-reports/2026-08-04-concurrent-scale-out.md
+          - Fault Injection During Join/Leave (2026-08-05): reports/chaos-reports/2026-08-05-fault-injection-during-join-leave.md
+          - Dual-Confirmed External Fencing (2026-08-05): reports/chaos-reports/2026-08-05-external-fencing-detach.md
+          - Fuzz, Fencing Retry, Arena, NVMe (2026-08-10): reports/chaos-reports/2026-08-10-fuzz-fencing-retry-arena-nvme.md
+      - Benchmark Reports:
+          - IOPS Ceiling, EFS Throughput Modes, Contention (2026-08-11): reports/benchmark-reports/2026-08-11-iops-ceiling-efs-throughput-contention.md
+  - Background:
+      - etcd/Raft Internals: background/etcd_raft_research.md
+      - Cluster Filesystem Survey: background/cluster-fs-survey.md
+      - VFS/FUSE/Block Research: background/vfs_fuse_block_research.md
+      - Userspace Filesystem Research: background/userspace_filesystem_research.md

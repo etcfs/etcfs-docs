@@ -139,6 +139,19 @@ barrier-on path also reads back a single sector rather than the whole run.
 The numbers above are from the barriers-always-on build and are the baseline
 that comparison is against.
 
+## Deeper follow-up: is EtcFS the bottleneck, or the device?
+
+`scripts/bench/` (a separate, scenario-based suite alongside this single
+harness) answers that directly by live-modifying the data volume's
+provisioned IOPS mid-run: EtcFS's own throughput stays flat (~100-105 IOPS)
+across a 10x change in the device's ceiling, which raw throughput on the same
+volume tracks exactly. The bottleneck is etcd's per-write round-trip count,
+not the device or FUSE — see
+[Benchmark Reports: IOPS Ceiling, EFS Throughput Modes, Contention (2026-08-11)](../../reports/benchmark-reports/2026-08-11-iops-ceiling-efs-throughput-contention.md),
+which also covers EFS provisioned-throughput mode (the fixed-budget analogue
+of `io2`'s `--iops`, since bursting mode has no such stated ceiling) and
+multi-node contention on a single shared file.
+
 ## Cost-per-IOPS
 
 Not computed here — it needs the FSx number to be the comparison
