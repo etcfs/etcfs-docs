@@ -186,11 +186,21 @@ stamped one generation ahead of their writer, and etcd running without
 compaction — along with several harness assertions that had drifted from the
 system they were checking.
 
-AWS runs were **not** performed: `scripts/infra/create-infra.sh` provisions
-billable instances and a Multi-Attach volume, which is not something to leave
-running unattended. `scripts/infra/create-infra.sh && scripts/infra/setup-compute.sh
+AWS runs were **not** performed for the fuzz/chaos suites above: `scripts/infra/create-infra.sh`
+provisions billable instances and a Multi-Attach volume, which is not something
+to leave running unattended. `scripts/infra/create-infra.sh && scripts/infra/setup-compute.sh
 && scripts/infra/run-full-test.sh` is still owed before trusting the
 device-enforced fencing paths, which docker cannot exercise.
+
+A live 3-node AWS run was performed to verify the `fuse_session_loop_mt` change
+(see the connection-per-worker entry below): 24 parallel workers across all 3
+nodes (8 threads per node), 60 seconds of concurrent create/write/append/read/
+rename/symlink/truncate/rmdir on a shared directory, plus a separate write on
+one node read back from the other two. Result: 0 errors out of ~2,900 ops, no
+daemon crash, `collisions=0` on every scrub pass throughout (the anomaly type
+that would indicate real corruption) — the orphan/dead-extent counts the
+scrubber did report are its normal self-healing response to files being
+renamed and truncated out from under it mid-run, not corruption.
 
 ## etcd compacts on revisions, and the fencing watch tolerates it
 

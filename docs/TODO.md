@@ -44,7 +44,7 @@ correctness problem; nothing is.
 24. **Single-threaded end to end.** `fuse_session_loop` plus a synchronous `ipc_sync` on one shared fd: one slow etcd operation blocks the whole mount.
     - [x] `pool.c` deleted; the constraint noted at the `fuse_session_loop` call — the fd has no mutex, so `_mt` alone corrupts the protocol.
     - [x] `fuse_session_loop_mt` with `clone_fd`, and a connection per worker thread in thread-local storage (`etcfs_ipc_fd`), so no demultiplexer is needed. File handles are handed out atomically now that several threads allocate them.
-    - [ ] Benchmark with `numjobs` above 1 — the published run is single-job and cannot show this.
+    - [x] Benchmarked at `numjobs=4`. First attempt shared one `fio.dat` across all four threads — fio does not split a shared `filename=` per thread, so it measured four writers serialized on one inode's exclusive lock, not the daemon's own concurrency. Fixed with `directory=`/`filename_format=` so each thread gets its own file, and re-ran: randwrite-4k 34→100 IOPS, randread-4k 100→100 IOPS (both now at the io2 volume's 100-IOPS provisioned ceiling, the same ceiling the raw device itself hits — the daemon is no longer the bottleneck), seqwrite-128k 4.5→13 MiB/s.
 25. **`readdir` read the whole directory, one `GetInode` per entry** — CLOSED. Paged from the kernel's cookie to its buffer size, inodes fetched with `Store.GetMany`.
 26. **`statfs` scanned every inode** — CLOSED. The inode allocation counter, read once.
 27. **Scrubber made five redundant scans and an N+1** — CLOSED. One `Snapshot` per pass; collisions compare overlapping ranges rather than equal offsets.

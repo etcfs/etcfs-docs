@@ -107,8 +107,20 @@ file-layout time) rather than the server.
 The daemon now runs `fuse_session_loop_mt` with a backend connection per
 worker thread, so that reasoning no longer holds and the single-job
 configuration now *understates* it: concurrency the daemon has is
-concurrency this job never asks for. Re-running EtcFS with `numjobs` above 1
-is what measures the change; the numbers below predate it.
+concurrency this job never asks for. The numbers in this section predate
+that change.
+
+**With `numjobs=4` (each thread its own file, `directory=`/`filename_format=`
+— a shared `filename=` does not split across threads, so a first attempt at
+this measured four writers serialized on one inode's lock, not the daemon):**
+randwrite-4k went 34 → 100 IOPS, randread-4k 100 → 100 IOPS. Both now sit at
+the io2 scratch volume's 100-IOPS provisioned ceiling — the same ceiling the
+raw device itself hits in this table — so concurrent EtcFS clients are
+bottlenecked by the EBS volume's provisioning, not by the daemon.
+seqwrite-128k went from ~4.5 to 13 MiB/s, still well under raw/ext4's ~25
+MiB/s: large sequential writes are one thread's problem (a single fio job
+with a wide enough queue would show the ceiling here too; this run keeps
+`numjobs` as the only concurrency knob for consistency with the other jobs).
 
 **`seqwrite-128k` is the most direct evidence for item 29's write-path
 theory.** 2.6 IOPS at 128 KiB is 335 KiB/s — roughly 1/75th of raw/ext4's
