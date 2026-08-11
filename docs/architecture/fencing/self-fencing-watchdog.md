@@ -120,7 +120,7 @@ The `Fenced()` method returns a channel that is closed when self-fence triggers.
 
 - The FUSE IPC handler can poll the channel to detect fence and return errors.
 - The arena allocator can use it to abort pending block writes.
-- The watch multiplexer can use it to tear down etcd watches.
+- The cache-invalidation watch can use it to tear down its etcd watch.
 
 In practice, the process exit (step 4 of the trigger) happens so quickly after the IsFenced flag is set that other goroutines may not have time to react. The channel is provided for future use cases where the daemon may need to coordinate a graceful shutdown before exiting.
 

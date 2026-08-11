@@ -180,6 +180,29 @@ When a watch event arrives:
 3. The C daemon's notification thread calls `fuse_lowlevel_notify_inval_entry`
 4. The kernel evicts any cached dentry for that name in the parent directory
 
+### Watch Amplification, and Why There Is No Multiplexer
+
+Each node holds one prefix watch on `dirent:`, not one watch per watched
+directory. The distinction matters at scale: a watcher per directory costs
+N nodes × D watched directories watchers against etcd, which is the
+amplification pattern that makes a cluster's coordination store the bottleneck
+before its data path is anywhere near saturated.
+
+A watch multiplexer — consolidating registered prefixes onto a small number of
+etcd streams and fanning events out to per-directory callbacks, as the
+Kubernetes API server's watch cache does between etcd and kubelets — is the
+answer if per-directory registration is ever needed. It is not needed today,
+because the single prefix watch already delivers every `dirent:` mutation with
+exactly one watcher per node, and the C daemon filters what it cares about.
+Building the multiplexer first would add a fan-out layer whose only current job
+is to hand every event to one subscriber.
+
+The point at which this changes is a subscriber that cannot tolerate the full
+firehose — a very large namespace where the per-event parsing cost on each node
+becomes material, or a second consumer of watch events with a different prefix.
+Until then, one watch per node is both the cheapest implementation and the
+cheapest thing for etcd to serve.
+
 ### Invalidation Events
 
 | Event Type | Watch Fires On | Kernel Call | Effect |

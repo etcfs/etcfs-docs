@@ -83,7 +83,7 @@ Ordered by severity.
   full set is too slow for every push, split it into a nightly job rather than
   leaving it unrun.
 
-- **[Should fix] `pkg/watch/` is dead code.** The package doc says so plainly
+- **[Done] `pkg/watch/` is dead code.** The package doc says so plainly
   ("nothing constructs a `Mux` yet, and cache invalidation currently goes over
   the notify socket instead"), and no file in the repo imports it. Honest
   comments do not make it live code: it is a design sketch sitting in `pkg/`,
@@ -196,7 +196,7 @@ reservation, no-op) is a genuine case of DIP done right, and item 32's decision
 ## Simplification opportunities
 
 - Delete `pkg/watch/` (≈ one package, zero call sites). Move its reasoning to
-  the cache-coherence doc.
+  the cache-coherence doc. *(Done.)*
 - Replace `pkg/metrics`'s registry with `prometheus/client_golang` at the same
   time the call sites are instrumented — fewer lines, plus histograms. *(Done.)*
 - Replace `Makefile`'s stale `GO_MODULE` with nothing. *(Done.)*
@@ -939,9 +939,10 @@ These could not be settled from the repository alone.
   per-inode gauges — a series per affected inode is a way to take a metrics
   backend down during a fault. The surface is documented in
   `docs/architecture/cluster-ops/observability.md`.)*
-- **Was `pkg/watch` shelved or deferred?** If a watch multiplexer is genuinely
-  planned, the recommendation to delete it changes to a TODO item plus a design
-  doc. Nothing in the tracking list mentions it either way.
+- **Was `pkg/watch` shelved or deferred?** *(Settled: deleted. The single
+  `dirent:` prefix watch per node already avoids the amplification a
+  multiplexer would solve, and the argument now lives in
+  `docs/architecture/consistency/cache-coherence.md` § Watch Amplification.)*
 - **Has any workload larger than the fuzz harness ever run on EtcFS?** No
   evidence of one appears in the repo. Running something real and unmodified —
   a Postgres data directory, a `git clone` of a large repository, a parallel
