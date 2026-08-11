@@ -46,6 +46,9 @@ jobs:
           fail: true
 
   build:
+    # Mkdocs build/deploy is a release-shaped action, not a check — skip it
+    # on PRs (external or internal) and only run on push to main.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
