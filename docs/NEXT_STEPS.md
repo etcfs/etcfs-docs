@@ -292,16 +292,13 @@ Publish the results as a docs page with the `fio` job files inline. Benchmarks
 whose configuration is not published are not evidence, and a filesystem project
 that publishes reproducible ones stands out immediately.
 
-**[Done, partial]** The harness (`scripts/infra/benchmark.sh`) and first
-results are published at
-`docs/architecture/reliability/performance-benchmarks.md`: raw `io2`,
-`ext4`, and EtcFS, all on the same volume type and node. EtcFS's
-`seqwrite-128k` throughput (488 KiB/s vs. raw/ext4's ~25 MiB/s) is direct
-evidence for item 29's three-round-trips theory. Two rows are still
-missing: EFS (blocked on the benchmarking IAM identity lacking
-`elasticfilesystem:*` — the script detects this and skips the row rather
-than failing) and FSx for Lustre (not attempted — provisioning cost/time is
-an order of magnitude higher for one comparison row).
+**[Done, partial]** The harness (`scripts/infra/benchmark.sh`) and results
+are published at `docs/architecture/reliability/performance-benchmarks.md`:
+raw `io2`, `ext4`, EFS, and EtcFS, all on the same node. EtcFS's
+`seqwrite-128k` throughput (335 KiB/s vs. raw/ext4's ~25 MiB/s and EFS's
+~78 MiB/s) is direct evidence for item 29's three-round-trips theory. One
+row is still missing: FSx for Lustre (not attempted — provisioning
+cost/time is an order of magnitude higher for one comparison row).
 
 ---
 
