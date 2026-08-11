@@ -62,6 +62,7 @@ nav:
           - Crash Recovery and Deterministic Replay: architecture/reliability/crash-recovery-determinism.md
           - Deterministic Fault-Injection Simulator: architecture/reliability/deterministic-simulator.md
           - Invariant Checkers: architecture/reliability/invariant-checkers.md
+          - Performance Benchmarks: architecture/reliability/performance-benchmarks.md
       - Cluster Operations:
           - Elastic Join and Leave: architecture/cluster-ops/elastic-join-leave.md
           - Single-Node Integration: architecture/cluster-ops/single-node-integration.md
