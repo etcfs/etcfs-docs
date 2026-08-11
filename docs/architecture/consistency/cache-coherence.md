@@ -26,7 +26,9 @@ Three independent cache layers can cause staleness:
 
 3. **EBS backend cache.** The EBS Multi-Attach service itself has an internal cache layer. Writes committed by one attachment may take a small propagation window before becoming visible to another attachment.
 
-EtcFS addresses all three layers through a combination of O_DIRECT I/O, device-level buffer flushes, per-inode locking, and read-back verification.
+EtcFS addresses all three layers through O_DIRECT I/O and per-inode locking, and — on a device that needs them — device-level buffer flushes and a read-back round trip after every write.
+
+The last two are the `--write-barriers` flag, and they are off by default. O_DIRECT removes the first layer outright: neither the writer's nor the reader's page cache holds the bytes, so there is nothing on either node for a flush to push out or invalidate. The remaining two layers are properties of the device. An EBS io2 Multi-Attach volume acknowledges a write only once it is durable and visible to every attachment, which leaves the barriers as three device round trips per write that publish nothing the acknowledged write has not already published. A device that acknowledges into a volatile write cache is a different matter, and that is what the flag is for. Buffered mode (`--allow-buffered-io`) turns the barriers on regardless of the flag, because there the page cache genuinely does hold the bytes back.
 
 ## Write Protocol
 
@@ -37,9 +39,9 @@ A write operation follows this sequence to guarantee cross-node visibility:
 2. Allocate disk blocks from the arena allocator
 3. Copy data to an O_DIRECT-aligned mmap buffer
 4. Write data to the block device via O_DIRECT pwrite
-5. Issue BLKFLSBUF ioctl to flush NVMe controller buffers
-6. Call sync_file_range to flush kernel page cache to EBS backend
-7. Wait for data to become visible via read-back verify
+5. With --write-barriers: BLKFLSBUF ioctl to flush NVMe controller buffers
+6. With --write-barriers: sync_file_range to flush kernel page cache to EBS backend
+7. With --write-barriers: read one sector back to establish a device round trip
 8. Commit extent metadata to etcd (logical_off, disk_off, length, generation)
 10. Update inode size in etcd
 11. Release exclusive lock
@@ -53,9 +55,9 @@ The `BLKFLSBUF` ioctl (`ioctl(fd, 0x1261, 0)`) instructs the block device driver
 
 `sync_file_range` with `SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER` ensures the kernel page cache has been submitted to the block device. With O_DIRECT, the page cache is bypassed for the data path, but metadata and buffer management structures still interact with the page cache. This call provides a second barrier after the NVMe flush.
 
-### Step 7: Read-Back Verify
+### Step 7: Read-Back
 
-After the flush and sync, the writer reads back the written bytes from the same disk offset. This is a blocking check that the data is actually on the device and readable. If the read returns stale data or zeros, the writer retries after a short sleep. This is the final confirmation that the EBS backend has committed the write.
+After the flush and sync, the writer reads back from the disk offset it just wrote. The bytes are discarded — it is not a verification, and nothing compares them. What the read establishes is a completed round trip to the device after the flush, so one sector is read rather than the whole run.
 
 ## Read Protocol
 
@@ -63,7 +65,7 @@ A read operation follows this sequence:
 
 ```
 1. Acquire shared lock on the inode (lease-backed, 2s TTL)
-2. Issue BLKFLSBUF ioctl to invalidate the reader's page cache
+2. With --write-barriers: BLKFLSBUF ioctl to invalidate the reader's page cache
 3. Look up the inode's extent map in etcd
 4. For each covering extent:
    a. If there is a gap between this extent and the previous one,
@@ -78,7 +80,7 @@ A read operation follows this sequence:
 
 ### Step 2: Reader-Side BLKFLSBUF
 
-The reader issues BLKFLSBUF on its own device fd before beginning the read. This ensures that any stale data in the reader's kernel page cache or NVMe controller cache is invalidated. The subsequent pread bypasses the page cache (O_DIRECT) and reads directly from the EBS backend, which returns the latest committed data.
+Under `--write-barriers` the reader issues BLKFLSBUF on its own device fd before beginning the read, invalidating any stale data in its kernel page cache or NVMe controller cache. Without the flag the ioctl is skipped: an O_DIRECT pread bypasses the page cache anyway, so the only cache the ioctl could still be invalidating is the device's own — and on a volume whose acknowledged writes are already visible to every attachment, there is nothing stale there to invalidate. The pread reads directly from the EBS backend, which returns the latest committed data.
 
 ### Step 4b–4e: O_DIRECT Alignment
 
@@ -283,7 +285,7 @@ While O_DIRECT bypasses the kernel page cache for file data, EtcFS still relies 
 | Guarantee | Description |
 |---|---|
 | Write atomicity | No reader sees partial writes (exclusive lock held for entire write+verify cycle) |
-| Cross-node visibility | Data written by Node A is visible to Node B immediately after the write returns (O_DIRECT + BLKFLSBUF + read-back verify) |
+| Cross-node visibility | Data written by Node A is visible to Node B immediately after the write returns (O_DIRECT against a volume that acknowledges only durable, visible writes; plus BLKFLSBUF and a read-back round trip under `--write-barriers`) |
 | Read serialisation | Two concurrent writes to the same file are serialised by the exclusive lock |
 | Concurrent read | Multiple readers can read the same file concurrently (shared lock) |
 | Crash safety | Lock is auto-released by etcd lease expiry (2s) if the holder crashes |

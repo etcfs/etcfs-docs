@@ -114,10 +114,12 @@ readback being what makes a write visible to other Multi-Attach attachers.
 At ~20–30 ms per 4 KiB round trip (measured above) and three round trips
 per write, a few hundred KiB/s of achievable sequential throughput is the
 expected consequence, not a surprise. This benchmark doesn't decompose
-which of the three round trips dominates — that's the follow-up experiment
-item 29 already asks for (does a single-sector readback establish the same
-visibility ordering as a full one?), and this harness is now in place to
-measure it once that change lands.
+which of the three round trips dominates. It does not have to any more: all
+three now sit behind `--write-barriers`, off by default, so the follow-up
+experiment is a re-run of this harness with the flag set and unset. The
+barrier-on path also reads back a single sector rather than the whole run.
+The numbers above are from the barriers-always-on build and are the baseline
+that comparison is against.
 
 ## Cost-per-IOPS
 

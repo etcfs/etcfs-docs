@@ -23,7 +23,7 @@ The primary data path. The Go metadata daemon opens the EBS volume at startup an
 
 The package provides a `Device` struct with methods for opening the device, reading, writing, syncing ranges, and closing. `Open` requires `O_DIRECT` and fails if it is unavailable. `OpenBuffered` accepts a fall back to buffered I/O and is selected by `--allow-buffered-io`, which the daemon also warns about at startup.
 
-The distinction is a correctness one, not a performance one. On a device attached to more than one node, a buffered write lands in this node's page cache, and the readback that is supposed to establish visibility to the other attachers is served from that same cache — so the round trip proves nothing, and both nodes believe they share bytes only one of them has. Buffered mode is therefore correct only for a single-node mount or a file-backed test device.
+The distinction is a correctness one, not a performance one. On a device attached to more than one node, a buffered write lands in this node's page cache, and a read of it is served from that same cache — so nothing proves the bytes ever left this node, and both nodes believe they share bytes only one of them has. Buffered mode is therefore correct only for a single-node mount or a file-backed test device, and it forces the write barriers on (see [Cache Coherence](../consistency/cache-coherence.md#the-consistency-problem)) so that the page cache is at least pushed out to the device.
 
 ### C Block I/O Library (`pkg/block/`)
 

@@ -49,7 +49,8 @@ correctness problem; nothing is.
 27. **Scrubber made five redundant scans and an N+1** — CLOSED. One `Snapshot` per pass; collisions compare overlapping ranges rather than equal offsets.
 28. **Allocation was a linear scan from block 0** — CLOSED. Rotating start hint that wraps, plus a double-free counter. A recycled arena still needs the full extent scan: extent keys cannot be range-scanned by device offset.
 29. **Each write costs a flush, a sync and a full readback.** Three device round trips, all on the critical path. The readback is what makes the write visible to other Multi-Attach attachers.
-    - [ ] Measure which are actually required on the target device; a single sector would establish the same round trip.
+    - [x] All three are behind `--write-barriers`, off by default: with O_DIRECT against a volume that acknowledges only durable, visible writes they publish nothing the write has not. Buffered mode forces them on, the barrier readback is one sector, and the reader-side BLKFLSBUF went the same way.
+    - [ ] Benchmark the two settings on the io2 Multi-Attach volume, and check cross-node visibility with the barriers off before the default is trusted.
 
 # SIMPLIFICATION
 
@@ -58,6 +59,8 @@ correctness problem; nothing is.
 32. **`ipc.Service` untestable against `MockStore`** — CLOSED, not done. The interface would be the whole store with one implementation; coverage stays at the integration tier (35).
 33. **Stale comments** — CLOSED.
 34. **Duplication in the C daemon** — CLOSED. Duplicate socket layer went with `pool.c`; response readers are a bounded cursor.
+
+43. **`readInto` can hand O_DIRECT a misaligned disk offset.** `ext.DiskOff+within` is only block-aligned at `within=0`; a read landing inside a run at a non-sector offset (e.g. behind a sub-block append) fails with "misaligned O_DIRECT read" instead of bouncing through an aligned buffer the way `directSafe`/`ioBuffer` already do for the destination slice. Found via a concurrent `dd oflag=append` workload on a live cluster; reproduces without `--write-barriers` involved, so it predates that flag.
 
 # FOUND WHILE CLOSING THE ABOVE
 

@@ -92,6 +92,25 @@ from configuration was the alternative, but none of the existing flags actually
 answer it — `--volume-id` is set on single-node runs too — so the safe default
 plus an explicit opt-out is the honest version.
 
+## Write barriers are opt-in, and the readback is one sector
+
+Every write used to end with a `BLKFLSBUF` ioctl, a `sync_file_range`, and a
+readback of everything it had just written; every read began with another
+`BLKFLSBUF`. That is three device round trips added to a write and one to a
+read, on the critical path, to defeat caches that O_DIRECT and an io2
+Multi-Attach volume between them do not have: the page cache is bypassed on both
+nodes, and the volume acknowledges a write only once it is durable and visible
+to every attachment. They now sit behind `--write-barriers`, off by default and
+forced on without O_DIRECT, where the page cache is real.
+
+Keeping them as a flag rather than deleting them is deliberate. The claim being
+relied on is about a specific device, not about block devices in general, and a
+device that acknowledges into a volatile write cache still needs the barriers —
+that is a knob no amount of reading the code can replace. Where they are on, the
+readback is one sector rather than the whole run: nothing compares the bytes, so
+what is being bought is the round trip, and a sector buys it as well as 128 KiB
+does.
+
 ## The write-ahead log was deleted rather than fixed
 
 Its stated job was returning blocks that were allocated and written but never
