@@ -58,6 +58,14 @@ That model has three consequences worth knowing before you install anything:
    volume will publish.
 4. Kubernetes 1.24 or later, and Helm 3.
 
+Prerequisites 1 and 2 — a running EtcFS cluster with its own etcd, on nodes
+the CSI driver can reach — are exactly what
+`infra/terraform-eks`
+provisions in one `terraform apply`, if starting from nothing rather than an
+existing EKS cluster: control plane, worker nodes, a shared io2 Multi-Attach
+volume, EtcFS's own etcd and daemon pair, and this chart, all in one
+configuration. See that directory's `README.md`.
+
 ## Installation
 
 ```bash

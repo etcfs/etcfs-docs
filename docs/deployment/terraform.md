@@ -9,6 +9,12 @@ It replaces `scripts/infra/create-infra.sh` and `scripts/infra/destroy-infra.sh`
 Both paths still exist — pick one per cluster; they never touch the same
 account-wide resources (see "Coexistence" below).
 
+Running EtcFS on Kubernetes instead of directly on EC2 is a separate root
+module, `infra/terraform-eks/` — EKS control plane, worker nodes, the shared
+volume, EtcFS's own etcd and daemon pair, and the [CSI
+driver](kubernetes-csi.md), all in one `apply`. See that directory's
+`README.md`; nothing on this page applies to it.
+
 ## What it does not do
 
 Installing etcd, compiling the two EtcFS binaries on-node, and starting a
