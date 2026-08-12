@@ -90,6 +90,22 @@ which the source directory sees as an unlink and the destination sees as an
 entry appearing, possibly replacing one that was already there — a privilege
 no other create-like operation has, which the model enforces explicitly.
 
+`readdir` is checked too, and it is the only operation that can observe a
+name's *absence* directly rather than by asking for it. The difficulty is that
+a readdir is paginated — the payload carries an offset, and the response is a
+window into the listing rather than the listing itself — so treating a page as
+complete would report every directory larger than one page as missing entries.
+
+What makes a page useful anyway is that the listing comes straight out of an
+etcd prefix scan, so its entries are a *contiguous run in sorted order*. Every
+name that sorts between a page's first and last entry must be on that page,
+and a name the model knows exists that falls inside that range but is absent
+from the page has been dropped by the listing. Names sorting past the end of
+the page are unconstrained: they are on a page this response says nothing
+about. A page starting at offset 0 gets one extra constraint, since its first
+entry is the smallest name in the whole directory — nothing may sort before
+it — and an empty page at offset 0 means an empty directory.
+
 **Extent** (`extent.go`) — a per-inode sparse register from byte position to
 value, built from the WRITE and READ operations already in the IPC history
 (no new recording needed). A position is constrained only once the history
@@ -264,11 +280,16 @@ undercounted any errno above 128. Fixed, and noted here because it is the kind
 of thing only a second reading finds — the metric had never been checked
 against the format it was reading.
 
+`readdir` was the largest of these gaps and is now closed — see the namespace
+model above. Its decoder is checked against the real handler rather than
+against a fixture: `TestIntegration_ReaddirDecodesWhatTheHandlerEncoded`
+drives real listings through the daemon in both framings and decodes them,
+because `READDIRPLUS` appends a fixed 84-byte attr block to every entry and
+getting that width wrong turns every entry after the first into garbage
+without failing loudly. Shrinking it by four bytes fails that test.
+
 ### What the models still do not cover
 
-- **`readdir` is not modelled at all.** Directory listings are the most direct
-  observation of namespace state and nothing checks them; the namespace model
-  sees only `lookup` and the mutations. This is the largest remaining gap.
 - **A cross-directory `rename` is split into two halves** and each partition
   checks its own, so a rename that is atomic in neither direction is not
   caught. Checking both directories together would close it and cost the
@@ -289,6 +310,14 @@ sabotaged copy of the same real data is correctly rejected.
 **Extent, lock, generation**: two nodes, one etcd, one shared block device,
 15 rounds each of write/read over 3 shared inodes — 60 extent operations, 120
 lock events, 30 guarded commits, all **consistent**.
+
+**Full docker chaos suite, re-run after the audit and after `readdir` was
+modelled**: all 7 scenarios pass, 169 recorded entries across 3 nodes, decoded
+into 39 namespace operations (including real directory listings), 33 extent
+operations, 44 lock events and 11 guarded commits — every model **consistent**.
+The chaos workload is otherwise all writes and reads and never lists a
+directory, so `provision_cluster` now runs one `ls` per node; without it the
+readdir checks would be exercised by nothing at chaos scale.
 
 **End-to-end wiring**, checked against the actual compiled binaries rather
 than only the Go test suite: `etcfuse-meta --history-log`, mounted through
