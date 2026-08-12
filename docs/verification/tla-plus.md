@@ -13,7 +13,7 @@ The subject is the *protocol* described in
 — not the implementation. The gap between the spec and `pkg/fencing` is closed
 by review; the spec is the design's argument, not a proof about the Go code.
 
-The spec is [`specs/Fencing.tla`](../../specs/Fencing.tla). Run it with:
+The spec is `specs/Fencing.tla`. Run it with:
 
 ```bash
 make test-tla          # 2-node models, ~30s
