@@ -83,4 +83,4 @@ correctness problem; nothing is.
     - [x] Hour-scale run: RSS settles at ~40 MB after warm-up and oscillates there, fd count 12-14 flat, etcd's store flat at 15.4 MB once compaction starts. No leak visible at this timescale.
     - [ ] Multi-hour run (4h, target 24h); add live-data ratio per arena to the samples.
 37. **Wire up `RebalanceArena`?** — CLOSED, not built. No observed imbalance at 3-5 nodes; it stays a harness fixture.
-38. **POSIX surface still missing.** Xattrs (`ENOSYS`); `fallocate`, `copy_file_range`, `lseek(SEEK_HOLE/SEEK_DATA)`; cross-node `O_APPEND` atomicity; cross-node byte-range locking (deliberately dropped, see `docs/architecture/metadata/posix-lock-operations.md`).
+38. **POSIX surface still missing.** — PARTIALLY CLOSED. Xattrs, `fallocate` (including hole punching) and `lseek(SEEK_HOLE/SEEK_DATA)` are implemented; still open: `copy_file_range`, cross-node `O_APPEND` atomicity; cross-node byte-range locking (deliberately dropped, see `docs/architecture/metadata/posix-lock-operations.md`).

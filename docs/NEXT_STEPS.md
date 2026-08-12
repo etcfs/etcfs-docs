@@ -74,11 +74,12 @@ reservation, no-op) is a genuine case of DIP done right.
 - **[Done]** Replaced `pkg/metrics`'s hand-rolled registry with
   `prometheus/client_golang`.
 - **[Done]** Removed stale `Makefile` `GO_MODULE`.
-- `scripts/infra/*.sh` reimplements VPC/security-group/IAM/instance
-  provisioning in bash. Works and is chaos-tested, so not urgent.
-  *(Deliberately deferred: its eventual home is the separate
-  `terraform-aws-etcfs` repository described below, downstream of the
-  ownership decision.)*
+- **[Done]** `scripts/infra/*.sh` reimplemented as a Terraform module
+  (`infra/terraform/`) — key pair, security group, io2 Multi-Attach volume,
+  compute nodes, IAM instance profile (referenced, not managed — see its
+  README). Node software still bootstraps via `bootstrap-cluster.sh`,
+  deliberately: see "Decided: no dedicated GitHub org" below for why it
+  stays in-tree rather than a separate `terraform-<PROVIDER>-<NAME>` repo.
 
 ---
 
@@ -239,9 +240,9 @@ Ordered by (value ÷ effort), highest first.
 
 ## Productization
 
-- **Distribution.** Release binaries with checksums, a container image on
-  `ghcr.io`, `.deb`/`.rpm` via `nfpm` (systemd units in `deploy/systemd/`
-  already written).
+- **[Done] Distribution.** Release binaries with checksums, container images
+  on `ghcr.io`, `.deb`/`.rpm` via `nfpm` — the CI `release-assets` job, gated
+  on a semantic-release publish. See `docs/deployment/binaries.md`.
 - **First-run experience.** `make dev` and Docker compose exist. Missing: a
   single command that brings up three nodes, mounts, writes a file, reads it
   from another node, and prints what happened.
@@ -249,7 +250,7 @@ Ordered by (value ÷ effort), highest first.
   cross-node byte-range locking, node-local POSIX locks, Raft-consensus
   metadata) — separates a serious project from a demo and heads off
   bug-reports-that-are-really-misuse-reports.
-- **Shrink the README.** 28 KB is a book where a landing page belongs. The
+- **[Done] Shrink the README.** 28 KB is a book where a landing page belongs. The
   `mkdocs` site already exists; README should be pitch, diagram, quickstart,
   links.
 
@@ -274,21 +275,13 @@ dependency graph, `require github.com/etcfs/etcfs vX.Y.Z`), not a repository
 split. Everything else (Prometheus instrumentation, `etcfsctl`, the TLA+ spec)
 stays in the root module.
 
-**The one genuine split: Terraform.** The Terraform Registry requires its own
-public repo named `terraform-<PROVIDER>-<NAME>` with semver tags — a
-publishing requirement, not a preference, and the module has near-zero
-coupling to the fencing protocol. Split only once it actually replaces
-`scripts/infra/*.sh` and is published; until then `deploy/terraform/` in-tree
-is correct.
-
-**The module-path rename must happen before the first release with attached
-binaries** (`github.com/MHS-20/EtcFS` → `github.com/etcfs/etcfs`) — cheap now
-with zero external consumers, a genuine break afterward. Steps: create the
-org and transfer the repo; `go mod edit -module` plus a repo-wide import
-rewrite; update non-Go references (`mkdocs.yml`, README links/badges,
-Dockerfiles, `scripts/infra/state.sh`, `.releaserc.json`, Pages URL); retag.
-Lowercase the repo name (`EtcFS` → `etcfs`) at the same time — Go module paths
-are case-sensitive — while keeping `EtcFS` as the display name in prose.
+**Decided (2026-08-12): no dedicated GitHub org.** Everything stays in
+`MHS-20/EtcFS`, including the Terraform module (`infra/terraform/`, not
+published to the Terraform Registry — that requires the
+`terraform-<PROVIDER>-<NAME>` repo-naming convention this decision forgoes).
+Superseded by this: the module-path rename to `github.com/etcfs/etcfs` and
+the org-transfer steps once proposed below — neither happens unless this
+decision is revisited.
 
 ---
 
@@ -439,20 +432,16 @@ before anyone asks is how a focused project becomes unfocused.
 
 ## Suggested sequencing
 
-0. Settle ownership/licensing, create the org, rename the module path, fix
-   `LICENSE` — blocks step 1's release-binaries follow-through, since a
-   published binary makes the module path expensive to change later. See
-   Open questions.
+0. **[Decided: no org — see "Decided: no dedicated GitHub org" above.]**
+   Settle ownership/licensing and fix `LICENSE` still stands on its own.
 1. **[Done]** Wire the metrics, stamp the version, extend CI to the full
-   integration suite. Release binaries with checksums remain open (Should
-   fix, above).
+   integration suite, release binaries with checksums.
 2. **[Done]** Fix dangling doc references, delete `pkg/watch`, add
    `CONTRIBUTING.md`/`SECURITY.md`.
 3. Run `pjdfstest`; publish the conformance table.
 4. Build the benchmark harness (**[Done]**); settle item 29 (**[Done]**);
    publish the EBS/EFS/Lustre comparison (Lustre row still missing).
-5. **[Done]** `etcfsctl --json`. Next: xattrs and `fallocate` — the
-   handler-table refactor they depend on is done.
+5. **[Done]** `etcfsctl --json`, xattrs, `fallocate`.
 6. TLA+ on the fencing protocol, in `specs/`, model-checked in CI.
 7. CSI driver in `csi/` as a nested module, with a Helm chart.
 8. A `StorageClass` parameter set and worked examples, shipped with the
