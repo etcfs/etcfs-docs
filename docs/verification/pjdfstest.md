@@ -78,22 +78,26 @@ The 69 failures are five distinct defects, not 69. Four of the five are
 timestamp bookkeeping, which is where an implementation that grew from the
 data path outward would be expected to be thin.
 
-**1. Namespace operations do not update the parent directory's `mtime`/`ctime`
+**1. Namespace operations did not update the parent directory's `mtime`/`ctime`
 (50 assertions: `unlink/00.t`, `link/00.t`, `mkdir/00.t`, `mkfifo/00.t`,
 `mknod/00.t`, `mknod/11.t`, `symlink/00.t`, `rmdir/00.t`, `open/00.t`,
-`rename/23.t`).** POSIX requires that creating or removing an entry marks the
-containing directory's `st_ctime` and `st_mtime` for update; EtcFS writes the
-dirent and the inode and leaves the parent record untouched. The same defect
-covers the missing `ctime` bump on the *target* inode of a `link` or an
-`unlink` of one of its links, and on the destination inode of a `rename` that
-replaces a multiply-linked file. Nothing in the codebase updates a parent
-inode on a namespace change: the only `Ctime`/`Mtime` assignments outside
-`setattr` are on the write path.
+`rename/23.t`) — since fixed.** POSIX requires that creating or removing an
+entry marks the containing directory's `st_ctime` and `st_mtime` for update;
+EtcFS wrote the dirent and the inode and left the parent record untouched. The same defect covered the missing `ctime` bump on the *target* inode of a
+`link` or an `unlink` of one of its links, and on the destination inode of a
+`rename` that replaces a multiply-linked file.
 
 This matters beyond conformance. `make`, `rsync` and every directory-mtime
 cache invalidation scheme reads the parent's mtime to decide whether a
 directory changed; a directory whose mtime never moves makes those tools miss
 new files.
+
+The parent's timestamps are updated after the transaction that changed the
+namespace rather than inside it. Folding them in would pin the parent's record
+in every create and unlink, so two nodes making unrelated entries in one
+directory would abort each other — a timestamp one commit late is the better
+trade. The target inode's `ctime` is atomic, because the transaction is
+already rewriting that record to change its link count.
 
 **2. `open(O_TRUNC)` did not truncate (3 assertions, `open/00.t`) — since
 fixed.** Opening an existing 5-byte file `O_WRONLY,O_TRUNC` left the size at

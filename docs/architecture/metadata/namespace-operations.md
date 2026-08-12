@@ -40,7 +40,11 @@ An inode is deleted by the transaction that removes the last name referring to i
 
 ### Attribute Updates
 
-Attribute changes are written by the `setattr` handler as a CAS transaction pinned to the revision the record was read at, so a concurrent update to a different field is not silently overwritten. Link counts are never adjusted on their own: they move as part of the transaction that adds or removes the name responsible for them.
+Attribute changes are written by the `setattr` handler as a CAS transaction pinned to the revision the record was read at, so a concurrent update to a different field is not silently overwritten. Link counts are never adjusted on their own: they move as part of the transaction that adds or removes the name responsible for them, and so does the target inode's `ctime`, since adding or removing a name is a status change of the file itself.
+
+### Directory Timestamps
+
+POSIX requires an operation that adds or removes an entry to mark the containing directory's `mtime` and `ctime` for update. `Store.touchDir` does this in its own CAS transaction *after* the namespace transaction commits, for both ends of a rename. Folding it into that transaction would mean pinning the parent's record in every create and unlink, so two nodes making unrelated entries in one directory would abort each other; a timestamp one commit late is the better trade, and a failure to record it is logged rather than failing an operation that already succeeded.
 
 ## Directory Entry Operations
 
