@@ -98,9 +98,14 @@ model uses for names — so a read of a position the history never touched is
 accepted unconditionally rather than assumed to be a hole. What it catches: a
 write's bytes disappearing, a read contradicting every write and every prior
 read of that position, or a torn read mixing bytes from two writes.
-Deliberately out of scope: truncate, `fallocate`, and any size change driven
-through `setattr` — none of them cross WRITE/READ, so this model says nothing
-about them.
+
+Truncation is modelled too, and has to be: it is not a write, but it changes
+what a read returns, and a model holding bytes a truncate removed reports the
+correct read of the zeroes past the new size as a contradiction. `setattr`
+carries the kernel's `valid` mask, so a size change is decodable exactly;
+everything at or past the new size is dropped. `fallocate` is decoded as a
+range the model simply forgets, which is sound for every mode without having
+to be right about each one.
 
 *What the extent model does and does not cover.* WRITE and READ, as observed
 over the socket, are both linearizable — the write path's internal
@@ -118,17 +123,24 @@ lock has no value for a read to disagree about, so an ordinary
 register-linearizability check would accept any interleaving of acquires and
 releases. What actually matters is mutual exclusion, checked as a state
 machine (`0` free, `-1` exclusive, `n` shared holders) over acquire/release
-events. Each event is recorded and checked as a **zero-width** `[t, t]`
-operation — Porcupine's way of saying "this took effect at exactly this
-instant" — because it is one etcd transaction, not a span: `AcquireLock`
-grants at one revision, `Release`/`Folded` drops it at another. Two exclusive
-holders, or a shared holder admitted during an exclusive hold, are both
-explicit invalid transitions.
+events. Two exclusive holders, or a shared holder admitted during an exclusive
+hold, are both explicit invalid transitions.
+
+Each event is checked over the **interval its own etcd transaction spanned**,
+not as a point. The transaction commits at a single revision, but nothing in
+the daemon observes that revision's wall-clock instant — only the call and the
+return around it — and recording a point instead asserted a precision this
+code does not have. A lock left held by a node that was killed mid-hold is
+released by etcd when its session lease expires, which no code in the dead
+process can record; the checker synthesizes that release over
+`[the node's last event, + lease TTL]`.
 
 **Generation** (`generation.go`) — the single most safety-critical property
-in the codebase: once a guarded commit has been rejected for a fence, does
-any later commit from that node ever succeed? Modelled per node as a one-way
-`fenced` flag, over the real `[call, return]` interval of each `commitGuarded`
+in the codebase: once a node has been fenced at some generation, does any
+later commit ever succeed under it? Modelled per node as the highest
+generation known to have been fenced — not a bare flag, which cannot tell a
+fenced incarnation from the restart that legitimately follows it — over the
+real `[call, return]` interval of each `commitGuarded`
 attempt — several FUSE worker threads call it concurrently on one node, so
 their attempts genuinely overlap, and the model has to consider every order
 the overlap allows rather than trust whichever order they happened to return
@@ -195,6 +207,78 @@ system, twice:
   locks against three shared inodes. All three data-path models — extent,
   lock, generation — are decoded from the same real recorded history and
   checked.
+
+## Auditing the models themselves (2026-08-12)
+
+The models are the part of this work with no independent check: a model that
+accepts everything passes every history, and a model that is *wrong* is worse
+than none, because it reports violations that are artefacts of itself. So the
+models were re-read adversarially, against the code they claim to describe,
+looking specifically for cases where a correct system would be reported as
+broken. Four defects came out of it, three of them live in the configuration
+the chaos suite actually runs.
+
+**1. The generation model reported a legitimate restart as a violation.** It
+tracked a bare "has been fenced" flag and ignored the generation each commit
+carried — a field it decoded and then never used. A fenced node that restarts
+adopts the cluster's new generation and resumes writing, which is the design
+working; but the recorder appends to the same file under the same node ID
+across a restart, so those commits land in the same partition as the fenced
+ones and the flag cannot tell them apart. The chaos suite restarts daemons in
+four of its seven scenarios, so this was live. Fixed by tracking the
+generation a fence was observed at: a commit is a violation exactly when it
+carries a generation already known to be fenced, which is also strictly
+stronger than the flag was.
+
+**2. Lock events claimed a precision the daemon does not have.** Each was
+recorded as a zero-width point taken *after* the operation returned — later
+than the instant it described, and with no room at all for clock offset
+between hosts, so ordinary skew between two nodes read as two holders of one
+lock. Now each event carries the interval its etcd transaction spanned, which
+is exactly what is known about it. `TestAuditLockToleratesClockSkewBetweenNodes`
+and `TestAuditLockStillCatchesRealOverlap` pin both directions: skew inside an
+operation's own duration is absorbed, a genuine overlap is still caught.
+
+**3. A node killed mid-hold made the next holder look like a violation.** Locks
+are written under a session lease, so when a process dies it is etcd that
+drops them — inside a process that no longer exists to record it. The model saw
+an acquire with no release, held the lock forever, and rejected the next
+acquirer. The chaos suite SIGKILLs daemons, so this was live too. Fixed by
+synthesizing a release over `[last event from that node, + lease TTL]`, which
+is the honest bound and still leaves a genuinely leaked lock a violation: a
+node that stayed alive goes on emitting events, so its synthetic release lands
+after them.
+
+**4. The extent model did not know about truncation.** It held bytes that a
+truncate had removed, so a correct read of the zeroes past the new size
+contradicted them. Shell redirection (`>`) opens with `O_TRUNC` and the chaos
+suite uses it throughout. `setattr` carries the kernel's `valid` mask, so a
+size change is decodable exactly; `fallocate` is now decoded too, as a
+range the model simply forgets, which is sound without having to be right
+about each mode.
+
+Each fix has a test that fails without it. Auditing also turned up an
+unrelated defect in the daemon: `observedDispatch` read the response errno
+little-endian on a big-endian wire, so the `FuseErrors` metric silently
+undercounted any errno above 128. Fixed, and noted here because it is the kind
+of thing only a second reading finds — the metric had never been checked
+against the format it was reading.
+
+### What the models still do not cover
+
+- **`readdir` is not modelled at all.** Directory listings are the most direct
+  observation of namespace state and nothing checks them; the namespace model
+  sees only `lookup` and the mutations. This is the largest remaining gap.
+- **A cross-directory `rename` is split into two halves** and each partition
+  checks its own, so a rename that is atomic in neither direction is not
+  caught. Checking both directories together would close it and cost the
+  partitioning that keeps the search tractable.
+- **The extent model constrains only byte positions the history has touched.**
+  A read of anything else is accepted; it cannot tell a legitimate hole from
+  data written before recording started.
+- **Clock skew larger than an operation's duration** is still beyond what the
+  intervals absorb. Nothing here needs a synchronised clock to be *correct* —
+  an unorderable pair is simply concurrent — but precision degrades with skew.
 
 ## Results (2026-08-12)
 
