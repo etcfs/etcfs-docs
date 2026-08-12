@@ -75,3 +75,9 @@ That detail stays in the daemon's logs and in `fsck` output.
   may not be able to claim.
 - `time() - etcfuse_scrub_last_run_seconds > 300` — the scrubber has stopped,
   which the anomaly counters cannot show; they simply stop rising.
+
+These five are wired as Prometheus alerting rules in
+`deploy/prometheus/etcfs-alerts.yml`. A matching Grafana dashboard covering all
+of the series above lives at `deploy/grafana/etcfs-dashboard.json` — import it
+directly, or provision it via Grafana's dashboard-provisioning config pointed
+at `deploy/grafana/`.
