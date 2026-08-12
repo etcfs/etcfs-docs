@@ -65,33 +65,13 @@ correctness problem; nothing is.
 
 # FOUND BY PJDFSTEST
 
-Five defects behind the 69 failing assertions of the 2026-08-12 conformance
-run; see `docs/verification/pjdfstest.md` for the full report.
+From the 2026-08-12 conformance run; report in `docs/verification/pjdfstest.md`.
 
-44. **`open(O_TRUNC)` does not truncate.** Opening an existing file
-    `O_WRONLY,O_TRUNC` leaves its size and contents alone and updates neither
-    `mtime` nor `ctime`. `O_TRUNC` is not handled anywhere in the FUSE layer
-    or the IPC handlers, so shell redirection and `fopen(…, "w")` silently
-    leave the old tail of the file in place past the new contents. Highest
-    severity of the five.
-45. **`S_ISUID`/`S_ISGID` survive a write by an unprivileged user.** The mode
-    lives in EtcFS's inode record, and the write path never inspects it, so a
-    setuid binary written to by uid 65534 stays setuid. Security defect.
-46. **Namespace operations leave the parent directory's timestamps
-    untouched.** `create`, `mkdir`, `mkfifo`, `mknod`, `symlink`, `link`,
-    `unlink`, `rmdir` and `rename` must mark the containing directory's
-    `st_ctime`/`st_mtime` for update, and `link`/`unlink`/replacing `rename`
-    must bump the target inode's `ctime`. None of them do. Directory-mtime
-    caches (`make`, `rsync`) miss changes as a result.
-47. **An unlinked file with an open descriptor is freed immediately.** POSIX
-    requires the inode to live until the last descriptor closes: `fstat`
-    should report `nlink = 0` and reads should still work, but both return
-    `ENOENT`. Needs an orphan record reclaimed by the last `release`, plus a
-    scrubber sweep for the descriptor whose node was fenced before closing.
-48. **Timestamps have one-second resolution.** `Atime`/`Mtime`/`Ctime` are
-    encoded as `time.Unix()` seconds in `pkg/metadata/inode.go`, so
-    `utimensat` with a sub-second value reads back with nanoseconds zeroed.
-    Fixing it changes the inode encoding, so it is a format-version change.
+44. **`open(O_TRUNC)` did not truncate** — CLOSED. `ec_open` sends an OPEN request when the flag is set; the handler empties the file and moves mtime/ctime.
+45. **`S_ISUID`/`S_ISGID` survive a write by an unprivileged user.** Security defect: the write path never looks at the mode.
+46. **Namespace operations leave the parent directory's timestamps untouched**, and `link`/`unlink`/replacing `rename` do not bump the target's ctime. Breaks directory-mtime caches (`make`, `rsync`).
+47. **An unlinked file with an open descriptor is freed immediately.** POSIX keeps it until the last close. Needs an orphan record plus a scrubber sweep for a descriptor whose node was fenced.
+48. **Timestamps have one-second resolution.** `pkg/metadata/inode.go` encodes `time.Unix()` seconds; fixing it is a format change.
 
 # FOUND WHILE CLOSING THE ABOVE
 

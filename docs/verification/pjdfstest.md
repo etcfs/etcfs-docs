@@ -95,10 +95,10 @@ cache invalidation scheme reads the parent's mtime to decide whether a
 directory changed; a directory whose mtime never moves makes those tools miss
 new files.
 
-**2. `open(O_TRUNC)` does not truncate (3 assertions, `open/00.t`).** Opening
-an existing 5-byte file `O_WRONLY,O_TRUNC` leaves the size at 5, and updates
-neither `mtime` nor `ctime`. `O_TRUNC` appears nowhere in the FUSE layer or
-the IPC handlers. This is the most consequential of the five: shell
+**2. `open(O_TRUNC)` did not truncate (3 assertions, `open/00.t`) — since
+fixed.** Opening an existing 5-byte file `O_WRONLY,O_TRUNC` left the size at
+5 and updated neither `mtime` nor `ctime`, because the C daemon answered open
+locally and never told the backend the flag was set. This is the most consequential of the five: shell
 redirection (`> file`), log rotation and any `fopen(…, "w")` rely on it, and
 the failure is silent — the old tail of the file survives past the new
 contents.
