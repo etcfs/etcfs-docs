@@ -87,21 +87,28 @@ reservation, no-op) is a genuine case of DIP done right.
 
 Three additions, cheapest first:
 
-1. **POSIX conformance: `pjdfstest`.** ~8,700 assertions on the surface items
-   3, 7–10 rebuilt. Runs against a mounted filesystem, no integration work
-   needed. Expect documented failures on unsupported surface (xattrs,
-   byte-range locks). **Highest credibility-per-hour item here.**
+1. **[Done] POSIX conformance: `pjdfstest`.** 8,720 assertions pass, 69 fail,
+   9 are the suite's own expected-failures on Linux. The 69 are five defects,
+   filed in `docs/TODO.md`: `O_TRUNC` ignored, setuid bits not cleared on
+   write, parent-directory timestamps never updated, unlinked-but-open files
+   freed immediately, and one-second timestamp resolution. Harness in
+   `test/pjdfstest/`, run with `make test-conformance`; report in
+   `docs/verification/pjdfstest.md`.
 2. **Linearizability checking with Porcupine.** Model the metadata store as a
    key-value register and check recorded chaos-run histories for
-   linearizability — reuses the existing harness.
-3. **TLA+ / PlusCal on the fencing protocol.** Model node state, lease epoch,
+   linearizability — reuses the existing harness. EtcFS is not uniformly
+   linearizable (serializable extent reads, node-local POSIX locks), so the
+   checker is extended with per-operation consistency models rather than one
+   global one; design in `docs/verification/porcupine.md`.
+3. **TLA+ / PlusCal on the fencing protocol.** Spec plan in
+   `docs/verification/tla-plus.md`. Model node state, lease epoch,
    generation counter, arena ownership, detach acknowledgement. Invariant: no
    two nodes hold a write path to the same arena at the same generation, plus
    eventual reclamation of a fenced node's arenas. Scope to the protocol, not
    the implementation.
 
-`pjdfstest` first (a day's work, immediately actionable); TLA+ last (most
-work, validates a design fault injection has so far failed to break).
+`pjdfstest` is done; TLA+ is last (most work, validates a design fault
+injection has so far failed to break).
 
 ---
 
@@ -451,7 +458,7 @@ before anyone asks is how a focused project becomes unfocused.
    integration suite, release binaries with checksums.
 2. **[Done]** Fix dangling doc references, delete `pkg/watch`, add
    `CONTRIBUTING.md`/`SECURITY.md`.
-3. Run `pjdfstest`; publish the conformance table.
+3. **[Done]** Ran `pjdfstest`; conformance table published under Verification.
 4. Build the benchmark harness (**[Done]**); settle item 29 (**[Done]**);
    publish the EBS/EFS/Lustre comparison (Lustre row still missing).
 5. **[Done]** `etcfsctl --json`, xattrs, `fallocate`.

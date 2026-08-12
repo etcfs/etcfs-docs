@@ -76,6 +76,11 @@ nav:
           - Single-Node Integration: architecture/cluster-ops/single-node-integration.md
           - "MockStore: In-Memory etcd Simulation": architecture/cluster-ops/mock-store.md
           - Observability: architecture/cluster-ops/observability.md
+  - Verification:
+      - Overview: verification/index.md
+      - "POSIX Conformance (pjdfstest)": verification/pjdfstest.md
+      - "Linearizability (Porcupine)": verification/porcupine.md
+      - "Protocol Model Checking (TLA+)": verification/tla-plus.md
   - Reports:
       - Chaos Reports:
           - Fresh Cluster Per Scenario (2026-07-30): reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md
