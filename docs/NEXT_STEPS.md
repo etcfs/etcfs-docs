@@ -231,10 +231,18 @@ Ordered by (value ÷ effort), highest first.
   a cluster-wide snapshot needs a *coordination protocol* so every node agrees
   not to reclaim below a revision, and that interacts with fencing.
 
-- **Kubernetes CSI driver.** Deferred — see the Kubernetes section below.
-  Largest item here and the one that decides whether the project gets users,
-  but it should come after `etcfsctl` and the benchmark numbers, since the
-  numbers are the reason anyone would try it.
+- **[Done] Kubernetes CSI driver.** `csi/`, a nested Go module, with a Helm
+  chart, worked examples and `docs/deployment/kubernetes-csi.md`. A CSI volume
+  is a subdirectory of one EtcFS filesystem: the device is already attached
+  everywhere and the daemon already mounts it, so provisioning is a directory
+  and publishing is a bind mount. The one non-boilerplate part is the fence
+  hook — `ControllerUnpublishVolume` records a fence intent only for a node
+  that no longer holds a membership lease, leaving a healthy node releasing a
+  volume during ordinary rescheduling alone, and leaving the fence itself to
+  `pkg/fencing.Controller`'s sweep. `ControllerPublishVolume` refuses a node
+  that is not a live member; the node plugin refuses to publish where the
+  mount path is not a mount point, which would otherwise give a pod a local
+  directory that looks shared.
 
 ---
 
@@ -335,7 +343,7 @@ programmatic access appears it'll be "script `etcfsctl`", answered by a
 `--json` flag, not an SDK.
 
 In order of adoption value: `etcfsctl --json` (**[Done]**, see Features
-above) → Helm chart alongside the CSI driver → Grafana dashboard + Prometheus
+above) → Helm chart alongside the CSI driver (**[Done]**) → Grafana dashboard + Prometheus
 alert rules (**[Done]**, see Features above) → `.deb`/`.rpm` via `nfpm` → a
 conformance/benchmark docs page.
 
@@ -402,14 +410,19 @@ in minutes. Two authorities over node health is how split-brain gets
 manufactured.
 
 **Worth building, in order:**
-1. CSI driver (`csi/`, nested module, Helm chart) — node plugin as a
+1. **[Done]** CSI driver (`csi/`, nested module, Helm chart) — node plugin as a
    DaemonSet alongside the existing daemon; controller plugin implementing
    `ControllerPublishVolume`/`ControllerUnpublishVolume` against the
    existing fencing controller.
-2. A `StorageClass` parameter set (etcd endpoints/TLS, cluster name, fencing
-   mode, arena size, lease TTL, buffered-I/O flag) with worked examples —
-   before any custom resource; it's versionless, needs no CRD install, no
-   extra RBAC.
+2. **[Done, reduced]** Configuration is chart values (etcd endpoints/TLS,
+   mount path, kubelet directory, driver name) rather than StorageClass
+   parameters, with worked examples for dynamic and static provisioning. The
+   per-volume knobs the sketch listed — cluster name, fencing mode, arena
+   size, lease TTL, buffered I/O — turned out to belong to the daemon, not to
+   a volume: they are properties of the one filesystem every volume is a
+   subdirectory of, and a StorageClass that appeared to set them per claim
+   would be lying. `parameters` is passed through to `VolumeContext` and left
+   empty by default.
 3. An `EtcFSCluster` custom resource — only once StorageClass duplication
    across many volumes is a real, observed problem, since that's the point a
    controller (reconciling etcd endpoint health, surfacing fencing state)
@@ -443,9 +456,9 @@ before anyone asks is how a focused project becomes unfocused.
    publish the EBS/EFS/Lustre comparison (Lustre row still missing).
 5. **[Done]** `etcfsctl --json`, xattrs, `fallocate`.
 6. TLA+ on the fencing protocol, in `specs/`, model-checked in CI.
-7. CSI driver in `csi/` as a nested module, with a Helm chart.
-8. A `StorageClass` parameter set and worked examples, shipped with the
-   driver.
+7. **[Done]** CSI driver in `csi/` as a nested module, with a Helm chart.
+8. **[Done]** Chart values and worked examples shipped with the driver; see
+   the note above on why the per-volume parameter set shrank.
 9. The fencing-vs-Kubernetes docs page, with chaos-suite failover numbers.
 10. Surface fence decisions as Kubernetes Events/CSI volume conditions.
 11. An instance-stop `Fencer`, opt-in, labelled power fencing.

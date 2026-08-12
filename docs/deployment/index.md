@@ -13,7 +13,10 @@ Everything needed to run an EtcFS cluster outside `docker compose`, in order:
    fit together.
 4. **[etcfsctl](etcfsctl.md)** — the operator CLI: status, members, arenas,
    fsck, scrub, fencing, quotas.
-5. **[Monitoring](monitoring.md)** — Prometheus scrape config, alert rules,
+5. **[Kubernetes (CSI driver)](kubernetes-csi.md)** — run EtcFS as a
+   `ReadWriteMany` volume for Kubernetes workloads: the Helm chart, the volume
+   model, and how a departed node's volume release drives the existing fence.
+6. **[Monitoring](monitoring.md)** — Prometheus scrape config, alert rules,
    and the Grafana dashboard.
 
 For local development instead of a real deployment, see `make dev` and

@@ -11,8 +11,9 @@ and publishes:
 - `etcfuse-<version>-1.x86_64.rpm`, `etcfuse-meta-<version>-1.x86_64.rpm`, `etcfsctl-<version>-1.x86_64.rpm`
 - `checksums.txt` (sha256, one line per artifact above)
 
-as assets on the GitHub release, and pushes two container images to
-`ghcr.io/mhs-20/etcfs/etcfuse` and `ghcr.io/mhs-20/etcfs/etcfuse-meta`
+as assets on the GitHub release, and pushes three container images to
+`ghcr.io/mhs-20/etcfs/etcfuse`, `ghcr.io/mhs-20/etcfs/etcfuse-meta` and
+`ghcr.io/mhs-20/etcfs/etcfs-csi` (the [CSI driver](kubernetes-csi.md))
 (tagged `<version>` and `latest`). `etcfsctl` has no image — it's a client
 tool, not something you run as a service.
 

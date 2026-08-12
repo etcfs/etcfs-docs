@@ -38,6 +38,7 @@ nav:
       - Binaries and Containers: deployment/binaries.md
       - Configuration: deployment/configuration.md
       - etcfsctl CLI: deployment/etcfsctl.md
+      - Kubernetes (CSI Driver): deployment/kubernetes-csi.md
       - Monitoring: deployment/monitoring.md
   - Architecture:
       - FUSE Layer:
