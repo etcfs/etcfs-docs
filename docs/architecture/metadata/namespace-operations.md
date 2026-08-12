@@ -25,7 +25,7 @@ An inode written without its name would be unreachable: no listing shows it, and
 
 The inode is initialised with:
 - `Nlink = 1` for regular files (one directory entry points to it)
-- `Nlink = 2` for directories (entries for `.` and `..`)
+- `Nlink = 2` for directories (its own `.` and its entry in its parent), and the parent's own count rises by one in the same transaction, for the new directory's `..`
 - `Mode` set to the caller-specified file type and permissions
 - All timestamps set to the current time, to nanosecond resolution
 - `Size = 0` and `Blocks = 0`
@@ -36,7 +36,7 @@ The inode is initialised with:
 
 ### Deletion
 
-An inode is deleted by the transaction that removes the last name referring to it. `AtomicUnlink` drops the link count and deletes the inode record in the same transaction as the dirent — and, for a symlink, the key holding its target. `AtomicRmdir` deletes a directory's record outright, since a directory's count never reaches zero on its own. There is no standalone delete: an inode removed without its name, or a name removed without its inode, is exactly the inconsistency these transactions exist to prevent.
+An inode is deleted by the transaction that removes the last name referring to it. `AtomicUnlink` drops the link count and deletes the inode record in the same transaction as the dirent — and, for a symlink, the key holding its target. `AtomicRmdir` deletes a directory's record outright — a directory has exactly one name, so its count says nothing about how many refer to it — and lowers its parent's count by one in the same transaction. There is no standalone delete: an inode removed without its name, or a name removed without its inode, is exactly the inconsistency these transactions exist to prevent.
 
 ### Attribute Updates
 

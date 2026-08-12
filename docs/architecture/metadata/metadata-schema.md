@@ -89,7 +89,7 @@ The three nanosecond fields are appended rather than folded into the timestamps,
 
 The extent list is **_not_** embedded in the inode record. Extents are stored in separate keys (`extent:<ino>/<chunk>`) to keep the inode value small and to allow extent maps to grow beyond the 1.5 MiB etcd value limit without splitting the inode record itself.
 
-The `Nlink` field tracks the number of directory entries pointing to this inode. When `Nlink` reaches zero, the inode is eligible for deletion.
+The `Nlink` field tracks the number of directory entries pointing to this inode. When `Nlink` reaches zero, the inode is eligible for deletion. A directory is the exception: its count is its own `.` plus the `..` of every subdirectory it holds, so it is 2 for an empty directory and rises with each subdirectory. `mkdir`, `rmdir` and a directory `rename` therefore adjust the parent's count in the same transaction that changes the entry, pinned to the revision it was read at.
 
 Every inode is created with the count its first entry implies: 1 for a regular file, symlink, device node or FIFO, and 2 for a directory, which is reached both through its parent's entry and through its own `.`. `metadata.InitialNlink` is the single definition of that rule.
 

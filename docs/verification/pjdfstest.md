@@ -175,16 +175,42 @@ the kernel's `struct stat` by assigning `st_atime` alone. `st_atime` and
 `memset` had put there and every fractional timestamp still read back rounded
 down — a bug that a test of the metadata layer alone could not have found.
 
-### What still fails
+### The last two failures, and the sixth defect behind them
 
-Both remaining failures are `rename/24.t`, "rename of a directory updates its
-`..` link", and they are one defect that predates this work rather than a
-regression: a directory's link count is fixed at 2 for its whole life, so a
-directory that gains a subdirectory never reaches 3. Making it correct means
-maintaining the parent's count in `mkdir`, `rmdir` and every directory
-`rename` — a deliberate design change to a rule the store currently relies on
-(a count that never moves is why losing a directory's one name removes it
-outright), not an oversight. It is filed in `docs/TODO.md`.
+Both were `rename/24.t`, "rename of a directory updates its `..` link" — one
+defect that predated this work rather than a regression: a directory's link
+count was fixed at 2 for its whole life, so a directory that gained a
+subdirectory never reached 3.
+
+Fixing it meant maintaining the count in `mkdir`, `rmdir` and directory
+`rename`, which is the one change here with a real concurrency cost. etcd has
+no atomic increment, so the count is a read-modify-write that has to be pinned
+to the revision it was read at, and a pin is what makes concurrent operations
+in one directory abort each other. Three things keep that bounded:
+
+- **Only directory operations pin the parent.** Creating a file, symlink,
+  device node or hard link does not move the count, so those keep the
+  unpinned single-transaction path they always had. Contention is confined to
+  concurrent `mkdir`/`rmdir` in the *same* directory.
+- **The count rides the namespace transaction**, unlike the directory
+  timestamps above. A timestamp one commit late is merely late; a count one
+  commit late is wrong, and the next increment builds on the wrong value.
+- **Losing the pin is contention, not failure**: the operation is retried from
+  a fresh read with the jittered backoff the store already uses, and only a
+  name that genuinely exists is reported as `EEXIST`.
+
+A rename's link-count moves are collected per inode before they are added to
+the transaction, because etcd rejects a transaction that writes one key twice —
+which a same-directory rename replacing a directory would otherwise do.
+
+After the fix, `rename` passes 4,857 of 4,857.
+
+**On an existing filesystem** every directory's count reads 2 regardless of
+what it holds. The scrubber and `fsck` now expect 2 + subdirectories, so they
+report the drift; neither repairs it, because `fsck` is report-only by design.
+The mount's own root is a separate case: the C daemon answers `getattr` for it
+locally with a fixed `nlink` of 2, so the root directory reports 2 whatever it
+holds.
 
 ### What this run does not cover
 
