@@ -132,14 +132,16 @@ its next startup. Only the unlinking node's own descriptors are counted:
 tracking them cluster-wide would mean a round trip on every open, and a peer
 unlinking a file this node holds open still takes it away.
 
-**5. Timestamps have one-second resolution (2 assertions,
-`utimensat/08.t`).** Setting `atime`/`mtime` to a sub-second value reads back
-with the nanoseconds zeroed. The on-disk inode record stores
-`Atime`/`Mtime`/`Ctime` as `time.Unix()` seconds
-(`pkg/metadata/inode.go`) — there is no nanosecond field to store them in.
-Fixing it is an encoding change, and therefore a format-version change.
+**5. Timestamps had one-second resolution (2 assertions, `utimensat/08.t`) —
+since fixed.** Setting `atime`/`mtime` to a sub-second value read back with the
+nanoseconds zeroed: the inode record stored `Atime`/`Mtime`/`Ctime` as
+`time.Unix()` seconds and had nowhere to put the rest. The three nanosecond
+fields are appended to the record rather than folded into the timestamps, so a
+record written before they existed still decodes, with its sub-second parts
+reading as the zero it stored.
 
-Every one of these is filed in `docs/TODO.md`.
+All five are tracked in `docs/TODO.md`; a re-run of the suite is the next
+thing this page should carry.
 
 ### What this run does not cover
 

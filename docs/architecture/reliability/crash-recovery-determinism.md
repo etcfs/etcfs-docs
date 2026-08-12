@@ -30,7 +30,7 @@ This represents the real system's loss of all in-memory state when the daemon pr
 
 After clearing the caches, the simulator re-reads all metadata from the MockStore by scanning the key space:
 
-- All `inode:<...>` keys are retrieved via `GetPrefix(ctx, "inode:")`. Each value is decoded from the 72-byte binary format into an `InodeRecord`, which is stored in the `inodes` map.
+- All `inode:<...>` keys are retrieved via `GetPrefix(ctx, "inode:")`. Each value is decoded from the 84-byte binary format into an `InodeRecord`, which is stored in the `inodes` map.
 - All `dirent:<...>` keys are retrieved via `GetPrefix(ctx, "dirent:")`. Each value (a big-endian uint64 inode number) is decoded and stored with the key (minus `dirent:` prefix) in the `dirents` map.
 
 This scan reads the complete namespace — every inode and every directory entry. For a production filesystem with millions of files, this scan would be replaced by a more targeted reconciliation (reading from the etcd revision snapshot). In the harness, a full scan is acceptable because the data volume is small (hundreds to thousands of keys).

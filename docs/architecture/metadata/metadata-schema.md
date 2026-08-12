@@ -21,7 +21,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 
 | Key pattern | Value | Purpose |
 |---|---|---|
-| `inode:<ino>` | `InodeRecord` (72 bytes) | File or directory metadata |
+| `inode:<ino>` | `InodeRecord` (84 bytes) | File or directory metadata |
 | `dirent:<parent>/<name>` | `<ino>` (8 bytes) | Directory entry resolving a name to an inode |
 | `xattr:<ino>/<name>` | attribute value (opaque bytes) | One extended attribute of an inode |
 | `quota:<ino>` | `QuotaRecord` (JSON) | Byte and inode limits on a directory that is a quota root |
@@ -65,7 +65,7 @@ Inode `0` is never valid — `DecodeUint64` returns `0` for a missing or malform
 
 ### InodeRecord
 
-The fixed-length binary record stored at each `inode:<ino>` key, totalling 72 bytes.
+The fixed-length binary record stored at each `inode:<ino>` key, totalling 84 bytes.
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -81,6 +81,11 @@ The fixed-length binary record stored at each `inode:<ino>` key, totalling 72 by
 | 48 | 8 | `Atime` | Last access time (Unix seconds) |
 | 56 | 8 | `Mtime` | Last modification time (Unix seconds) |
 | 64 | 8 | `Ctime` | Last status-change time (Unix seconds) |
+| 72 | 4 | `Atime` nanoseconds | Sub-second part of the access time |
+| 76 | 4 | `Mtime` nanoseconds | Sub-second part of the modification time |
+| 80 | 4 | `Ctime` nanoseconds | Sub-second part of the status-change time |
+
+The three nanosecond fields are appended rather than folded into the timestamps, so a record written before they existed still decodes: it is 72 bytes long and its sub-second parts read as the zero it stored.
 
 The extent list is **_not_** embedded in the inode record. Extents are stored in separate keys (`extent:<ino>/<chunk>`) to keep the inode value small and to allow extent maps to grow beyond the 1.5 MiB etcd value limit without splitting the inode record itself.
 

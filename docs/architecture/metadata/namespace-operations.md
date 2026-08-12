@@ -15,7 +15,7 @@ Inode lifecycle management, directory entry operations, and the atomic transacti
 
 ## Inode Lifecycle
 
-Every file and directory in EtcFS has an inode record stored at `inode:<ino>`. The inode record carries all POSIX metadata — mode, ownership, timestamps, size, link count — in a fixed-length 72-byte binary format. The extent list is stored separately, one key per extent (`extent:<ino>/<chunk>`), to stay under etcd’s value size limit.
+Every file and directory in EtcFS has an inode record stored at `inode:<ino>`. The inode record carries all POSIX metadata — mode, ownership, timestamps, size, link count — in a fixed-length 84-byte binary format. The extent list is stored separately, one key per extent (`extent:<ino>/<chunk>`), to stay under etcd’s value size limit.
 
 ### Creation
 
@@ -27,7 +27,7 @@ The inode is initialised with:
 - `Nlink = 1` for regular files (one directory entry points to it)
 - `Nlink = 2` for directories (entries for `.` and `..`)
 - `Mode` set to the caller-specified file type and permissions
-- All timestamps set to the current time
+- All timestamps set to the current time, to nanosecond resolution
 - `Size = 0` and `Blocks = 0`
 
 ### Retrieval
