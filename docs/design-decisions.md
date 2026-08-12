@@ -177,6 +177,54 @@ them and keeps only what is genuinely its own (undecodable records, dirents
 pointing at missing inodes, arena ownership). Two implementations had drifted to
 different thresholds and severities for the same invariant.
 
+## Snapshots are not built, and the metadata half is the easy half
+
+Snapshots look nearly free from the metadata side and are not, and the gap is
+worth recording before someone files it as a small feature.
+
+The appealing part is real. etcd is an MVCC store: every key carries a revision,
+a read can be pinned to one with `clientv3.WithRev`, and the inode records,
+directory entries and extent records that make up the entire namespace are all
+etcd keys. Capturing a consistent point-in-time view of the metadata therefore
+costs one number. Reading the filesystem as it was at that revision is a matter
+of threading it through the store's read path.
+
+The data does not work that way. An extent record names a byte range on the
+shared device, and the arena allocator hands those ranges out and takes them
+back. Pinning a revision pins the *reference* to a disk range; it does nothing
+to the range itself. So the moment a file is deleted or overwritten after a
+snapshot is taken, the reclaim path — `unlinkInodeOps`, `planReclaim`, the
+scrubber's orphan pass — returns those blocks to the arena, a later write is
+allocated into them, and the snapshot's extent record now points at somebody
+else's data. The snapshot would read as silent corruption rather than as a
+missing file, which is the worst failure mode available.
+
+Closing that needs one of two changes, and both reach the allocator's core:
+
+- **Copy-on-write on reclaim.** A block referenced by a live snapshot is copied
+  before it is reused, or simply never reused. This means reference counting
+  every block against the set of live snapshots — the allocator today tracks a
+  single bit per block, live or free, and rebuilds that bitmap from the extent
+  records on restart. A refcount has no such derivation: it would need its own
+  durable record, which is a new source of truth to keep consistent with the
+  extents across a fence.
+- **Per-snapshot arena pinning.** An arena holding snapshotted data is frozen
+  whole and excluded from the free pool. Much simpler to reason about, and it
+  makes an arena the unit of retention, so a single pinned block holds a whole
+  gibibyte. On a filesystem whose deletes are spread across arenas that is most
+  of the device.
+
+There is a third problem that neither addresses: a snapshot has to be
+cluster-wide, and the revision that makes it consistent has to be agreed before
+any node's reclaim path runs past it. That is a coordination protocol — every
+node has to learn "do not reclaim below revision R" and acknowledge it — and it
+interacts with fencing, since a fenced node must not be the one still holding a
+retention promise the cluster is relying on.
+
+None of this is unreasonable to build. It is simply an allocator project with a
+coordination protocol attached, not a read pinned to a revision, and the
+metadata half being nearly free is what makes it look otherwise.
+
 ## Arena rebalancing is not wired up
 
 `RebalanceArena` stays harness-only. Imbalance has not been observed at the

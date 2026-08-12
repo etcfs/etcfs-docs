@@ -219,11 +219,16 @@ Ordered by (value ÷ effort), highest first.
   by its Raft round-trip count. Hard enforcement is a real design decision
   against the measured bottleneck, not an increment on this.
 
-- **Snapshots.** Worth a design note, not code, yet. etcd revisions give
-  point-in-time metadata for free; the data half is not solved (block reuse
-  would need copy-on-write, or arenas pinned per snapshot — touches the
-  allocator's core). Write down why it's hard before it gets filed as an easy
-  feature request.
+- **[Done] Snapshots — the design note, which is what this item asked for.**
+  Written up in `docs/design-decisions.md`: why the metadata half really is
+  nearly free (etcd MVCC, one revision), why the data half is not (a pinned
+  revision pins the *reference* to a disk range, not the range, so the reclaim
+  path hands the blocks to a later write and the snapshot reads as silent
+  corruption), and what closing it would actually cost — block refcounting the
+  allocator cannot derive from the extents, or arena-granularity pinning that
+  retains a gibibyte per pinned block. Plus the part the original note missed:
+  a cluster-wide snapshot needs a *coordination protocol* so every node agrees
+  not to reclaim below a revision, and that interacts with fencing.
 
 - **Kubernetes CSI driver.** Deferred — see the Kubernetes section below.
   Largest item here and the one that decides whether the project gets users,
