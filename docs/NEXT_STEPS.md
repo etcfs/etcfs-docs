@@ -97,15 +97,29 @@ Three additions, cheapest first:
    `docs/verification/pjdfstest.md`.
 2. **[Done] Linearizability checking with Porcupine.** History recorder
    (`internal/history`, `--history-log`) plus four consistency models
-   (`test/verify`) — namespace, extent, lock, generation. EtcFS is not
-   uniformly linearizable (serializable extent reads, node-local POSIX
-   locks), so the checker is extended with per-operation consistency models
-   (`test/verify/relax.go`) rather than one global one. `cmd/verify-history`
-   plus `--history-log` wired into `deploy/docker/docker-compose.yml` and
-   `chaos-lib.sh`, run via `VERIFY_HISTORY=1 chaos-test-single-cluster.sh
-   docker all` — all 7 chaos scenarios, 157 recorded operations across 3
-   nodes, every model consistent, including a real fence in S5. Design and
-   results in `docs/verification/porcupine.md`.
+   (`test/verify`) — namespace (including `readdir`), extent, lock,
+   generation. EtcFS is not uniformly linearizable (serializable extent reads,
+   node-local POSIX locks), so the checker is extended with per-operation
+   consistency models (`test/verify/relax.go`) rather than one global one.
+   `cmd/verify-history` plus `--history-log` wired into
+   `deploy/docker/docker-compose.yml` and `chaos-lib.sh`, run via
+   `VERIFY_HISTORY=1 chaos-test-single-cluster.sh docker all` — all 7 chaos
+   scenarios, 169 recorded operations across 3 nodes, every model consistent,
+   including a real fence in S5. Design and results in
+   `docs/verification/porcupine.md`.
+
+   **The models themselves were audited** for cases where a *correct* system
+   would be reported as broken — the failure mode a checker with no
+   independent check is prone to. Four were found and fixed (TODO 51–53): the
+   generation model couldn't tell a fenced incarnation from the restart that
+   legitimately follows it, lock events claimed a precision the daemon
+   doesn't have and had no room for clock skew, a node killed mid-hold made
+   the next legitimate holder look like a violation, and the extent model
+   didn't know about truncation. A fifth, unrelated defect (TODO 52) —
+   `FuseErrors` reading the response errno little-endian on a big-endian
+   wire — turned up while auditing the decoders against the wire format.
+   Running the audited suite against real docker chaos also found the harness
+   itself reporting infrastructure failures as product failures (TODO 54).
 3. **[Done] TLA+ on the fencing protocol.** Spec in `specs/Fencing.tla`, run
    with `make test-tla`. Models node lifecycle, lease expiry, the three
    fencing layers and arena ownership — the last modelled twice, as what etcd
@@ -118,14 +132,14 @@ Three additions, cheapest first:
    fenced anyway — wedged into permanent `EIO`, and four states further on,
    two live writers in one arena. Fixed (TODO 50) with an incarnation check;
    TLC rejects the more obvious liveness check, and the regression tests fail
-   without the fix against real etcd. It also
-   confirms the three-layer argument: with the fence ordering broken, the
-   generation guard alone still blocks every post-fence commit across 1.2M
-   states. Results in `docs/verification/tla-plus.md`.
+   without the fix against real etcd. It also confirms the three-layer
+   argument: with the fence ordering broken, the generation guard alone still
+   blocks every post-fence commit across 1.2M states. Results in
+   `docs/verification/tla-plus.md`.
 
-All three are done, and the one defect they turned up is fixed. The open work
-from them is CI jobs for both checkers, and modelling two controllers fencing
-one node concurrently.
+All three are done, and every defect they turned up (TODO 50–54) is fixed.
+The open work is CI jobs for both checkers, and modelling two controllers
+fencing one node concurrently.
 
 ---
 

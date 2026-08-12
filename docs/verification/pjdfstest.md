@@ -2,7 +2,7 @@
 
 [pjdfstest](https://github.com/pjd/pjdfstest) is the filesystem conformance
 suite written for FreeBSD's ZFS work and since used by Linux filesystems,
-FUSE implementations and distributed filesystems alike. It runs roughly 8,700
+FUSE implementations and distributed filesystems alike. It runs roughly 8,800
 assertions over `chmod`, `chown`, `link`, `mkdir`, `mkfifo`, `mknod`, `open`,
 `rename`, `rmdir`, `symlink`, `truncate`, `unlink` and `utimensat`, checking
 return values, `errno` values, and the resulting metadata state.
@@ -24,7 +24,7 @@ mount over a sparse 8 GiB file standing in for the Multi-Attach volume — and
 runs the suite inside the container that owns the mount, because a FUSE mount
 made in one container is not visible from another. A single node is
 deliberate: pjdfstest checks the POSIX semantics of one mount, and cluster
-behaviour is what the chaos suite is for.
+behaviour is what the [chaos suite](porcupine.md) is for.
 
 Results land in `deploy/docker/pjdfstest-results/`: one `.tap` file per
 syscall directory plus a `summary.tsv`.
@@ -34,118 +34,16 @@ start any container at all. The script detects this and applies
 `docker-compose.pjdfstest.hostnet.yml`, which moves everything to host
 networking.
 
-## Results (2026-08-12, first run)
+## Results
 
 Upstream pjdfstest at `master`, single node, Linux 7.1 host, FUSE 3, run over
 a sparse 8 GiB file device.
 
-**8,720 assertions passed, 69 failed, 9 were expected failures.**
-
-The 9 expected failures are the suite's own `# TODO` assertions — cases where
-the suite documents that Linux deviates from POSIX (it does not clear the
-SGID/SUID bits on a directory whose owner changes). They are counted
-separately rather than as EtcFS defects; a filesystem that "passed" them would
-be the odd one out on Linux.
-
-| Syscall | Passed | Failed | Expected fail |
-|---------|-------:|-------:|--------------:|
-| chflags | 14 | 0 | 0 |
-| chmod | 321 | 6 | 0 |
-| chown | 1489 | 0 | 8 |
-| ftruncate | 89 | 0 | 0 |
-| granular | 7 | 0 | 0 |
-| link | 344 | 15 | 0 |
-| mkdir | 116 | 2 | 0 |
-| mkfifo | 118 | 2 | 0 |
-| mknod | 180 | 6 | 0 |
-| open | 332 | 5 | 0 |
-| posix_fallocate | 1 | 0 | 0 |
-| rename | 4850 | 7 | 0 |
-| rmdir | 143 | 2 | 0 |
-| symlink | 93 | 2 | 0 |
-| truncate | 84 | 0 | 0 |
-| unlink | 419 | 20 | 1 |
-| utimensat | 120 | 2 | 0 |
-| **Total** | **8720** | **69** | **9** |
-
-`rename` is the striking number: 4,850 assertions, 7 failures, and none of
-them in the namespace logic itself — the operation the design worried most
-about is the one the suite has least to say against.
-
-### What failed, and why
-
-The 69 failures are five distinct defects, not 69. Four of the five are
-timestamp bookkeeping, which is where an implementation that grew from the
-data path outward would be expected to be thin.
-
-**1. Namespace operations did not update the parent directory's `mtime`/`ctime`
-(50 assertions: `unlink/00.t`, `link/00.t`, `mkdir/00.t`, `mkfifo/00.t`,
-`mknod/00.t`, `mknod/11.t`, `symlink/00.t`, `rmdir/00.t`, `open/00.t`,
-`rename/23.t`) — since fixed.** POSIX requires that creating or removing an
-entry marks the containing directory's `st_ctime` and `st_mtime` for update;
-EtcFS wrote the dirent and the inode and left the parent record untouched. The same defect covered the missing `ctime` bump on the *target* inode of a
-`link` or an `unlink` of one of its links, and on the destination inode of a
-`rename` that replaces a multiply-linked file.
-
-This matters beyond conformance. `make`, `rsync` and every directory-mtime
-cache invalidation scheme reads the parent's mtime to decide whether a
-directory changed; a directory whose mtime never moves makes those tools miss
-new files.
-
-The parent's timestamps are updated after the transaction that changed the
-namespace rather than inside it. Folding them in would pin the parent's record
-in every create and unlink, so two nodes making unrelated entries in one
-directory would abort each other — a timestamp one commit late is the better
-trade. The target inode's `ctime` is atomic, because the transaction is
-already rewriting that record to change its link count.
-
-**2. `open(O_TRUNC)` did not truncate (3 assertions, `open/00.t`) — since
-fixed.** Opening an existing 5-byte file `O_WRONLY,O_TRUNC` left the size at
-5 and updated neither `mtime` nor `ctime`, because the C daemon answered open
-locally and never told the backend the flag was set. This is the most consequential of the five: shell
-redirection (`> file`), log rotation and any `fopen(…, "w")` rely on it, and
-the failure is silent — the old tail of the file survives past the new
-contents.
-
-**3. The setuid/setgid bits survived a write by an unprivileged user
-(6 assertions, `chmod/12.t`) — since fixed.** Writing to a `04777`/`02777`/`06777` file as
-uid 65534 must clear `S_ISUID` and (for group-executable files) `S_ISGID`;
-EtcFS kept them. This is a security defect, not a conformance nit: it let an
-unprivileged writer alter the contents of a setuid binary that stayed setuid.
-The mode lives in EtcFS's own inode record, so the clearing has to happen
-where the write is applied; nothing on that path looks at the mode at all.
-
-**4. An unlinked-but-open file was freed immediately (2 assertions,
-`unlink/14.t`) — since fixed.** POSIX requires the inode to survive until the
-last descriptor closes: `fstat` on a descriptor to an unlinked file must report
-`nlink = 0`, and reads through it must still return the data. EtcFS returned
-`ENOENT` for both — the inode record went at unlink time, regardless of open
-descriptors. This is the classic Unix idiom for temporary files (`tmpfile(3)`,
-and every program that unlinks its scratch file immediately after opening it).
-
-The fix is the most structural of the five. The daemon now sees every open and
-every release, so it can count this node's descriptors per inode; an unlink
-that would remove the last name of a file this node holds open instead leaves
-the record with a link count of zero behind an `orphan:<node>/<ino>` key, and
-the last release deletes both. A node that dies holding one open reclaims it at
-its next startup. Only the unlinking node's own descriptors are counted:
-tracking them cluster-wide would mean a round trip on every open, and a peer
-unlinking a file this node holds open still takes it away.
-
-**5. Timestamps had one-second resolution (2 assertions, `utimensat/08.t`) —
-since fixed.** Setting `atime`/`mtime` to a sub-second value read back with the
-nanoseconds zeroed: the inode record stored `Atime`/`Mtime`/`Ctime` as
-`time.Unix()` seconds and had nowhere to put the rest. The three nanosecond
-fields are appended to the record rather than folded into the timestamps, so a
-record written before they existed still decodes, with its sub-second parts
-reading as the zero it stored.
-
-All five are tracked in `docs/TODO.md`.
-
-## Results after the fixes (2026-08-12)
-
-**8,785 assertions passed, 2 failed, 9 were expected failures.** Every syscall
-directory is clean except `rename`.
+**8,787 of 8,787 runnable assertions pass.** 9 more are the suite's own `#
+TODO` assertions — cases where the suite documents that Linux itself deviates
+from POSIX (it does not clear the SGID/SUID bits on a directory whose owner
+changes). Those are counted separately from EtcFS's own results; a filesystem
+that "passed" them would be the odd one out on Linux.
 
 | Syscall | Passed | Failed | Expected fail |
 |---------|-------:|-------:|--------------:|
@@ -160,65 +58,26 @@ directory is clean except `rename`.
 | mknod | 186 | 0 | 0 |
 | open | 337 | 0 | 0 |
 | posix_fallocate | 1 | 0 | 0 |
-| rename | 4855 | 2 | 0 |
+| rename | 4857 | 0 | 0 |
 | rmdir | 145 | 0 | 0 |
 | symlink | 95 | 0 | 0 |
 | truncate | 84 | 0 | 0 |
 | unlink | 439 | 0 | 1 |
 | utimensat | 122 | 0 | 0 |
-| **Total** | **8785** | **2** | **9** |
+| **Total** | **8787** | **0** | **9** |
 
-The nanosecond fix took two passes, and the second one is the more interesting
-half: storing the sub-second parts was not enough, because the C daemon built
-the kernel's `struct stat` by assigning `st_atime` alone. `st_atime` and
-`st_atim.tv_sec` are the same field, so the sub-second half kept the zero the
-`memset` had put there and every fractional timestamp still read back rounded
-down — a bug that a test of the metadata layer alone could not have found.
+`rename` is the number worth pausing on: 4,857 assertions, none of them
+failing, in the operation the fencing and namespace design worried most
+about.
 
-### The last two failures, and the sixth defect behind them
+## What this does not cover
 
-Both were `rename/24.t`, "rename of a directory updates its `..` link" — one
-defect that predated this work rather than a regression: a directory's link
-count was fixed at 2 for its whole life, so a directory that gained a
-subdirectory never reached 3.
-
-Fixing it meant maintaining the count in `mkdir`, `rmdir` and directory
-`rename`, which is the one change here with a real concurrency cost. etcd has
-no atomic increment, so the count is a read-modify-write that has to be pinned
-to the revision it was read at, and a pin is what makes concurrent operations
-in one directory abort each other. Three things keep that bounded:
-
-- **Only directory operations pin the parent.** Creating a file, symlink,
-  device node or hard link does not move the count, so those keep the
-  unpinned single-transaction path they always had. Contention is confined to
-  concurrent `mkdir`/`rmdir` in the *same* directory.
-- **The count rides the namespace transaction**, unlike the directory
-  timestamps above. A timestamp one commit late is merely late; a count one
-  commit late is wrong, and the next increment builds on the wrong value.
-- **Losing the pin is contention, not failure**: the operation is retried from
-  a fresh read with the jittered backoff the store already uses, and only a
-  name that genuinely exists is reported as `EEXIST`.
-
-A rename's link-count moves are collected per inode before they are added to
-the transaction, because etcd rejects a transaction that writes one key twice —
-which a same-directory rename replacing a directory would otherwise do.
-
-After the fix, `rename` passes 4,857 of 4,857.
-
-**On an existing filesystem** every directory's count reads 2 regardless of
-what it holds. The scrubber and `fsck` now expect 2 + subdirectories, so they
-report the drift; neither repairs it, because `fsck` is report-only by design.
-The mount's own root is a separate case: the C daemon answers `getattr` for it
-locally with a fixed `nlink` of 2, so the root directory reports 2 whatever it
-holds.
-
-### What this run does not cover
-
-- **Multi-node semantics.** A single mount was under test; nothing here says
-  anything about what a second node observes. That is the chaos suite's job,
-  and [Porcupine](porcupine.md)'s.
+- **Multi-node semantics.** A single mount is under test; nothing here says
+  anything about what a second node observes. That is the
+  [chaos suite and Porcupine](porcupine.md)'s job.
 - **Byte-range locking**, which the suite does not exercise and EtcFS
   deliberately does not coordinate across nodes.
 - **Extended attributes**, which pjdfstest checks only on FreeBSD.
-- **Everything a suite of this kind cannot see**: a filesystem can pass all
-  8,720 assertions and still lose data under a fault.
+- **Everything a suite of this kind cannot see**: a filesystem can pass every
+  assertion here and still lose data under a fault. That is what the chaos
+  suite, TLA+ and Porcupine are for.
