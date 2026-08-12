@@ -156,12 +156,12 @@ A dirent whose inode is missing is already corrupt, and fsck reports it. Renamin
 
 ## Data Write (WRITE)
 
-WRITE is called when the kernel has data to write to a file. The Go backend receives the full IPC payload (including the data bytes), allocates disk blocks from the arena allocator, writes the data to the shared EBS volume via the block device I/O layer, fsyncs the written range, commits the extent to etcd with a generation stamp, and updates the inode size.
+WRITE is called when the kernel has data to write to a file. The Go backend receives the full IPC payload (including the data bytes), allocates disk blocks from the arena allocator, writes the data to the shared EBS volume via the block device I/O layer, fsyncs the written range, commits the extent to etcd with a generation stamp, and updates the inode size. The caller's `uid` rides along because a write by an unprivileged user has to clear the file's set-user-ID and set-group-ID bits, and the mode lives in EtcFS's inode record rather than anywhere the kernel can reach.
 
 ### IPC Payload
 
 ```
-[u64:ino] [u64:offset] [u32:data_len] [data_bytes...]
+[u64:ino] [u64:offset] [u32:data_len] [data_bytes...] [u32:uid]
 ```
 
 ### Handler Flow

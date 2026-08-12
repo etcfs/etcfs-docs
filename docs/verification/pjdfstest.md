@@ -103,11 +103,11 @@ redirection (`> file`), log rotation and any `fopen(…, "w")` rely on it, and
 the failure is silent — the old tail of the file survives past the new
 contents.
 
-**3. The setuid/setgid bits survive a write by an unprivileged user
-(6 assertions, `chmod/12.t`).** Writing to a `04777`/`02777`/`06777` file as
+**3. The setuid/setgid bits survived a write by an unprivileged user
+(6 assertions, `chmod/12.t`) — since fixed.** Writing to a `04777`/`02777`/`06777` file as
 uid 65534 must clear `S_ISUID` and (for group-executable files) `S_ISGID`;
-EtcFS keeps them. This is a security defect, not a conformance nit: it lets an
-unprivileged writer alter the contents of a setuid binary that stays setuid.
+EtcFS kept them. This is a security defect, not a conformance nit: it let an
+unprivileged writer alter the contents of a setuid binary that stayed setuid.
 The mode lives in EtcFS's own inode record, so the clearing has to happen
 where the write is applied; nothing on that path looks at the mode at all.
 
