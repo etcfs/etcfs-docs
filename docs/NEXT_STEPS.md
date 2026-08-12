@@ -138,8 +138,11 @@ Three additions, cheapest first:
    `docs/verification/tla-plus.md`.
 
 All three are done, and every defect they turned up (TODO 50–54) is fixed.
-The open work is CI jobs for both checkers, and modelling two controllers
-fencing one node concurrently.
+The TLA+ models run in CI (`test-tla` job, `ci.yml`) on every push and pull
+request. Porcupine's models need a real chaos run to produce a history worth
+checking, so they stay a manual/nightly job rather than a per-push one. Open
+work: a Porcupine CI job, and modelling two controllers fencing one node
+concurrently.
 
 ---
 

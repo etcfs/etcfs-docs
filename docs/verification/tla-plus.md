@@ -158,7 +158,9 @@ symmetry reduction is unsound for some temporal properties.
 | `FencingNoGuard` | counterexample found, as expected |
 | `FencingArenaBug` | counterexample found, as expected |
 
+`.github/workflows/ci.yml`'s `test-tla` job runs the 2-node models on every
+push and pull request.
+
 ## Next
 
-1. A CI job running `make test-tla` on changes to `specs/` or `pkg/fencing/`.
-2. Model two concurrent fence sequences for one node.
+Model two concurrent fence sequences for one node.
