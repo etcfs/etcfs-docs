@@ -95,15 +95,18 @@ Three additions, cheapest first:
    assertions (9 more are the suite's own expected-failures on Linux). Harness
    in `test/pjdfstest/`, run with `make test-conformance`; report in
    `docs/verification/pjdfstest.md`.
-2. **[In progress] Linearizability checking with Porcupine.** History recorder
-   (`internal/history`, `--history-log`) and a namespace consistency model
-   (`test/verify`) are built and checked against a live two-node run. EtcFS is
-   not uniformly linearizable (serializable extent reads, node-local POSIX
-   locks), so the checker is extended with per-operation consistency models
-   (`test/verify/relax.go`) rather than one global one. Still open: extent,
-   lock and generation models, and running it against the chaos suite's
-   histories rather than a purpose-built one. Design and results in
-   `docs/verification/porcupine.md`.
+2. **[Done, pending a real chaos-scale run] Linearizability checking with
+   Porcupine.** History recorder (`internal/history`, `--history-log`) plus
+   four consistency models (`test/verify`) — namespace, extent, lock,
+   generation — each checked against a live two-node run through the real
+   compiled daemon and mount. EtcFS is not uniformly linearizable (serializable
+   extent reads, node-local POSIX locks), so the checker is extended with
+   per-operation consistency models (`test/verify/relax.go`) rather than one
+   global one. `cmd/verify-history` plus `--history-log` wired into
+   `deploy/docker/docker-compose.yml` and `chaos-lib.sh`, gated behind
+   `VERIFY_HISTORY=1` in `chaos-test-single-cluster.sh docker` — not yet run at
+   chaos scale in this environment (no `veth` module for the multi-container
+   compose topology). Design and results in `docs/verification/porcupine.md`.
 3. **TLA+ / PlusCal on the fencing protocol.** Spec plan in
    `docs/verification/tla-plus.md`. Model node state, lease epoch,
    generation counter, arena ownership, detach acknowledgement. Invariant: no
