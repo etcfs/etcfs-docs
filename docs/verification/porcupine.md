@@ -1,8 +1,8 @@
 # Porcupine: linearizability and weaker models
 
-**Status: four models built — namespace, extent, lock, generation — each
-checked against a live cluster.** Wired into the docker chaos suite as an
-opt-in step (`VERIFY_HISTORY=1`).
+**Status: four models — namespace, extent, lock, generation — checked
+against the full docker chaos suite (all 7 scenarios).** Opt-in via
+`VERIFY_HISTORY=1`.
 
 [Porcupine](https://github.com/anishathalye/porcupine) is a linearizability
 checker: given a history of concurrent operations (each with an invocation
@@ -212,16 +212,23 @@ the real C daemon, exercised with `echo`, `mkdir`, `mv` and `cat` from a
 shell — 28 real entries recorded, all four models pass against them via
 `cmd/verify-history`.
 
-**Not run in this environment**: a full multi-node docker chaos scenario.
-`deploy/docker/docker-compose.yml` and `chaos-lib.sh`'s `add_node` now start
-every node with `--history-log`, and `scripts/test/verify-chaos-history.sh` +
-`VERIFY_HISTORY=1` (opt-in, off by default — see the script for why) wire the
-check into `chaos-test-single-cluster.sh docker`, but this sandbox's kernel
-has no `veth` module, and unlike `pjdfstest`'s single-etcd case, the full
-9-container compose topology depends on container-to-container DNS that host
-networking would break. The wiring is built and the single-node path it
-depends on is proven; a real chaos-scale run is the next thing to check on a
-host that can run the full compose topology.
+**Full docker chaos suite** (`chaos-test-single-cluster.sh docker all`, all
+seven scenarios back to back — daemon SIGKILLs, a network partition, a
+generation-bump fence, a 3-node crash, a mid-write crash): 157 recorded
+operations across 3 nodes (101 + 28 + 28), decoded into 36 namespace
+operations, 33 extent operations, 44 lock events, 11 guarded commits — every
+model **consistent**. S5 is the interesting one: it bumps `n1`'s fencing
+generation from 2 to 3 mid-run and confirms the next write is blocked
+(`Input/output error`), so the generation model above is checked against a
+real fence, not just the synthetic one in its unit tests.
+
+Getting this running exposed two real bugs in the wiring itself, both now
+fixed: `verify-chaos-history.sh` copied the history files out of the docker
+volume as root (the daemon writes them `0600` inside the container) without
+`chown`-ing them back to the host user, so the checker couldn't open its own
+input; and the scenario argument is numeric (`1`, not `s1`) — a call-site
+mistake in a first pass at running this, not a bug in the chaos runner
+itself.
 
 ## Sequencing
 
@@ -234,7 +241,7 @@ host that can run the full compose topology.
    `deploy/docker/docker-compose.yml` and `chaos-lib.sh`'s `add_node`, with
    `scripts/test/verify-chaos-history.sh` and an opt-in
    (`VERIFY_HISTORY=1`) hook in `chaos-test-single-cluster.sh docker`.
-6. Run a real multi-node docker chaos scenario with `VERIFY_HISTORY=1` on a
-   host that can run the full compose topology, and publish the result here.
+6. **[Done]** Ran the full docker chaos suite (all 7 scenarios) with
+   `VERIFY_HISTORY=1`; results above.
 7. A CI job checking a short recorded history, so a regression that breaks
    linearizability of any of the four models fails the build.
