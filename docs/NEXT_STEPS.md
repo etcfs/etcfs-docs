@@ -185,13 +185,20 @@ Ordered by (value ÷ effort), highest first.
   enforced in the store rather than only in the FUSE layer, because it is etcd
   that an unbounded attribute would hurt.
 
-- **`fallocate`, `SEEK_HOLE`, `SEEK_DATA`.** The extent map is already sparse
-  and already answers "which extent covers this offset". `fallocate` maps to
-  a reservation in the arena allocator, which already tracks per-block state.
+- **[Done] `fallocate`, `SEEK_HOLE`, `SEEK_DATA`.** `SEEK_HOLE` and `SEEK_DATA`
+  resolve the extent list through the same walk the read path uses, so they
+  cannot disagree with what a read of the same offset returns — including the
+  case where an older extent outlives the newer one that partly overwrote it.
+  `FALLOC_FL_PUNCH_HOLE` reuses `reclaimCovered`, which is truncate's reclaim
+  restricted to a bounded range. Plain `fallocate` publishes the new size
+  without reserving blocks and is marked in the code as the deferral it is;
+  `ZERO_RANGE` and `COLLAPSE_RANGE` return `EOPNOTSUPP` rather than an
+  approximation of semantics a database relies on.
 
-- **Read-only mounts (`--read-only`).** A flag checked at the IPC boundary.
-  Enables mounting for backup/inspection while another node writes, and gives
-  `fsck` a safe way to run against a live volume.
+- **[Done] Read-only mounts (`--read-only`).** Checked in `dispatch` against a
+  set of mutating opcodes rather than per handler, so a newly added mutating
+  operation is refused by default until it is listed. Mounts for backup or
+  inspection are now safe while another node writes.
 
 - **[Done] Prometheus dashboard and alert rules.** Alerting rules for all
   five conditions in `docs/architecture/cluster-ops/observability.md`
