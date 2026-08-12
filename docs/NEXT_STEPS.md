@@ -106,15 +106,25 @@ Three additions, cheapest first:
    docker all` — all 7 chaos scenarios, 157 recorded operations across 3
    nodes, every model consistent, including a real fence in S5. Design and
    results in `docs/verification/porcupine.md`.
-3. **TLA+ / PlusCal on the fencing protocol.** Spec plan in
-   `docs/verification/tla-plus.md`. Model node state, lease epoch,
-   generation counter, arena ownership, detach acknowledgement. Invariant: no
-   two nodes hold a write path to the same arena at the same generation, plus
-   eventual reclamation of a fenced node's arenas. Scope to the protocol, not
-   the implementation.
+3. **[Done] TLA+ on the fencing protocol.** Spec in `specs/Fencing.tla`, run
+   with `make test-tla`. Models node lifecycle, lease expiry, the three
+   fencing layers and arena ownership — the last modelled twice, as what etcd
+   records and as what the node believes, since their divergence is the whole
+   hazard. Eight model configurations, three of them deliberately broken and
+   asserted to still produce a counterexample.
 
-`pjdfstest` is done; TLA+ is last (most work, validates a design fault
-injection has so far failed to break).
+   **It found a real defect** that chaos testing had not: a fence does not
+   re-check that the node is still gone, so a node restarting mid-fence is
+   fenced anyway — wedged into permanent `EIO`, and four states further on,
+   two live writers in one arena. Filed as TODO 50, with a verified fix (an
+   incarnation check; TLC rejects the more obvious liveness check). It also
+   confirms the three-layer argument: with the fence ordering broken, the
+   generation guard alone still blocks every post-fence commit across 1.2M
+   states. Results in `docs/verification/tla-plus.md`.
+
+All three are done. The open work from them is TODO 50 (apply the fencing
+fix), the extent/lock/generation models against a real chaos-scale history,
+and CI jobs for both checkers.
 
 ---
 
