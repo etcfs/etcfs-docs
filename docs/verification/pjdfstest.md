@@ -34,7 +34,7 @@ start any container at all. The script detects this and applies
 `docker-compose.pjdfstest.hostnet.yml`, which moves everything to host
 networking.
 
-## Results (2026-08-12)
+## Results (2026-08-12, first run)
 
 Upstream pjdfstest at `master`, single node, Linux 7.1 host, FUSE 3, run over
 a sparse 8 GiB file device.
@@ -140,8 +140,51 @@ fields are appended to the record rather than folded into the timestamps, so a
 record written before they existed still decodes, with its sub-second parts
 reading as the zero it stored.
 
-All five are tracked in `docs/TODO.md`; a re-run of the suite is the next
-thing this page should carry.
+All five are tracked in `docs/TODO.md`.
+
+## Results after the fixes (2026-08-12)
+
+**8,785 assertions passed, 2 failed, 9 were expected failures.** Every syscall
+directory is clean except `rename`.
+
+| Syscall | Passed | Failed | Expected fail |
+|---------|-------:|-------:|--------------:|
+| chflags | 14 | 0 | 0 |
+| chmod | 327 | 0 | 0 |
+| chown | 1489 | 0 | 8 |
+| ftruncate | 89 | 0 | 0 |
+| granular | 7 | 0 | 0 |
+| link | 359 | 0 | 0 |
+| mkdir | 118 | 0 | 0 |
+| mkfifo | 120 | 0 | 0 |
+| mknod | 186 | 0 | 0 |
+| open | 337 | 0 | 0 |
+| posix_fallocate | 1 | 0 | 0 |
+| rename | 4855 | 2 | 0 |
+| rmdir | 145 | 0 | 0 |
+| symlink | 95 | 0 | 0 |
+| truncate | 84 | 0 | 0 |
+| unlink | 439 | 0 | 1 |
+| utimensat | 122 | 0 | 0 |
+| **Total** | **8785** | **2** | **9** |
+
+The nanosecond fix took two passes, and the second one is the more interesting
+half: storing the sub-second parts was not enough, because the C daemon built
+the kernel's `struct stat` by assigning `st_atime` alone. `st_atime` and
+`st_atim.tv_sec` are the same field, so the sub-second half kept the zero the
+`memset` had put there and every fractional timestamp still read back rounded
+down — a bug that a test of the metadata layer alone could not have found.
+
+### What still fails
+
+Both remaining failures are `rename/24.t`, "rename of a directory updates its
+`..` link", and they are one defect that predates this work rather than a
+regression: a directory's link count is fixed at 2 for its whole life, so a
+directory that gains a subdirectory never reaches 3. Making it correct means
+maintaining the parent's count in `mkdir`, `rmdir` and every directory
+`rename` — a deliberate design change to a rule the store currently relies on
+(a count that never moves is why losing a directory's one name removes it
+outright), not an oversight. It is filed in `docs/TODO.md`.
 
 ### What this run does not cover
 

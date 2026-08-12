@@ -87,13 +87,14 @@ reservation, no-op) is a genuine case of DIP done right.
 
 Three additions, cheapest first:
 
-1. **[Done] POSIX conformance: `pjdfstest`.** 8,720 assertions pass, 69 fail,
-   9 are the suite's own expected-failures on Linux. The 69 are five defects,
-   filed in `docs/TODO.md`: `O_TRUNC` ignored, setuid bits not cleared on
+1. **[Done] POSIX conformance: `pjdfstest`.** The first run found five defects
+   behind 69 failing assertions — `O_TRUNC` ignored, setuid bits not cleared on
    write, parent-directory timestamps never updated, unlinked-but-open files
-   freed immediately, and one-second timestamp resolution. Harness in
-   `test/pjdfstest/`, run with `make test-conformance`; report in
-   `docs/verification/pjdfstest.md`.
+   freed immediately, one-second timestamp resolution — all since fixed. The
+   suite now reports 8,785 passed, 2 failed, 9 expected-fail; the two are a
+   directory's link count not counting its subdirectories, filed in
+   `docs/TODO.md`. Harness in `test/pjdfstest/`, run with
+   `make test-conformance`; report in `docs/verification/pjdfstest.md`.
 2. **Linearizability checking with Porcupine.** Model the metadata store as a
    key-value register and check recorded chaos-run histories for
    linearizability — reuses the existing harness. EtcFS is not uniformly
