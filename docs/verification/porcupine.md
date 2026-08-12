@@ -1,7 +1,7 @@
 # Porcupine: linearizability and weaker models
 
-**Status: planned.** This page describes the design; results will replace this
-notice once the checker runs against recorded histories.
+**Status: namespace model implemented and checked against a live cluster.**
+The extent, lock and generation models are not yet built; see Sequencing.
 
 [Porcupine](https://github.com/anishathalye/porcupine) is a linearizability
 checker: given a history of concurrent operations (each with an invocation
@@ -33,110 +33,124 @@ the tool and wrong answers about the system:
 So the checking work splits in two: a history recorder, and a checker that
 knows which guarantee each operation is entitled to.
 
-## Design
+## What is built
 
-### 1. History recording
+### 1. History recording (`internal/history`)
 
-A `--history-log=<path>` flag on `etcfuse-meta` appends one JSON object per
-IPC operation:
+`etcfuse-meta --history-log=<path>` appends one JSON line per served IPC
+operation, wrapped around the same single dispatch point (`observedDispatch`
+in `internal/ipc/socket.go`) that already instruments every operation for
+metrics — a new opcode cannot forget to appear in the history, because it
+cannot forget to appear in the metrics either.
 
 ```json
-{"node":"n2","op":"write","ino":42,"args":{"off":0,"len":4096},
- "call":170123456789,"ret":170123499999,"res":{"n":4096},"model":"linearizable"}
+{"node":"n1","op":"create","opcode":5,"call_ns":1723484912000000000,
+ "return_ns":1723484912004000000,"request":"AAAA...","response":"AAAA..."}
 ```
 
-Timestamps come from a monotonic clock; comparisons across nodes rely on the
-clock offsets already bounded by the chaos harness's NTP requirement, and the
-checker treats an unorderable pair as concurrent rather than assuming an
-order. The existing chaos scenarios (`scripts/test/chaos-*.sh`) become the
-workload generator: no new harness, the histories fall out of runs already
-performed.
+The request and response are recorded as the exact wire frames, base64-encoded
+— not decoded fields. That is deliberate: the checker (`test/verify`) has its
+own, independent decoder for those frames, so a bug in the daemon's encoder or
+the checker's decoder shows up as a checker failure instead of being hidden by
+code the two sides share. Verifying a system with something other than its own
+assertions only means something if the verifier does not reuse the system's
+own machinery to read its own output.
+
+Timestamps are wall-clock nanoseconds. Entries from different nodes are only
+as comparable as the clocks that stamped them; the checker does not assume an
+order it cannot derive; an unorderable pair is concurrent, which costs
+precision, not correctness.
 
 ### 2. Models, one per object
 
-Checking the whole filesystem as a single object explodes the search space.
-Porcupine's own guidance is to partition, and EtcFS partitions naturally:
+`test/verify` implements the namespace model so far — a directory as a map
+from name to inode number, partitioned by parent directory so operations on
+different directories cannot constrain each other's order and the search
+stays tractable. `rename` is the case that does not partition cleanly, since
+it touches two directories in one atomic step; it is checked from both ends
+(`splitRename`), which the source directory sees as an unlink and the
+destination sees as an entry appearing, possibly replacing one that was
+already there — a privilege no other create-like operation has, which the
+model enforces explicitly.
 
-| Object | Model | Operations |
-|--------|-------|------------|
-| Inode record (per inode) | Register holding `{size, mode, nlink}` | `setattr`, `getattr`, `write` (size growth), `truncate` |
-| Extent list (per inode) | Ordered map from chunk number to extent | `write`, `truncate`, `fallocate`, reclaim |
-| Directory (per parent inode) | Set of names → inode numbers | `create`, `mkdir`, `unlink`, `rmdir`, `rename`, `lookup` |
-| Lock (per inode) | Mutex with owner | `lock`, `unlock` |
-| Fencing generation (per node) | Monotonic counter | generation bump, guarded commit outcome |
+Not yet built: the extent list (per inode), the lock state (per inode) and
+the fencing generation (per node). The namespace model was built first
+because it is what the [pjdfstest](pjdfstest.md) fixes changed, and because
+`rename`'s cross-directory step is the one genuinely awkward case in the
+whole set — solving it early derisks the rest.
 
-`rename` is the awkward case — it touches two directories atomically, so it
-cannot be partitioned by parent. It is checked against a combined
-two-directory model, restricted to histories where renames appear, rather
-than weakening the per-directory model everywhere.
+### 3. Extending the checker to weaker guarantees (`test/verify/relax.go`)
 
-### 3. Extending the checker to weaker guarantees
+This is the part your original question forces, and it is the actual
+contribution: Porcupine checks linearizability and nothing else, by design,
+and reusing it for anything weaker means reusing it, not patching it.
 
-This is the part the question above forces, and it is the interesting
-contribution: Porcupine checks linearizability and nothing else. Two ways to
-reach the weaker models, both implemented in a small `test/verify/` package
-that wraps Porcupine rather than forking it:
+The implementation is **history relaxation**: a `Classifier` decides which
+`Consistency` (`Linearizable`, `BoundedStale`, `Serializable`) each operation
+is entitled to, and `Relax` rewrites the history before it reaches Porcupine's
+unmodified checker.
 
-**(a) History relaxation — transform the history, reuse the checker.**
-Linearizability is real-time ordering plus a sequential model. Weakening the
-real-time constraint for an operation is exactly moving its invocation
-earlier. Concretely:
+- `Linearizable` — untouched.
+- `BoundedStale` — the operation's invocation moves back by the staleness
+  bound, clamped to the start of the history. A read that was current within
+  that window now overlaps whatever produced the value it returned, so
+  Porcupine can order it there.
+- `Serializable` — the invocation moves to the start of the history and the
+  return to the end, erasing real-time order entirely; only the sequential
+  model still constrains it.
 
-- *Bounded staleness (Δ)*: shift a serializable read's invocation time back by
-  Δ. The history is then checked for linearizability as usual; it passes iff
-  the original is Δ-stale-consistent.
-- *Unbounded staleness*: shift the invocation to the start of the history.
-  This is the honest model for `GetExtents` — etcd offers no freshness bound
-  on a serializable read.
-- *Serializability without real-time order*: shift every operation's
-  invocation to the start and every response to the end, which erases
-  real-time ordering entirely and leaves the sequential model as the only
-  constraint.
+`ReadsAreCached` is the classifier for the FUSE layer's attribute/entry cache:
+every read is `BoundedStale`, every mutation stays `Linearizable`. The extent
+read's classifier (unbounded staleness) is not yet written, because the
+extent model it would apply to is not built yet either.
 
-The relaxation is a pure function on histories, which makes it testable in
-isolation and keeps Porcupine's checker unmodified — the property being
-verified is stated by the transformation, not buried in a patched solver.
+Moving an invocation earlier can only add valid orderings, never remove one —
+`TestRelaxationOnlyEverAccepts` checks that directly: every history the strict
+check accepts, the relaxed check accepts too.
 
-**(b) State-carrying models — a read may return any recently valid value.**
-For cases relaxation states too weakly, the model's state carries a bounded
-window of superseded values and a read is accepted if it matches any of them.
-This is more precise for reads but blows up the state space, so it is applied
-per object, not globally.
-
-**Which is used where.** Extent reads use (a) with unbounded staleness, since
-that is precisely what etcd promises. Attribute reads within the cache TTL use
-(a) with Δ = the TTL, which turns the cache's correctness claim into a checked
-property rather than a comment. Locks and guarded commits are checked
-unrelaxed: they are linearizable or they are broken.
-
-### 4. Correctness of the checker itself
+### 4. Correctness of the checker itself (`test/verify/verify_test.go`)
 
 A checker that never reports a violation is indistinguishable from a correct
-system, so the harness ships negative controls:
+system. `test/verify` is mostly negative controls, and writing them is what
+found two real gaps in the first draft of the namespace model — a `lookup`
+that could return a name that was never created, and a `create` accepted
+against a name that already existed — both now rejected
+(`TestInventedValueIsRejectedEvenFullyRelaxed`,
+`TestTwoSuccessfulCreatesOfOneNameAreRejected`). The suite also checks that a
+relaxed model does not become an excuse for *everything*
+(`TestInventedValueIsRejectedEvenFullyRelaxed` runs under full
+`Serializable` relaxation and still fails), and that concurrency itself is not
+mistaken for a violation (`TestConcurrentCreateAndLookupAreAccepted`,
+`TestSeparateDirectoriesDoNotConstrainEachOther`).
 
-- A history with a known lost update must fail the linearizable model.
-- A stale extent read must fail the linearizable model and pass the relaxed
-  one — this is the test that the relaxation is doing real work rather than
-  accepting everything.
-- A relaxed model must still reject a read returning a value that was never
-  written, and a write that vanishes.
-- Small histories are cross-checked against a brute-force enumerator, so the
-  relaxation cannot silently disagree with the definition it implements.
+`internal/ipc/history_integration_test.go` closes the loop against the real
+system: two `Service`s share one etcd, contend over the same names through
+the daemon's own `observedDispatch`, and the recorded history is decoded and
+checked. `TestIntegration_TamperedHistoryIsRejected` then takes that same
+recorded history and injects a duplicated create with no intervening unlink —
+the shape a real lost update would take — to confirm the check has teeth on
+data that came from the real wire format, not only on hand-built fixtures.
 
-Additionally, running the checker against a build with the
-create-revision guard disabled must produce a violation. If it does not, the
-histories are not exercising the concurrency the guard exists for, and the
-workload is wrong.
+## Results (2026-08-12)
+
+Two nodes, one etcd, 10 rounds each of create/lookup/unlink over 3 contended
+names — 60 recorded operations, decoded from their exact wire frames,
+**linearizable**. `TestIntegration_TamperedHistoryIsRejected` confirms the
+same pipeline rejects a sabotaged version of the same recorded data.
+
+This is a small run (single-cluster, short duration) rather than a chaos-scale
+one; the chaos suite's histories are the next thing to check, once
+`--history-log` is wired into `scripts/test/chaos-*.sh`.
 
 ## Sequencing
 
-1. History logging behind a flag, with the JSON schema above.
-2. Per-object models and the partitioner.
-3. Relaxation transformations plus the negative-control tests.
-4. Run against existing chaos and fuzz histories; publish results here.
-5. A CI job checking a short recorded history, so a regression that breaks
-   linearizability of the lock path fails the build.
-
-## Results
-
-Not yet run.
+1. **[Done]** History logging behind `--history-log`.
+2. **[Done]** Namespace model, partitioner, and rename's two-sided split.
+3. **[Done]** Relaxation transformations plus the negative-control tests.
+4. **[Done]** End-to-end check against a live two-node run, plus a tamper
+   control on real recorded data.
+5. Extent list, lock and generation models.
+6. Wire `--history-log` into the chaos suite; check a real chaos-scale
+   history, unbounded-stale extent reads included.
+7. A CI job checking a short recorded history, so a regression that breaks
+   linearizability of the namespace path fails the build.

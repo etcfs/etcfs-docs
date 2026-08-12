@@ -87,20 +87,23 @@ reservation, no-op) is a genuine case of DIP done right.
 
 Three additions, cheapest first:
 
-1. **[Done] POSIX conformance: `pjdfstest`.** The first run found five defects
-   behind 69 failing assertions — `O_TRUNC` ignored, setuid bits not cleared on
-   write, parent-directory timestamps never updated, unlinked-but-open files
-   freed immediately, one-second timestamp resolution — all since fixed. The
-   suite now reports 8,785 passed, 2 failed, 9 expected-fail; the two are a
-   directory's link count not counting its subdirectories, filed in
-   `docs/TODO.md`. Harness in `test/pjdfstest/`, run with
-   `make test-conformance`; report in `docs/verification/pjdfstest.md`.
-2. **Linearizability checking with Porcupine.** Model the metadata store as a
-   key-value register and check recorded chaos-run histories for
-   linearizability — reuses the existing harness. EtcFS is not uniformly
-   linearizable (serializable extent reads, node-local POSIX locks), so the
-   checker is extended with per-operation consistency models rather than one
-   global one; design in `docs/verification/porcupine.md`.
+1. **[Done] POSIX conformance: `pjdfstest`.** Found and fixed six defects:
+   `O_TRUNC` ignored, setuid bits not cleared on write, parent-directory
+   timestamps never updated, unlinked-but-open files freed immediately,
+   one-second timestamp resolution, and a directory's link count not counting
+   its subdirectories. The suite now passes 8,787 of 8,787 runnable
+   assertions (9 more are the suite's own expected-failures on Linux). Harness
+   in `test/pjdfstest/`, run with `make test-conformance`; report in
+   `docs/verification/pjdfstest.md`.
+2. **[In progress] Linearizability checking with Porcupine.** History recorder
+   (`internal/history`, `--history-log`) and a namespace consistency model
+   (`test/verify`) are built and checked against a live two-node run. EtcFS is
+   not uniformly linearizable (serializable extent reads, node-local POSIX
+   locks), so the checker is extended with per-operation consistency models
+   (`test/verify/relax.go`) rather than one global one. Still open: extent,
+   lock and generation models, and running it against the chaos suite's
+   histories rather than a purpose-built one. Design and results in
+   `docs/verification/porcupine.md`.
 3. **TLA+ / PlusCal on the fencing protocol.** Spec plan in
    `docs/verification/tla-plus.md`. Model node state, lease epoch,
    generation counter, arena ownership, detach acknowledgement. Invariant: no
