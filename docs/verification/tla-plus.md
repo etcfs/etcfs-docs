@@ -1,7 +1,10 @@
 # TLA+: the fencing protocol
 
-**Status: written and checked. It found a real defect.** The spec is in
-[`specs/Fencing.tla`](../../specs/Fencing.tla); run it with `make test-tla`.
+**Status: written, checked, and it found a real defect — now fixed.** The
+spec is in [`specs/Fencing.tla`](../../specs/Fencing.tla); run it with
+`make test-tla`. The fix is in `pkg/fencing/controller.go` and
+`pkg/metadata/membership.go`, with regression tests in
+`pkg/fencing/controller_integration_test.go` that fail without it.
 
 Fencing is the part of EtcFS where a bug is silent, rare, and destroys data:
 two nodes writing to the same arena at the same time corrupts a filesystem in
@@ -28,8 +31,8 @@ Constants bound the model to a finite state space: a set of nodes, a set of
 arenas, a ceiling on the generation counter, and three switches —
 `FencerMode` (`reliable` / `unreliable` / `none`), `GuardEnabled`, and
 `ReleaseNeedsFencer` — that turn the protocol's layers on and off
-independently. A fourth, `FenceChecksIncarnation`, is the proposed fix rather
-than a description of today's behaviour.
+independently. A fourth, `FenceChecksIncarnation`, models the fix; it is on in
+every configuration except the one kept to document the defect.
 
 The variable worth calling out is that arena ownership is modelled **twice**:
 
@@ -57,11 +60,11 @@ exactly:
   owning whatever etcd still says it owns. `NodeRestart` therefore sets
   `holds[n] = {a : owner[a] = n}`, not `{}`.
 
-## The defect
+## The defect it found
 
-`fenceNode` gates on the node being absent, then runs sever → bump → release
-arenas → mark complete. **Nothing re-checks, after that gate, that the node
-is still absent.** A node that restarts mid-fence is fenced anyway.
+`fenceNode` gated on the node being absent, then runs sever → bump → release
+arenas → mark complete. **Nothing re-checked, after that gate, that the node
+was still absent.** A node that restarted mid-fence was fenced anyway.
 
 TLC's counterexample, six states, with a reliable Fencer and every layer
 enabled:
@@ -101,11 +104,12 @@ writing to the same disk offset."
 
 `ReleaseArenaID` compares only that the ownership record still exists
 (`CreateRevision(key) != 0`) — not which epoch created it, and not whether
-the node has since come back.
+the node has since come back. It is the fence, not the release, that now
+carries the epoch check.
 
-### How reachable is it
+### How reachable was it
 
-Narrow, and narrow for reasons that are accidental rather than designed:
+Narrow, and narrow for reasons that were accidental rather than designed:
 
 - The **sweep** path is protected: `reconcile` reads `membership:<node>` per
   node and drops the intent for a node that has re-registered.
@@ -117,11 +121,16 @@ Narrow, and narrow for reasons that are accidental rather than designed:
   `newNVMeFencer` registers the node's reservation key at construction — but
   the preempt is fast, so the window is a few etcd round trips.
 
-So it needs a node to restart within roughly the time a fence takes, on the
+So it needed a node to restart within roughly the time a fence takes, on the
 NVMe path, via the watch path. Fast restarts are exactly what
 `Restart=always` produces, and a crash-looping node restarts continuously.
-Nothing in the code makes the sequence impossible; it is improbable, which is
+Nothing in the code made the sequence impossible; it was improbable, which is
 the worst property for a data-corruption bug to have.
+
+It was not only a model artefact. The regression tests added with the fix
+drive the real controller against real etcd, and without the fix the arena
+assertion fails with `"[]" should have 1 item` — the restarted node's arena
+really is released to the free pool.
 
 ### The fix, and why the obvious one is not enough
 
@@ -135,10 +144,35 @@ and is writing to that arena.
 
 The check has to be on **incarnation**, not liveness: the fence must confirm
 that the node it is about to bump and reclaim is the same incarnation it
-severed. In etcd terms that is the membership key's create-revision, or the
-lease ID, captured when the fence begins and compared before each irreversible
-step. `FenceChecksIncarnation = TRUE` models exactly that, and with it TLC
-finds no counterexample in 115,232 states at 2 nodes and 11,664,975 at 3.
+severed. With it, TLC finds no counterexample in 115,232 states at 2 nodes and
+11,664,975 at 3.
+
+### What was shipped
+
+The incarnation marker is the create-revision of `fence_pending:<node>`. etcd
+keeps a key's create-revision stable across overwrites, so re-recording an
+intent for the same departure leaves it alone; it moves only when the key has
+been deleted and made again — which is exactly "the node came back, and then
+left once more".
+
+- `Store.FenceIntentRevision` reads it.
+- `fenceNode` captures it after its gate and re-checks before each of the
+  three irreversible steps: severing device access, bumping the generation,
+  and releasing arenas.
+- `Membership.grantAndRegister` drops the intent (and the fence mark) as the
+  node re-registers, so a returning node invalidates any fence still in flight
+  for the departure it recovered from. The reconciliation sweep already did
+  this, but only every 30 s; the window that closes is the one a fast restart
+  lands in.
+
+One deliberate weakening: a fence whose intent is *missing at the start* is
+not abandoned. On the watch path `fenceNode` runs even when
+`RecordFenceIntent` failed, and refusing to fence without an intent would
+trade a duplicate fence for a missed one — the worse of the two, and the
+reason the watch path skips the sweep's intent re-check in the first place.
+In that case the check degrades to the weaker liveness question. It cannot
+catch depart-restart-depart, which is why it is the fallback and not the
+mechanism.
 
 ## Results
 
@@ -151,7 +185,7 @@ Run with `make test-tla` (`DEEP=1` adds the 3-node model).
 | `FencingNoFencer` — single-signal | no counterexample | **pass**, 76,115 states |
 | `FencingUnreliableFencer` | no counterexample | **pass**, 1,020 states |
 | `FencingGuardIsBackstop` — fix off, guard on | no counterexample | **pass**, 1,211,154 states |
-| `FencingAsImplemented` — fix off | breaks `NoHealthyNodeSevered` | **counterexample found** |
+| `FencingNoIncarnationCheck` — fix off | breaks `NoHealthyNodeSevered` | **counterexample found** |
 | `FencingNoGuard` — fix off, guard off | breaks `StaleWriteRejected` | **counterexample found** |
 | `FencingArenaBug` — reclaim unconfirmed | breaks `ReleasedArenaHasNoLiveWriter` | **counterexample found** |
 

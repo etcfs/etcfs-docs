@@ -113,18 +113,19 @@ Three additions, cheapest first:
    hazard. Eight model configurations, three of them deliberately broken and
    asserted to still produce a counterexample.
 
-   **It found a real defect** that chaos testing had not: a fence does not
-   re-check that the node is still gone, so a node restarting mid-fence is
+   **It found a real defect** that chaos testing had not: a fence did not
+   re-check that the node was still gone, so a node restarting mid-fence was
    fenced anyway — wedged into permanent `EIO`, and four states further on,
-   two live writers in one arena. Filed as TODO 50, with a verified fix (an
-   incarnation check; TLC rejects the more obvious liveness check). It also
+   two live writers in one arena. Fixed (TODO 50) with an incarnation check;
+   TLC rejects the more obvious liveness check, and the regression tests fail
+   without the fix against real etcd. It also
    confirms the three-layer argument: with the fence ordering broken, the
    generation guard alone still blocks every post-fence commit across 1.2M
    states. Results in `docs/verification/tla-plus.md`.
 
-All three are done. The open work from them is TODO 50 (apply the fencing
-fix), the extent/lock/generation models against a real chaos-scale history,
-and CI jobs for both checkers.
+All three are done, and the one defect they turned up is fixed. The open work
+from them is CI jobs for both checkers, and modelling two controllers fencing
+one node concurrently.
 
 ---
 
