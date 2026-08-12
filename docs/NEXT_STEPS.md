@@ -205,8 +205,19 @@ Ordered by (value ÷ effort), highest first.
   (`deploy/prometheus/etcfs-alerts.yml`) and a Grafana dashboard covering
   every exported series (`deploy/grafana/etcfs-dashboard.json`).
 
-- **Per-subtree quotas.** The inode allocation counter added for `statfs`
-  is most of the accounting machinery.
+- **[Done, soft] Per-subtree quotas.** `quota:<ino>` limits on a directory,
+  with `pkg/quota` computing usage and `etcfsctl quota` reporting it.
+
+  The sketch above was wrong about the starting point: the inode allocation
+  counter is a single global number of inode numbers handed out, used by
+  `statfs` and over-reporting after deletions — it carries no subtree
+  information at all. The real obstacle is that an inode records no parent, so
+  attributing a file to a subtree means building the parent index from the
+  directory entries. That is why these are soft quotas: enforcing inline would
+  need either a parent pointer on every inode or a counter update inside the
+  transaction that publishes each write, and the write path is already bound
+  by its Raft round-trip count. Hard enforcement is a real design decision
+  against the measured bottleneck, not an increment on this.
 
 - **Snapshots.** Worth a design note, not code, yet. etcd revisions give
   point-in-time metadata for free; the data half is not solved (block reuse

@@ -24,6 +24,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 | `inode:<ino>` | `InodeRecord` (72 bytes) | File or directory metadata |
 | `dirent:<parent>/<name>` | `<ino>` (8 bytes) | Directory entry resolving a name to an inode |
 | `xattr:<ino>/<name>` | attribute value (opaque bytes) | One extended attribute of an inode |
+| `quota:<ino>` | `QuotaRecord` (JSON) | Byte and inode limits on a directory that is a quota root |
 | `lock:<ino>/<mode>/<holder>` | holder's node ID | One holder of an inode's lock, written under that node's session lease |
 | `arena:<node_id>/<arena_id>` | `<arena_id>` (8 bytes) | One arena a node currently owns |
 | `arena_alloc_log` | counter (8 bytes) | Global arena-ID allocation counter |
@@ -43,6 +44,10 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 Attributes are owned outright by the inode, so removing an inode deletes them in the same transaction, via a range delete over the prefix. That matters beyond leaked keys: inode numbers are reused, and a surviving attribute would be inherited by whatever file next took the number. An inode that still has other hard links keeps its attributes, since they belong to the inode rather than to the name being removed.
 
 Name and value sizes are bounded at the kernel's own `XATTR_NAME_MAX` (255) and `XATTR_SIZE_MAX` (65536). The bound is enforced in the metadata store rather than only in the FUSE layer because it is etcd being protected — an attribute is a Raft-replicated value, and an unbounded one is a route into the store quota. Names containing `/` or NUL are rejected: the first would move the key's split point, the second would end the name early in the NUL-separated `listxattr` buffer, and either lets a caller address an attribute other than the one it named. The `trusted.*` namespace is writable only by uid 0, matching the kernel; `security.*` is left writable so SELinux and IMA labels work, with the contents policed by the LSM hooks that own them.
+
+**Quota keys** mark a directory as the root of a subtree with byte and inode limits; a zero limit in either dimension means unlimited. Usage is computed by walking the namespace from each root, because an inode records no parent — building the parent index from directory entries is the only way to know which subtree a file is in, the same walk a directory rename already does to check for cycles.
+
+That walk is why accounting is periodic rather than transactional, and the consequence is deliberate: **these are soft quotas.** Charging a write to its subtree as it happened would need the enclosing root known on the write path, which means either a parent pointer on every inode — a second source of truth to keep consistent — or a counter update inside the transaction that publishes the write. The write path is already bound by the number of Raft round trips it makes, so adding one more to every write is the wrong trade for a limit that is policy rather than a correctness invariant. `etcfsctl quota` reports usage and flags a root that is over; nothing rejects a write. A file hard-linked into two quota roots is charged to both, which is what every filesystem with subtree quotas does — the alternative, charging whichever root a walk reached first, would make the answer depend on iteration order.
 
 **Lock keys** are one per holder, not one per inode. The mode is part of the key and the value is just the holder's node ID. Each key carries its holder's own etcd lease, so a holder that stops heartbeating is dropped automatically — and dropping one holder cannot disturb the others, which is what allows a shared lock to have several at once.
 
