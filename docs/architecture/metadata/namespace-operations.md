@@ -87,7 +87,9 @@ Hard links to directories are refused with `EPERM`. Allowing one would let the n
 Unlinking a file is more complex because two outcomes are possible depending on the link count:
 
 1. If `Nlink > 1` after decrement: the file still has other hard links. The transaction deletes the dirent and writes back the inode with `Nlink - 1`.
-2. If `Nlink == 1` before decrement (zero after): this is the last link. The transaction deletes both the dirent and the inode key.
+2. If `Nlink == 1` before decrement (zero after): this is the last link. The transaction deletes both the dirent and the inode key — unless this node still has the file open, in which case the record survives with `Nlink = 0` and an `orphan:<node>/<ino>` key naming the node that must finish the job.
+
+POSIX requires a file to stay readable through an open descriptor after its last name is gone. The daemon counts this node's open descriptors per inode (it sees every `open` and every `release`), and the last release deletes the record, its attributes and the orphan key; a node that dies holding one reclaims it at its next startup. Only the unlinking node's own descriptors are counted — tracking them cluster-wide would cost a round trip on every open, so a *peer* unlinking a file this node holds open still takes it away.
 
 Both paths execute in a single Txn, so there is no intermediate state where a dirent exists pointing to a deleted inode, or an inode with nlink=0 but no dirent pointing to it.
 

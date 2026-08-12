@@ -70,7 +70,7 @@ From the 2026-08-12 conformance run; report in `docs/verification/pjdfstest.md`.
 44. **`open(O_TRUNC)` did not truncate** — CLOSED. `ec_open` sends an OPEN request when the flag is set; the handler empties the file and moves mtime/ctime.
 45. **`S_ISUID`/`S_ISGID` survived a write by an unprivileged user** — CLOSED. The WRITE request carries the caller's uid; the commit that publishes the write clears the bits. Root keeps them, as CAP_FSETID does.
 46. **Namespace operations left the parent directory's timestamps untouched** — CLOSED. `Store.touchDir` after each commit; the target's ctime moves inside the transaction that changes its link count.
-47. **An unlinked file with an open descriptor is freed immediately.** POSIX keeps it until the last close. Needs an orphan record plus a scrubber sweep for a descriptor whose node was fenced.
+47. **An unlinked file with an open descriptor was freed immediately** — CLOSED. The record survives with nlink 0 behind an `orphan:<node>/<ino>` key until the last release; a restart reclaims what a crash left. Only the unlinking node's own descriptors count — a peer's unlink still takes the file away.
 48. **Timestamps have one-second resolution.** `pkg/metadata/inode.go` encodes `time.Unix()` seconds; fixing it is a format change.
 
 # FOUND WHILE CLOSING THE ABOVE

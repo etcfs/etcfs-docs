@@ -115,17 +115,22 @@ unprivileged writer alter the contents of a setuid binary that stayed setuid.
 The mode lives in EtcFS's own inode record, so the clearing has to happen
 where the write is applied; nothing on that path looks at the mode at all.
 
-**4. An unlinked-but-open file is freed immediately (2 assertions,
-`unlink/14.t`).** POSIX requires the inode to survive until the last
-descriptor closes: `fstat` on a descriptor to an unlinked file must report
-`nlink = 0`, and reads through it must still return the data. EtcFS returns
-`ENOENT` for both — the inode record and its extents go at unlink time,
-regardless of open descriptors. This is the classic Unix idiom for temporary
-files (`tmpfile(3)`, and every program that unlinks its scratch file
-immediately after opening it), so it is worth fixing, and it is the most
-structural of the five: it needs an orphan record that the last `release`
-reclaims, plus a scrubber sweep for the descriptor that never closes because
-its node was fenced.
+**4. An unlinked-but-open file was freed immediately (2 assertions,
+`unlink/14.t`) — since fixed.** POSIX requires the inode to survive until the
+last descriptor closes: `fstat` on a descriptor to an unlinked file must report
+`nlink = 0`, and reads through it must still return the data. EtcFS returned
+`ENOENT` for both — the inode record went at unlink time, regardless of open
+descriptors. This is the classic Unix idiom for temporary files (`tmpfile(3)`,
+and every program that unlinks its scratch file immediately after opening it).
+
+The fix is the most structural of the five. The daemon now sees every open and
+every release, so it can count this node's descriptors per inode; an unlink
+that would remove the last name of a file this node holds open instead leaves
+the record with a link count of zero behind an `orphan:<node>/<ino>` key, and
+the last release deletes both. A node that dies holding one open reclaims it at
+its next startup. Only the unlinking node's own descriptors are counted:
+tracking them cluster-wide would mean a round trip on every open, and a peer
+unlinking a file this node holds open still takes it away.
 
 **5. Timestamps have one-second resolution (2 assertions,
 `utimensat/08.t`).** Setting `atime`/`mtime` to a sub-second value reads back
