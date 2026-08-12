@@ -11,6 +11,13 @@ container-storage-interface dependencies stay out of the root module, so
 turn depends on the root module for `pkg/metadata`, which is how it reaches
 membership and the fence path.
 
+Validated on a real 2-node EKS cluster with a real io2 Multi-Attach EBS
+volume — dynamic provisioning, cross-node `ReadWriteMany` visibility, and
+quota recording all confirmed working. See the
+[EKS CSI Driver Validation report](../reports/csi-reports/2026-08-12-eks-csi-driver-validation.md)
+for the full run, including one real deployment bug it found and fixed (the
+`etcfuse` runtime image was missing `/bin/mount`, now corrected).
+
 ## What a volume is
 
 A CSI volume is **a subdirectory of one EtcFS filesystem**, not a device and
