@@ -32,6 +32,13 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Deployment:
+      - Overview: deployment/index.md
+      - Infrastructure (Terraform): deployment/terraform.md
+      - Binaries and Containers: deployment/binaries.md
+      - Configuration: deployment/configuration.md
+      - etcfsctl CLI: deployment/etcfsctl.md
+      - Monitoring: deployment/monitoring.md
   - Architecture:
       - FUSE Layer:
           - FUSE Daemon Architecture: architecture/fuse/fuse-architecture.md
