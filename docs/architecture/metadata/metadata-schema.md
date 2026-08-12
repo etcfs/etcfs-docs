@@ -23,6 +23,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 |---|---|---|
 | `inode:<ino>` | `InodeRecord` (72 bytes) | File or directory metadata |
 | `dirent:<parent>/<name>` | `<ino>` (8 bytes) | Directory entry resolving a name to an inode |
+| `xattr:<ino>/<name>` | attribute value (opaque bytes) | One extended attribute of an inode |
 | `lock:<ino>/<mode>/<holder>` | holder's node ID | One holder of an inode's lock, written under that node's session lease |
 | `arena:<node_id>/<arena_id>` | `<arena_id>` (8 bytes) | One arena a node currently owns |
 | `arena_alloc_log` | counter (8 bytes) | Global arena-ID allocation counter |
@@ -36,6 +37,12 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 **Inode keys** are the canonical record of a file or directory. The key is derived solely from the inode number, with no parent information — a file can have multiple hard links pointing to the same inode key from different directory-entry keys.
 
 **Directory-entry keys** encode a parent inode and a child name separated by `/`. A directory listing is a prefix scan over `dirent:<parent>/`, which etcd serves in lexicographic order. Each value is simply the target inode number as a big-endian 64-bit integer.
+
+**Extended-attribute keys** deliberately mirror directory-entry keys, and for the same reason: one key per attribute makes a single attribute readable, writable and removable on its own, and makes "every attribute of this inode" a prefix scan over `xattr:<ino>/`. A single packed value per inode would turn every `setxattr` into a read-modify-write of the whole set, which is both slower and a lost-update race between two nodes setting different attributes at once.
+
+Attributes are owned outright by the inode, so removing an inode deletes them in the same transaction, via a range delete over the prefix. That matters beyond leaked keys: inode numbers are reused, and a surviving attribute would be inherited by whatever file next took the number. An inode that still has other hard links keeps its attributes, since they belong to the inode rather than to the name being removed.
+
+Name and value sizes are bounded at the kernel's own `XATTR_NAME_MAX` (255) and `XATTR_SIZE_MAX` (65536). The bound is enforced in the metadata store rather than only in the FUSE layer because it is etcd being protected — an attribute is a Raft-replicated value, and an unbounded one is a route into the store quota. Names containing `/` or NUL are rejected: the first would move the key's split point, the second would end the name early in the NUL-separated `listxattr` buffer, and either lets a caller address an attribute other than the one it named. The `trusted.*` namespace is writable only by uid 0, matching the kernel; `security.*` is left writable so SELinux and IMA labels work, with the contents policed by the LSM hooks that own them.
 
 **Lock keys** are one per holder, not one per inode. The mode is part of the key and the value is just the holder's node ID. Each key carries its holder's own etcd lease, so a holder that stops heartbeating is dropped automatically — and dropping one holder cannot disturb the others, which is what allows a shared lock to have several at once.
 
