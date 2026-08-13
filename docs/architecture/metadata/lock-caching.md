@@ -182,14 +182,22 @@ exclusive lock and says nothing, and for those the default on release is to
 drop the snapshot. Being wrong in that direction costs one read; being wrong
 in the other serves a file's old extent list after it was rewritten.
 
-**The lock session's liveness bounds all of it.** A cached key is only as good
+**The lock session's identity bounds all of it.** A cached key is only as good
 as the lease it was written under. If that lease is gone — expired during a
 partition, or revoked — etcd deleted the key with it and a peer may already
-hold the inode, so `ensureLockKey` checks `LockSessionAlive` on every
-operation and drops both the key and the snapshot when it reads false. That
-check is a mutex and a channel poll, no round trip, and it is what bounds how
-long a partitioned node can answer from its own caches: the lock session's
-2-second TTL, not the self-fencing watchdog's much longer window. A node that
+hold the inode, so `ensureLockKey` compares the lease this entry's key was
+written under against the session's current lease on every operation, and
+drops both the key and the snapshot when they differ. That check is a mutex
+and a channel poll, no round trip, and it is what bounds how long a
+partitioned node can answer from its own caches: the lock session's 2-second
+TTL, not the self-fencing watchdog's much longer window.
+
+It compares identity rather than liveness, and the distinction is the whole
+guarantee. A dead session is replaced lazily, by whichever inode next needs a
+lock, so "is a session alive" answers yes again the moment any other operation
+acquires one — while this entry's key, written under the previous lease and
+deleted with it, is already gone. Checking liveness would let through exactly
+the stale holder the check exists to catch. A node that
 still holds a live session still holds its locks, and a peer that cannot take
 the lock cannot have changed what the snapshot describes — which is why a
 stale read needs the session to be gone, and the session being gone is what
@@ -245,9 +253,15 @@ properties a future change to this file must not reintroduce):
    `releaseKeyLocked` clears both together, and the snapshot carries the
    holder token it was read under so a re-acquired key cannot revive it.
 4. **A node that has lost its lock session holds nothing.** `ensureLockKey`
-   checks `LockSessionAlive` before trusting a cached key, so a partitioned
-   node stops answering from its caches within the lock session's TTL rather
-   than continuing until the self-fencing watchdog fires.
+   compares the lease its key was written under against the session's current
+   lease before trusting a cached key, so a partitioned node stops answering
+   from its caches within the lock session's TTL rather than continuing until
+   the self-fencing watchdog fires.
+5. **No lock decision is ever made from a read.** Whether a lock can be taken
+   is decided inside `AcquireLock`'s transaction, atomically with taking it.
+   `GetLockInfo` and `IsLocked` exist for tooling and are marked observation
+   only; wiring either into an acquisition path would reintroduce the
+   check-then-act window the transaction closes.
 
 ### Races considered
 
@@ -282,6 +296,15 @@ the gap.
 lock it can acquire without waiting, so no operation is ever running under an
 entry being evicted, and the eviction releases the key — and with it the
 snapshot — through the same path a recall does.
+
+**An acquisition whose reply is lost.** The transaction may have committed
+while the response did not arrive, and every attempt mints a fresh holder
+token — so the retry's "no holder exists" comparison is then blocked by this
+node's own orphaned key, which nothing will ever release. Each token names
+exactly one key, so before each retry the acquisition point-reads the tokens
+it has already tried and adopts one that exists. Only its own tokens: two
+shared holders on one node are legitimate and separately owned, and adopting
+another operation's key would let this one release a lock it never took.
 
 **A fenced node still holding cached locks.** Its writes are already rejected
 by the generation guard, and its reads cannot be stale for as long as it holds

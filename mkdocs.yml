@@ -61,6 +61,7 @@ nav:
           - Write Ordering Invariants: architecture/storage/write-ordering-invariants.md
           - "Kleppmann's Stale-Write Hazard Analysis": architecture/storage/kleppmann-stale-write-analysis.md
       - Consistency:
+          - Consistency and Durability Model: architecture/consistency/consistency-and-durability-model.md
           - Cache Coherence and Data Consistency: architecture/consistency/cache-coherence.md
           - Multi-Node Cache Coherence: architecture/consistency/multi-node-coherence.md
       - Fencing:

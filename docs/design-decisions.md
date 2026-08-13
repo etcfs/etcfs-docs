@@ -319,3 +319,58 @@ Verified by clearing the partially-bootstrapped nodes and running the new
 that script has run to completion), and by running `chaos-test-single-cluster.sh
 aws` — real scenario S1 — against the refactored `chaos-lib.sh` to confirm the
 shared script didn't change its proven behavior.
+
+## Coordination stays in etcd; the device is used only for bytes
+
+*Options:* (a) all coordination in etcd, the shared volume holding only file
+data, (b) per-inode locking on the device itself, using NVMe fused
+compare-and-write as the atomic primitive, (c) a hybrid — an on-device
+metadata index that peers read directly, with etcd only for locking.
+
+*Chosen:* (a), and it is now settled rather than open.
+
+A block device offers no atomicity beyond a sector, no compare-and-swap, no
+way to notify another attacher that something changed, and no cache coherence
+between attachers. Mutual exclusion needs an atomic read-modify-write, so (b)
+depends entirely on a primitive the hardware has to provide. AWS documents
+exactly four NVMe commands for Multi-Attach io2 volumes — Reservation
+Register, Acquire, Release and Report — and mentions Compare, Compare and
+Write and fused operations nowhere. Whether a given controller supports it is
+answerable on real hardware with `nvme id-ctrl`, reading ONCS bit 0 (Compare)
+and FUSES bit 0 (Compare and Write); undocumented support is not something a
+correctness argument can rest on regardless.
+
+(c) fails for a different reason and would fail even with perfect hardware
+support: a device cannot tell anyone that it changed, so a peer discovers
+updates only by reading, and every poll spends an IOP from the same budget the
+data path needs. Moving an index onto the volume does not add capacity, it
+splits it. Discovery needs something that can push, which is what an etcd
+watch is.
+
+The line the design holds to: the disk is used for what it is genuinely good
+at — durable, single-writer, sequential I/O — and consensus for what only
+consensus does, which is atomic exclusion and change discovery. NVMe
+reservations stay in use for fencing, where whole-namespace granularity is
+exactly right.
+
+## O_SYNC and O_DSYNC are read from each write, not latched at open
+
+The kernel does not turn a synchronous open into an `FUSE_FSYNC` on this
+mount. `fuse_file_write_iter` routes a file opened with `FOPEN_DIRECT_IO` to
+`fuse_direct_write_iter`, which — unlike `fuse_cache_write_iter` — never calls
+`generic_write_sync`. A daemon waiting for an fsync that the flags implied
+would wait forever.
+
+The flags do arrive, on every write: `fuse_send_write`, which is the function
+that direct-IO path calls, sets `inarg->flags = fuse_write_flags(iocb)`, and
+`fuse_write_flags` carries `O_DSYNC` and `O_SYNC` through from the iocb.
+libfuse hands them to the server as `fi->flags` (`_do_write` and
+`_do_write_buf`, protocol minor ≥ 9).
+
+So durability policy is decided per write from `fi->flags` rather than per
+inode at open. It is also the more correct reading of POSIX: the flag belongs
+to the descriptor, and a file can be open twice with different ones.
+
+Not established: whether the asynchronous direct-IO path (`fuse_direct_IO` →
+`fuse_async_req_send`, used by AIO and io_uring) carries the same flags. Until
+measured, the guarantee should be claimed only for synchronous writes.
