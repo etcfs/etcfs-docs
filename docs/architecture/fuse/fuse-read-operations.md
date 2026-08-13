@@ -189,9 +189,11 @@ The `offset` is the byte position within the file where reading starts. The `siz
 
 ### Processing
 
-The Go backend takes a shared lock on the inode, then asks for the inode record and the inode's extent keys (`extent:<ino>/<chunk>`). Both are needed before the read can be answered — the record to clamp the request to the file's size, the extents to resolve the range.
+The Go backend takes a shared lock on the inode, and fails the read with `EAGAIN` if it cannot get one. The lock is not only excluding a racing update: a writer that buries an extent frees its blocks in the same transaction that publishes the write, so a reader proceeding without the lock could resolve an extent, have its blocks returned to the arena and handed to another file, and read back that other file's bytes. Acquisition already asks the current holder to yield and retries before giving up, so failing is the rare case and a wrong answer is not the alternative worth taking.
 
-If this node already held the lock, both come from the snapshot cached under it and the read costs no etcd round trip at all (see [Lock Caching](../metadata/lock-caching.md)). Otherwise they are read as one serializable transaction (`Store.GetInodeAndExtents`): together rather than separately, so it is one round trip and one revision, and serializable rather than linearizable because the shared lock, not the read's place in etcd's linear order, is what keeps a concurrent writer off the range. A read that could not take the lock at all falls back to that same transaction and does not cache what it reads, since nothing would keep it true.
+With the lock held, the backend asks for the inode record and the inode's extent keys (`extent:<ino>/<chunk>`). Both are needed before the read can be answered — the record to clamp the request to the file's size, the extents to resolve the range.
+
+If this node already held the lock, both come from the snapshot cached under it and the read costs no etcd round trip at all (see [Lock Caching](../metadata/lock-caching.md)). Otherwise they are read as one serializable transaction (`Store.GetInodeAndExtents`): together rather than separately, so it is one round trip and one revision, and serializable rather than linearizable because the shared lock, not the read's place in etcd's linear order, is what keeps a concurrent writer off the range.
 
 For each extent, the handler parses the value `"logical_off,disk_off,length,generation"`. It finds the first extent that covers the requested offset and reads the data from the block device via `pread()` at the correct disk offset plus the offset within the extent.
 

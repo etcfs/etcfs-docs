@@ -239,6 +239,65 @@ properties a future change to this file must not reintroduce):
    `isCurrent` and restarts on the entry that replaced it if the check
    fails.
 
+3. **A snapshot must never outlive the key it was read under.** The cached
+   metadata is only true because no peer can write the inode while this node
+   holds the lock, so the moment the key goes the snapshot is worthless.
+   `releaseKeyLocked` clears both together, and the snapshot carries the
+   holder token it was read under so a re-acquired key cannot revive it.
+4. **A node that has lost its lock session holds nothing.** `ensureLockKey`
+   checks `LockSessionAlive` before trusting a cached key, so a partitioned
+   node stops answering from its caches within the lock session's TTL rather
+   than continuing until the self-fencing watchdog fires.
+
+### Races considered
+
+The scenarios below were worked through against this design; each is listed
+with what actually closes it, so a future change can tell which property it
+would be giving up.
+
+**A write that loses its lock mid-operation.** It cannot happen through a
+recall: a recall takes the entry's write lock, and the operation holds it for
+its whole duration, so a recall waits rather than cutting in. Through a lost
+lease it can, and the commit is then what stops it — every new extent is
+written under a `CreateRevision == 0` comparison and every rewrite under the
+revision it was read at, so a proposal built before a peer's write cannot
+apply on top of it. The generation guard is a separate protection against a
+*fenced* writer and does not cover this case; the comparisons do.
+
+**A reader against a concurrent reclaim.** The writer buries an extent and
+frees its blocks in the same transaction, and the allocator may hand them
+straight out, so a reader that resolved that extent earlier would read another
+file's bytes. The shared lock is what closes it — the writer's exclusive
+acquisition is blocked by it, on this node by the entry's `RWMutex` and across
+nodes by the lock key. This is why a read that cannot take the shared lock
+fails with `EAGAIN` instead of proceeding.
+
+**This node upgrading its own shared lock.** The upgrade is a delete followed
+by an acquire, and it is not atomic: a peer can take the inode in between. It
+is safe because the release clears the cached snapshot, so the operation
+re-reads under its new key rather than continuing from a view that predates
+the gap.
+
+**Eviction under load.** `evictLocksLocked` only takes an entry whose write
+lock it can acquire without waiting, so no operation is ever running under an
+entry being evicted, and the eviction releases the key — and with it the
+snapshot — through the same path a recall does.
+
+**A fenced node still holding cached locks.** Its writes are already rejected
+by the generation guard, and its reads cannot be stale for as long as it holds
+the locks, because a peer that cannot take the lock cannot have changed what
+the snapshot describes. What it can do is block healthy peers until it exits,
+which is why a self-fence drops every cached lock ahead of the rest of
+shutdown rather than waiting for the lease.
+
+**The cached extent list drifting from etcd.** The list is not maintained by a
+second description of what a write did — it is the write's own transaction
+replayed over the list it was built from. `TestIntegration_CachedMetadataMatchesEtcdAfterWrites`
+compares the cached view against a fresh read after an append, an overwrite
+that buries an extent, and a write that splits one in two;
+`TestIntegration_MutationsThatDoNotPublishDropTheCache` checks that a mutation
+which does not publish leaves nothing cached behind.
+
 Both were caught by review before being benchmarked or shipped, not by a
 failure in the field — there was no failure in the field, since the code had
 not run outside tests. `internal/ipc/lockcache_test.go` has one test per
