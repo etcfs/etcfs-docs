@@ -189,11 +189,13 @@ The `offset` is the byte position within the file where reading starts. The `siz
 
 ### Processing
 
-The Go backend scans the inode's extent keys (`extent:<ino>/<chunk>`) from etcd. For each extent, it parses the CSV value `"logical_off,disk_off,length,generation"`. It finds the first extent that covers the requested offset and reads the data from the block device via `pread()` at the correct disk offset plus the offset within the extent.
+The Go backend takes a shared lock on the inode, then reads the inode record and the inode's extent keys (`extent:<ino>/<chunk>`) as one serializable transaction (`Store.GetInodeAndExtents`). Both are needed before the read can be answered — the record to clamp the request to the file's size, the extents to resolve the range — and reading them together costs one round trip instead of two and answers both from a single revision. The read is serializable rather than linearizable because the shared lock, not the read's place in etcd's linear order, is what keeps a concurrent writer off the range.
+
+For each extent, the handler parses the value `"logical_off,disk_off,length,generation"`. It finds the first extent that covers the requested offset and reads the data from the block device via `pread()` at the correct disk offset plus the offset within the extent.
 
 If the file has multiple extents (e.g., from sequential writes), the handler walks them in order and copies each one into the position it occupies *within the request*, not into a running output cursor. That distinction is the whole of it: with a hole before an extent, placing its bytes at the running position shifts everything after the gap.
 
-The output buffer starts zeroed, so a hole needs no work at all — only the ranges an extent covers are filled in. The handler returns the whole range that was asked for, so a gap between extents, or a tail past the last extent, reads back as zeroes rather than as a short read. The kernel has already clamped the request to the size it last saw, so nothing past the end of the file is in it.
+The output buffer starts zeroed, so a hole needs no work at all — only the ranges an extent covers are filled in. The handler returns the whole range that was asked for, so a gap between extents, or a tail past the last extent, reads back as zeroes rather than as a short read. That is why the request is clamped to the size in the inode record first: the kernel usually clamps to the size it last cached, but it does not always, and an unclamped request past the end would come back as a buffer of zeroes instead of the short read a reader terminates its loop on.
 
 Extents arrive ordered by logical offset, and newest first where two of them cover the same one, so taking the first extent that reaches the cursor resolves an overwrite to the later write.
 
