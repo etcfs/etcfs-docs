@@ -26,6 +26,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 | `xattr:<ino>/<name>` | attribute value (opaque bytes) | One extended attribute of an inode |
 | `quota:<ino>` | `QuotaRecord` (JSON) | Byte and inode limits on a directory that is a quota root |
 | `lock:<ino>/<mode>/<holder>` | holder's node ID | One holder of an inode's lock, written under that node's session lease |
+| `lock_want:<ino>/<node_id>` | requesting node's ID | A peer asking the holder of a cached lock to yield it; outside `lock:` so it cannot block the acquisition it exists to unblock |
 | `arena:<node_id>/<arena_id>` | `<arena_id>` (8 bytes) | One arena a node currently owns |
 | `arena_alloc_log` | counter (8 bytes) | Global arena-ID allocation counter |
 | `membership:<node_id>` | membership metadata | Lease-backed liveness key for cluster membership |
@@ -149,6 +150,7 @@ Each key family has a constructor function that builds the etcd key string from 
 - `DirentKey(parent, name)` — produces `"dirent:<parent>/<name>"`
 - `DirentPrefix(parent)` — produces `"dirent:<parent>/"` for prefix scans
 - `LockKey(ino, mode, holder)` — produces `"lock:<ino>/<mode>/<holder>"`, where the holder token is the node's session lease and a per-acquisition counter; `LockPrefix(ino)` and `LockModePrefix(ino, mode)` produce the ranges a transaction compares against
+- `LockWantKey(ino, node)` — produces `"lock_want:<ino>/<node_id>"`, the request a blocked node writes to recall a cached lock; `ParseLockWantKey` reads back the inode and the node that wants it
 - `ArenaOwnerKey(nodeID, arenaID)` — produces `"arena:<nodeID>/<arenaID>"`
 - `ArenaNodePrefix(nodeID)` — produces `"arena:<nodeID>/"` for prefix scans
 - `MembershipKey(nodeID)` — produces `"membership:<nodeID>"`
