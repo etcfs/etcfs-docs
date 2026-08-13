@@ -4,7 +4,10 @@ Everything needed to run an EtcFS cluster outside `docker compose`, in order:
 
 1. **[Infrastructure (Terraform)](terraform.md)** — provision the EC2 nodes,
    the shared io2 Multi-Attach EBS volume, security group and fencing IAM
-   profile on AWS.
+   profile on AWS. **[Autoscaling (ASG)](autoscaling.md)** covers the
+   alternative Terraform module that runs nodes in an Auto Scaling Group
+   instead, with self-joining nodes and graceful `etcd member remove` on
+   scale-in.
 2. **[Binaries and containers](binaries.md)** — install `etcfuse`,
    `etcfuse-meta` and `etcfsctl` from a GitHub release (`.deb`/`.rpm`,
    tarball + checksum) or pull the `ghcr.io` container images.

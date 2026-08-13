@@ -35,6 +35,7 @@ nav:
   - Deployment:
       - Overview: deployment/index.md
       - Infrastructure (Terraform): deployment/terraform.md
+      - Autoscaling (ASG): deployment/autoscaling.md
       - Binaries and Containers: deployment/binaries.md
       - Configuration: deployment/configuration.md
       - etcfsctl CLI: deployment/etcfsctl.md

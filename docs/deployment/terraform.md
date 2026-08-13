@@ -15,6 +15,11 @@ volume, EtcFS's own etcd and daemon pair, and the [CSI
 driver](kubernetes-csi.md), all in one `apply`. See that directory's
 `README.md`; nothing on this page applies to it.
 
+A cluster that needs to grow and shrink on its own — an ASG rather than a
+fixed `node_count` — is `infra/terraform-asg/`, a third root module. Nodes
+join and leave without an operator's involvement: see
+[Autoscaling](autoscaling.md).
+
 ## What it does not do
 
 Installing etcd, compiling the two EtcFS binaries on-node, and starting a
