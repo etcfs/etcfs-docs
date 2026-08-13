@@ -152,7 +152,16 @@ serializable, and the reclaim of buried extents plus the lock release folded
 into the transaction that publishes the write, taking a write from four
 committed operations to two. A re-run at the 1000-IOPS tier after the first
 two of those changes measured 176 randwrite / 149 randread IOPS against the
-earlier ~100-105; the folding is not yet benchmarked. See
+earlier ~100-105.
+
+Since that measurement the remaining lock round trips have gone too. An inode's
+lock key is now cached past the operation that took it and reused, released only
+when a peer asks for it back (see
+[Concurrency Control](../metadata/concurrency-control.md#lock-caching)). In the
+uncontended steady state a write commits once — the transaction publishing its
+own extents — and a read commits not at all, against the four commits per write
+this section started from. Neither the folding nor the caching has been
+benchmarked yet; the numbers throughout this page predate both. See
 [Benchmark Reports: IOPS Ceiling, EFS Throughput Modes, Contention (2026-08-11)](../../reports/benchmark-reports/2026-08-11-iops-ceiling-efs-throughput-contention.md),
 which also covers EFS provisioned-throughput mode (the fixed-budget analogue
 of `io2`'s `--iops`, since bursting mode has no such stated ceiling) and

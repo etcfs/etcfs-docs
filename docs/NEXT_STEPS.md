@@ -190,6 +190,23 @@ derived from a stale extent list could resurrect a deleted record); each
 rewritten extent now carries a comparison on the revision it was read at. The
 folding has not yet been benchmarked.
 
+**[Done, not yet benchmarked]** The lock round trips themselves are now gone
+from the steady state. A node keeps an inode's lock key in etcd past the
+operation that took it and reuses it, so a repeat acquisition costs nothing;
+node-local exclusion moves to a per-inode `RWMutex`, and a blocked peer recalls
+the lock with a `lock_want:` key the holder watches for. An uncontended write is
+then one committed operation — the transaction publishing its own extents — and
+an uncontended read is none, against the four per write this line of work
+started from. Contended access costs a want-key commit plus the recall latency,
+which is the trade an NFSv4-style delegation makes. See
+`internal/ipc/lockcache.go` and
+`docs/architecture/metadata/concurrency-control.md`.
+
+The next round-trip on the list is the extent read the write path still does
+before proposing, which is a linearizable-or-serializable RPC rather than a
+commit, and is a caching problem now that the lock guaranteeing its validity is
+held across operations.
+
 Splitting metadata into a faster store (Redis) with etcd kept only for
 locks/fencing was considered and set aside: it trades one round-trip problem
 for a two-system atomicity problem, and does not match what JuiceFS itself

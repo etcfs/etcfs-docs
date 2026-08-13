@@ -6,6 +6,7 @@ Lock operations, lease-backed lock expiry, fencing generations, and the safety p
 
 - [Lock Model](#lock-model)
 - [Lock Acquisition](#lock-acquisition)
+- [Lock Caching](#lock-caching)
 - [Lease-Backed Expiry](#lease-backed-expiry)
 - [Lock Release](#lock-release)
 - [Lock Watching](#lock-watching)
@@ -35,7 +36,7 @@ This design eliminates directory-level lock contention entirely. The only serial
 
 Etcd evaluates a comparison over a range as "true for every key in it", and an empty range is vacuously true, so `CreateRevision == 0` over the range reads as "no blocking holder exists". Deciding it inside the transaction rather than by a preceding read is what closes the window a competing acquisition would otherwise slip through.
 
-If the comparison fails, the acquisition fails with `ErrConflict` and writes nothing, leaving nothing behind. The caller can retry with backoff or report the conflict to the application.
+If the comparison fails, the acquisition fails with `ErrConflict` and writes nothing, leaving nothing behind. The caller retries with backoff, having first asked the current holder to yield (see [Lock Caching](#lock-caching)), or reports the conflict to the application.
 
 ### The session lease
 
@@ -45,7 +46,25 @@ The safety argument is unchanged by the sharing. What releases a dead holder's l
 
 Two consequences follow from the sharing, and both are handled explicitly. A holder is no longer identified by its lease, so the key carries a per-acquisition counter alongside it; without that, two concurrent readers on one node would write the same key and one would release the other's lock. And a release must delete its own key rather than revoke the lease, since revoking would drop every other lock the node holds.
 
-The production data path (`internal/ipc/datapath.go`, both the read and write handlers) acquires with a fixed 2-second TTL (`inodeLockTTL` in `internal/ipc/retry.go`) — not a configurable default; every caller of `AcquireLock` in the running system passes the same constant. The first acquisition fixes the session's TTL; later ones reuse the session. If the session's lease is ever lost — expired during a partition, or revoked — the next acquisition grants a new one, which is safe precisely because expiry has already removed every lock the old lease held.
+The production data path (`internal/ipc/datapath.go`, both the read and write handlers) acquires through the lock cache described below, with a fixed 2-second TTL (`inodeLockTTL` in `internal/ipc/retry.go`) — not a configurable default; every caller of `AcquireLock` in the running system passes the same constant. The first acquisition fixes the session's TTL; later ones reuse the session. If the session's lease is ever lost — expired during a partition, or revoked — the next acquisition grants a new one, which is safe precisely because expiry has already removed every lock the old lease held.
+
+## Lock Caching
+
+A lock key outlives the operation that took it. The node keeps it in etcd and reuses it for every later operation on the same inode, so a repeat acquisition is a map lookup and costs no round trip at all. This is a write delegation in the NFSv4 sense, scoped to the lock rather than to the open. The implementation is `internal/ipc/lockcache.go`.
+
+The motivation is the same one the session lease came from, taken one step further. Acquiring and releasing in etcd around every operation put two Raft commits on the critical path of a write and one on that of a read; at etcd's measured ~2.2 ms per commit, that was what set the filesystem's IOPS ceiling, and no amount of provisioned device IOPS moved it (see [Performance Benchmarks](../reliability/performance-benchmarks.md)). Caching removes both from the steady state: an uncontended write commits once, to publish its own extents, and an uncontended read commits not at all.
+
+**Node-local exclusion.** The etcd key excludes other nodes; it no longer excludes this node's own threads, since they all find the same cached key. Each operation therefore takes a per-inode `sync.RWMutex` — read lock for shared, write lock for exclusive — which is what actually serialises two threads on one node. The wait is bounded rather than blocking: a lock a thread cannot get within its retry budget fails with `EAGAIN`, the same outcome the etcd-side conflict used to produce.
+
+**Recall.** A cached key sits under a lease the node renews for as long as it lives, so a blocked peer cannot wait it out. It writes a want key, `lock_want:<ino>/<node>`, and every node watches that prefix; a node holding a cached lock for that inode waits for the operation in flight to finish, deletes its key, and drops the entry. The waiter withdraws its want key once it has the lock, off the critical path — a want key left standing would have every peer yield that inode from then on.
+
+The want key is deliberately stored outside `lock:`, because an exclusive acquisition compares the whole of `lock:<ino>/` against "no keys exist" — a want key stored there would block the acquisition it exists to unblock.
+
+**Mode upgrades.** An exclusive lock satisfies a request for a shared one: it excludes every peer a shared lock would, so a read under it is at least as safe. The cache never downgrades, which is what stops a read-modify-write sequence flapping the key between modes at a Raft commit each way. Only the reverse direction costs anything: a cached shared key must be deleted before this node can take the inode exclusively, since the acquisition's comparison rejects any holder, including itself.
+
+**Bound.** The cache holds at most 4096 inodes. Eviction picks the least recently used entry that has no operation in flight and releases its key; an entry currently in use is skipped rather than waited for, so a cache full of busy inodes grows past the bound rather than blocking a request.
+
+**Interaction with fencing.** Caching does not widen the fencing window. Every mutation is still guarded by the node's generation, so a fenced node's commits stop being accepted whether or not it is holding a lock; a fenced node's cached keys are cleared when its lock session ends at shutdown, or by lease expiry if it stops renewing.
 
 ## Lease-Backed Expiry
 
@@ -62,9 +81,9 @@ The lease mechanism is fundamentally safer than a "release on crash" protocol be
 
 `ReleaseLock` deletes one holder's key. Any watchers receive a DELETE event. A shared lock survives with its remaining holders — only the last one to leave actually unlocks the inode.
 
-A caller that is already committing a transaction can put that deletion into it instead, which is what the write path does: the lock is dropped in the same transaction that publishes the write, so it costs no round trip of its own and is released at exactly the revision the work it protected becomes visible. The release is only ever treated as done once that transaction is known to have committed — a rejected one released nothing, and the lock is then dropped in a round trip of its own after all.
+On the data path a release is not issued at the end of the operation at all: the key is kept and reused (see [Lock Caching](#lock-caching)), and `ReleaseLock` runs only when a peer asks for the lock, when the cache evicts the entry, or on shutdown.
 
-A release issued on its own is retried, because a lock key now outlives a failed release for as long as the node does: the session lease that would otherwise have expired it is the one this node keeps renewing. A graceful shutdown ends the session (`CloseLockSession`), which clears anything a failed release left behind. The lock's own TTL (2 seconds) provides an upper bound on how long the lock itself can remain held after a crash. That is a different figure from the self-fencing watchdog's window: the watchdog gates on the node's *membership* lease (`gen:<node>`/`membership:<node>`, TTL configured separately via `--lease-ttl`, default 10 seconds — see `internal/config/config.go`) and fires at 2–3× that TTL, not the lock TTL. The two leases are independent and not proportional to each other; conflating them here previously understated the actual self-fence window by describing it as derived from the lock's 5-second TTL, a value that was itself wrong.
+A release is retried, because a lock key outlives a failed release for as long as the node does: the session lease that would otherwise have expired it is the one this node keeps renewing. A graceful shutdown drops every cached lock and then ends the session (`CloseLockSession`), which clears anything a failed release left behind. The lock's own TTL (2 seconds) provides an upper bound on how long the lock itself can remain held after a crash. That is a different figure from the self-fencing watchdog's window: the watchdog gates on the node's *membership* lease (`gen:<node>`/`membership:<node>`, TTL configured separately via `--lease-ttl`, default 10 seconds — see `internal/config/config.go`) and fires at 2–3× that TTL, not the lock TTL. The two leases are independent and not proportional to each other; conflating them here previously understated the actual self-fence window by describing it as derived from the lock's 5-second TTL, a value that was itself wrong.
 
 ## Lock Watching
 

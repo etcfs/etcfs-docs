@@ -52,6 +52,11 @@ correctness problem; nothing is.
 29. **Each write costs a flush, a sync and a full readback.** Three device round trips, all on the critical path. The readback is what makes the write visible to other Multi-Attach attachers.
     - [x] All three are behind `--write-barriers`, off by default: with O_DIRECT against a volume that acknowledges only durable, visible writes they publish nothing the write has not. Buffered mode forces them on, the barrier readback is one sector, and the reader-side BLKFLSBUF went the same way.
     - [ ] Benchmark the two settings on the io2 Multi-Attach volume, and check cross-node visibility with the barriers off before the default is trusted.
+55. **The inode lock cost a Raft commit on every operation.** Acquire and release around each read and write, at etcd's measured ~2.2 ms per commit — the ceiling no amount of provisioned device IOPS moved, since a serial chain of commits is latency-bound and provisioning buys parallelism.
+    - [x] The release folded into the transaction that publishes the write, taking an overwriting write from four committed operations to two.
+    - [x] Lock keys cached past the operation that took them and reused, with node-local exclusion on a per-inode `RWMutex` and a `lock_want:` key by which a blocked peer recalls one. An uncontended write is one committed operation, an uncontended read none.
+    - [ ] Benchmark it. Every number on `docs/architecture/reliability/performance-benchmarks.md` predates both changes.
+    - [ ] Cache the write path's extent read too — the lock that makes it valid is now held across operations, so re-reading it per write is the next round trip on the list.
 
 # SIMPLIFICATION
 
