@@ -12,6 +12,7 @@ device) and `etcfuse` (C, mounts the filesystem, forwards VFS ops to
 | `--listen` | `/run/etcfuse/etcfuse.sock` | IPC socket the C daemon connects to. |
 | `--notify-socket` | `/run/etcfuse/etcfuse-notify.sock` | Cache-invalidation notifications to the C daemon. |
 | `--etcd-endpoints` | `http://localhost:2379` | Comma-separated. |
+| `--etcd-local-endpoint` | unset | Endpoint of the etcd member colocated with this node. Reads are served through it — otherwise the client round-robins and a serializable data-path read still crosses the network. Falls back to `--etcd-endpoints` if the local member cannot answer. Leave unset when no member runs on this node. |
 | `--etcd-cert`, `--etcd-key`, `--etcd-ca` | unset | etcd client TLS. Every cluster this repo's own scripts provision runs plaintext etcd (see `bootstrap-cluster.sh`'s header) — set these if yours does not. |
 | `--node-id` | hostname | |
 | `--cluster-name` | `etcfuse` | Namespaces this node's membership/fencing keys in etcd. |

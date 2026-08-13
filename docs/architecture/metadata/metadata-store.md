@@ -45,7 +45,9 @@ Key characteristics of the Store implementation:
 
 - **No caching.** Every `Get`, `GetPrefix`, and `Txn` call hits etcd directly. Caching is the responsibility of higher layers (the inode cache, the dentry cache in the FUSE daemon, the kernel VFS cache). The store is the single source of truth.
 
-- **Serializable vs linearizable reads.** Simple key-value reads use etcd's default (serializable) consistency for lower latency. Domain operations that require strong consistency (lock acquisition, generation checks) use transactions, which are linearizable.
+- **Serializable vs linearizable reads.** Reads are linearizable by default, which costs a leader round trip. A read asks for serializable consistency only where something else already establishes the ordering it needs: the data path's extent reads are covered by the inode lock, and the write path's proposal is re-checked by the comparison it commits under. Domain operations that depend on the read itself being ordered (lock acquisition, generation checks) stay linearizable.
+
+- **Reads pinned to the colocated member.** The etcd client round-robins over every endpoint, so a serializable read can still leave the machine — which defeats the point of asking for one. When `--etcd-local-endpoint` names the member colocated with this node, `Store.SetLocalClient` installs a second client dialed only at it, and every read is attempted there first. Linearizable reads are unchanged in meaning: the local member still confirms its read index with the leader. Writes keep using the cluster-wide client, and a read the local member cannot serve is retried on it, so losing the colocated member costs latency rather than availability.
 
 - **Revision-based pagination.** Directory listings that exceed a single response are paginated using etcd's revision-based cursor. The first page establishes a consistent revision snapshot; subsequent pages iterate from that revision. This guarantees that a directory seen mid-mutation does not produce duplicate or missing entries (no phantom reads).
 
