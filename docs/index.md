@@ -32,9 +32,7 @@ data you can't afford to lose. In particular:
 - Arena space emptied by deletes/truncates is reclaimed automatically: a
   background reaper (`Allocator.ReapEmptyArenas`) returns emptied arenas to
   the global free pool. `RebalanceArena` (manual ownership transfer) exists
-  but is unused in production — see [`docs/NEXT_STEPS.md`](https://github.com/MHS-20/EtcFS/blob/main/docs/NEXT_STEPS.md).
+  but is unused in production.
 
-Full tracking list: [`docs/TODO.md`](https://github.com/MHS-20/EtcFS/blob/main/docs/TODO.md).
-Larger directions — benchmarking against EBS/EFS/Lustre, TLA+
-verification, the Kubernetes CSI driver — are in
-[`docs/NEXT_STEPS.md`](https://github.com/MHS-20/EtcFS/blob/main/docs/NEXT_STEPS.md).
+Larger directions not yet started — benchmarking against EBS/EFS/Lustre,
+TLA+ verification, the Kubernetes CSI driver — are tracked internally.

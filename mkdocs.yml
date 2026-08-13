@@ -54,6 +54,7 @@ nav:
           - Namespace Operations: architecture/metadata/namespace-operations.md
           - POSIX Lock Operations: architecture/metadata/posix-lock-operations.md
           - Concurrency Control: architecture/metadata/concurrency-control.md
+          - Lock Caching and Recall: architecture/metadata/lock-caching.md
       - Storage Substrate:
           - Block Device I/O Substrate: architecture/storage/block-device-io.md
           - Arena Allocator: architecture/storage/arena-allocator.md

@@ -23,7 +23,7 @@ First deployment of the EtcFS CSI driver (`csi/`) onto a real Kubernetes cluster
 - `etcfuse-meta`, `etcfuse`, and `etcfs-csi` images built from the repository's own Dockerfiles, pushed to a scratch ECR repository created and destroyed for this test.
 - EtcFS's own etcd (single node — this test exercises the CSI driver and the fence hook, not etcd HA, which `pkg/fencing`'s own integration suite already covers) and the `etcfuse-meta`/`etcfuse` pair ran as a privileged DaemonSet on both nodes, mirroring what `deploy/docker/docker-compose.yml` does for local development, moved onto real nodes with a real shared block device instead of loopback files.
 
-This mirrors the "positioning" argument in `docs/NEXT_STEPS.md`'s Kubernetes section directly: Kubernetes already models `volumeMode: Block` + `ReadWriteMany`, the AWS EBS CSI driver supports Multi-Attach there, and its own docs say application-level I/O fencing is required or the result is data loss and silent corruption. This run is EtcFS actually doing that, on the same class of volume, on real EKS.
+This mirrors the broader positioning argument for Kubernetes directly: Kubernetes already models `volumeMode: Block` + `ReadWriteMany`, the AWS EBS CSI driver supports Multi-Attach there, and its own docs say application-level I/O fencing is required or the result is data loss and silent corruption. This run is EtcFS actually doing that, on the same class of volume, on real EKS.
 
 ## What was tested
 

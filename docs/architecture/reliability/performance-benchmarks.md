@@ -1,7 +1,7 @@
 # Performance benchmarks: EtcFS vs. its own device ceiling and EFS
 
-`docs/NEXT_STEPS.md`'s performance section asked for measurement before
-optimizing items 24, 28 and 29. This is that measurement: `fio` run on the
+Measurement was needed before optimizing further. This is that
+measurement: `fio` run on the
 same `t3.medium` node, same `eu-west-1a` AZ, same 100-IOPS `io2` volume type,
 against four targets. The harness is `scripts/infra/benchmark.sh`, run
 against a live 3-node EtcFS cluster provisioned by `create-infra.sh` /
@@ -157,11 +157,33 @@ earlier ~100-105.
 Since that measurement the remaining lock round trips have gone too. An inode's
 lock key is now cached past the operation that took it and reused, released only
 when a peer asks for it back (see
-[Concurrency Control](../metadata/concurrency-control.md#lock-caching)). In the
+[Lock Caching and Recall](../metadata/lock-caching.md)). In the
 uncontended steady state a write commits once — the transaction publishing its
 own extents — and a read commits not at all, against the four commits per write
-this section started from. Neither the folding nor the caching has been
-benchmarked yet; the numbers throughout this page predate both. See
+this section started from.
+
+A re-run of `benchmark.sh` (2026-08-13, single fio client, `psync`/`iodepth=1`,
+same 3-node cluster shape, 1000-IOPS io2) measured **237 randwrite / 208
+randread IOPS**, against 176/149 from the folding-only build and ~100-105 from
+before any of this section's changes:
+
+| Target | randwrite-4k IOPS | randwrite-4k p99 (ms) | randread-4k IOPS | randread-4k p99 (ms) | seqwrite-128k MiB/s |
+|---|---|---|---|---|---|
+| raw (1000-IOPS io2) | 1033 | 219 | 1006 | 219 | 252 |
+| ext4 | 1027 | 267 | 8990 | 95 | 251 |
+| EFS (bursting) | 4864 | 40 | 20211 | 11 | 72 |
+| EtcFS | 237 | 37 | 208 | 41 | 43 |
+
+Read gained more than write (+40% vs. +35%), consistent with the round-trip
+accounting: a cached-lock write still commits once (extent publish) plus an
+uncached extent read RPC, while a cached-lock read drops its only commit
+entirely and is left with the extent read RPC and the device read. EtcFS
+remains well under the 1000-IOPS device ceiling raw and ext4 sit almost
+exactly on — the bottleneck is no longer per-write RPC count in the way it
+was at the 100-105 baseline, but it has not become device-bound either; the
+extent read named in [Lock Caching and Recall](../metadata/lock-caching.md)
+as the next round trip on the list is the next thing worth measuring in
+isolation. See
 [Benchmark Reports: IOPS Ceiling, EFS Throughput Modes, Contention (2026-08-11)](../../reports/benchmark-reports/2026-08-11-iops-ceiling-efs-throughput-contention.md),
 which also covers EFS provisioned-throughput mode (the fixed-budget analogue
 of `io2`'s `--iops`, since bursting mode has no such stated ceiling) and
@@ -169,10 +191,10 @@ multi-node contention on a single shared file.
 
 ## Cost-per-IOPS
 
-Not computed here — it needs the FSx number to be the comparison
-`docs/NEXT_STEPS.md` actually asks for (cost-per-delivered-IOPS is named
-there as the argument EtcFS wins on against *provisioned Lustre*
-specifically, not EFS). Worth finishing once FSx is added to the harness.
+Not computed here — it needs the FSx number to make the real comparison:
+cost-per-delivered-IOPS is the argument EtcFS wins on against
+*provisioned Lustre* specifically, not EFS. Worth finishing once FSx is
+added to the harness.
 
 ## Reproducing
 

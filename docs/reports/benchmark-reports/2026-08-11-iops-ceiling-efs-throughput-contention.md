@@ -43,7 +43,7 @@ etcd itself isn't slow. A single FUSE write commits 4 separate Raft entries in s
 
 (`GetExtents`, read between steps 2 and 3, is a linearizable *read*, not a Raft commit — it costs an RPC and a leader round trip, but not a WAL fsync.)
 
-4 × 2.2ms ≈ 8.8ms → 1/0.0088 ≈ 113 ops/sec. Measured: ~100-105. The RPC count per write, not etcd's raw speed or the device, sets the ceiling — and because it's a fixed multiplier, cutting round trips and speeding up etcd both raise the ceiling, multiplicatively. Two concrete reductions (a session-scoped lease instead of per-write grant/revoke, and a serializable rather than linearizable extent read) are filed in `docs/NEXT_STEPS.md` under "Metadata round-trip reduction."
+4 × 2.2ms ≈ 8.8ms → 1/0.0088 ≈ 113 ops/sec. Measured: ~100-105. The RPC count per write, not etcd's raw speed or the device, sets the ceiling — and because it's a fixed multiplier, cutting round trips and speeding up etcd both raise the ceiling, multiplicatively. Two concrete reductions are tracked internally: a session-scoped lease instead of per-write grant/revoke, and a serializable rather than linearizable extent read.
 
 *Both reductions have since been implemented, and a re-measurement corrected the arithmetic above.* Locks are now written under a per-node session lease, so the `GrantLease` of step 1 is gone; the extent read is serializable and answered by whichever member the client is connected to. That alone took a write from 4 committed operations to 3 — the release still cost a commit, because deleting the lock key is itself a guarded transaction, so it replaced `RevokeLease` rather than removing it. Measured on a fresh 3-node cluster against a 1000-IOPS io2 volume: **176 randwrite / 149 randread IOPS**, against the ~100-105 in this report.
 
@@ -79,7 +79,7 @@ Neither bug changed what EtcFS did under contention — both were the harness di
 
 - The 4000 IOPS tier (AWS's modification-rate limit, see above).
 - FSx for Lustre, same reason as the original benchmark: an order of magnitude more provisioning cost/time for one row.
-- The two round-trip reductions this report's own finding motivates (session-scoped lease, serializable extent reads) are not yet implemented — see `docs/NEXT_STEPS.md`.
+- The two round-trip reductions this report's own finding motivates (session-scoped lease, serializable extent reads) are not yet implemented.
 - A TiKV-backed JuiceFS comparison, which would be the fairer "similarly Raft-backed metadata store" comparison than a Redis-backed one; not attempted here.
 
 ## Reproduction

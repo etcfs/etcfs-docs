@@ -50,29 +50,19 @@ The production data path (`internal/ipc/datapath.go`, both the read and write ha
 
 ## Lock Caching
 
-A lock key outlives the operation that took it. The node keeps it in etcd and reuses it for every later operation on the same inode, so a repeat acquisition is a map lookup and costs no round trip at all. This is a write delegation in the NFSv4 sense, scoped to the lock rather than to the open. The implementation is `internal/ipc/lockcache.go`.
+The lock key an operation acquires now outlives that operation: the node
+keeps it in etcd and reuses it for later operations on the same inode, so a
+repeat acquisition costs no round trip. Mutual exclusion between this node's
+own threads moves to a per-inode mutex, and a blocked peer recalls a cached
+key with a `lock_want:<ino>/<node>` key the holder watches for — the same
+role a DLM's blocking AST plays.
 
-The motivation is the same one the session lease came from, taken one step further. Acquiring and releasing in etcd around every operation put two Raft commits on the critical path of a write and one on that of a read; at etcd's measured ~2.2 ms per commit, that was what set the filesystem's IOPS ceiling, and no amount of provisioned device IOPS moved it (see [Performance Benchmarks](../reliability/performance-benchmarks.md)). Caching removes both from the steady state: an uncontended write commits once, to publish its own extents, and an uncontended read commits not at all.
-
-**Node-local exclusion.** The etcd key excludes other nodes; it no longer excludes this node's own threads, since they all find the same cached key. Each operation therefore takes a per-inode `sync.RWMutex` — read lock for shared, write lock for exclusive — which is what actually serialises two threads on one node. The wait is bounded rather than blocking: a lock a thread cannot get within its retry budget fails with `EAGAIN`, the same outcome the etcd-side conflict used to produce.
-
-The mutex and the etcd key must name the same inode for the same reason a DLM lock resource is a singleton per resource: whichever cache entry an operation holds has to be the one every other caller of that inode finds. That invariant is checked after the local lock is taken, not assumed.
-
-**Recall.** A cached key sits under a lease the node renews for as long as it lives, so a blocked peer cannot wait it out. It writes a want key, `lock_want:<ino>/<node>`, and every node watches that prefix; a node holding a cached lock for that inode waits for the operation in flight to finish and deletes its key. This is the blocking AST of a DLM: the same callback GFS2 gets when a peer's request conflicts with a glock it is holding. The waiter withdraws its want key once it has the lock, off the critical path — a want key left standing would have every peer yield that inode from then on.
-
-A recall demotes the entry rather than removing it. The cache entry is also the node-local mutex, so dropping it would leave any operation running under it holding a mutex the next caller no longer looks at, and two of this node's own operations would then run against one inode each believing it held the lock. Only eviction removes an entry, and only while holding it; an operation that finds its entry gone from the cache between the lookup and the local lock starts over on the entry that replaced it.
-
-**Minimum hold time.** A lock is held for at least 10 ms before a recall is honoured. Without that floor, sustained contention on one inode costs a recall and a want key per operation — two extra commits where the per-operation acquire this cache replaced cost one, making the contended case worse than the case the cache was built to fix. This is GFS2's `gl_hold_time` and it makes the same trade: a bounded extra wait for the peer, in exchange for a bound on how often a lock can change hands.
-
-The want key is deliberately stored outside `lock:`, because an exclusive acquisition compares the whole of `lock:<ino>/` against "no keys exist" — a want key stored there would block the acquisition it exists to unblock.
-
-**Mode upgrades.** An exclusive lock satisfies a request for a shared one: it excludes every peer a shared lock would, so a read under it is at least as safe. The cache never downgrades, which is what stops a read-modify-write sequence flapping the key between modes at a Raft commit each way. Only the reverse direction costs anything: a cached shared key must be deleted before this node can take the inode exclusively, since the acquisition's comparison rejects any holder, including itself.
-
-**Bound.** The cache holds at most 4096 inodes. Eviction picks the least recently used entry that has no operation in flight and releases its key; an entry currently in use is skipped rather than waited for, so a cache full of busy inodes grows past the bound rather than blocking a request.
-
-**Nothing is cached under the lock.** This is what separates the mechanism from a GFS2 glock, which is both a mutual-exclusion token and the coherence token for the page cache it protects — which is why demoting one there obliges the holder to flush and invalidate. EtcFS caches no file data on either side of the lock: the mount sets `direct_io` with `keep_cache` off, so the kernel holds no pages for a file, and the daemon re-reads an inode's extents from etcd on every operation. Holding the lock longer therefore extends no cached state, and a recall has nothing to invalidate. Attribute and dentry caching is bounded by its own timeouts and the `dirent:` watch (see [Cache Coherence](../consistency/cache-coherence.md)), and was never tied to lock acquisition.
-
-**Interaction with fencing.** Caching does not widen the fencing window. Every mutation is still guarded by the node's generation, so a fenced node's commits stop being accepted whether or not it is holding a lock. A cached lock key is the one piece of shared state that guard does not neutralise, since a key held by a fenced node blocks a healthy peer, so a self-fence drops every cached lock immediately rather than waiting for the process to exit; a partitioned node's keys go with its session lease within the 2-second TTL.
+None of this touches the lease-based safety argument below, the fencing
+guard, or the extent CAS in the write transaction; caching changes only when
+the etcd key is taken and released. See
+[Lock Caching and Recall](lock-caching.md) for the full protocol, the
+recall sequence, and the two correctness invariants the implementation has
+to hold.
 
 ## Lease-Backed Expiry
 

@@ -49,9 +49,9 @@ interchangeable in what they guarantee.
 
 Soft per-subtree quotas — a directory becomes a quota root with a byte
 and/or inode ceiling; usage is computed by `pkg/quota` and enforced at the
-next mutating operation under that root, not inline (see
-`docs/NEXT_STEPS.md` for why soft). Configured live via `etcfsctl`, not a
-daemon flag:
+next mutating operation under that root, not inline — see
+`docs/architecture/metadata/metadata-schema.md` for why soft. Configured
+live via `etcfsctl`, not a daemon flag:
 
 ```bash
 etcfsctl quota set <inode> --bytes=10737418240 --inodes=100000   # 10 GiB, 100k inodes
