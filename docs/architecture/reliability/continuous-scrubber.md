@@ -232,10 +232,12 @@ The `Type` determines the severity:
 The anomalies the scrubber auto-remediates are orphan extents and dead extents. Both are the same operation — an extent record nothing can read, and the blocks behind it — so both run through one protocol.
 
 Remediation, in the same pass that detects them:
-1. The finding is logged with `AutoFix: true`, carrying the `disk_off` and `length` decoded from the extent's value.
+1. The finding is logged with `AutoFix: true`, carrying the `disk_off` and `length` decoded from the extent's value, and the revision the record was at when the scan read it.
 2. `arena.Allocator.Owns(disk_off)` is consulted. A range outside every arena this node holds is reported and left alone — see below.
-3. The `extent:<ino>/<chunk>` key is deleted from etcd. This comes before the reclaim: the blocks must stop being reachable through metadata before they can be handed to another allocation, or a reader resolving the extent could land on data that has already been overwritten. A failed delete skips the reclaim, leaving both the key and its blocks for the next pass.
+3. The `extent:<ino>/<chunk>` key is deleted from etcd, in a transaction conditional on the record still being at that revision. This comes before the reclaim: the blocks must stop being reachable through metadata before they can be handed to another allocation, or a reader resolving the extent could land on data that has already been overwritten. A failed delete skips the reclaim, leaving both the key and its blocks for the next pass.
 4. `arena.Allocator.Free(disk_off, length)` returns the blocks to the free-list.
+
+The comparison in step 3 is what makes the pass safe without an inode lock. A scrub pass works from a snapshot taken some time earlier and takes no lock on the inodes it visits, so a truncate or an overwrite can rewrite the record in between — reclaiming the extent itself, and freeing its blocks, which the allocator may then hand to another file. An unconditional delete cannot detect that, because deleting an already-absent key succeeds, and the pass would free the same range a second time, leaving two files owning the same blocks. Losing the comparison costs nothing: if the extent is still unreachable, the next pass finds it again.
 
 Step 2 is the ownership rule, and it is what keeps reclamation from leaking across nodes:
 
