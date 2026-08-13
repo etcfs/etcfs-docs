@@ -98,7 +98,7 @@ The watch-driven invalidation provides **eventual consistency** for the kernel V
 
 - **Directory mutations.** Creates, unlinks, and renames are immediately visible on other nodes after the watch fires — typically within the etcd RTT, not bounded by `entry_timeout`.
 
-- **Attribute changes.** `chmod`, `chown`, `truncate` are reflected after `attr_timeout` or when the inode is explicitly invalidated. For size changes from writes, the attribute cache on other nodes will show the old size until `attr_timeout` expires, but reads from a file opened after the write will see the new data because the extent list is read fresh on open.
+- **Attribute changes.** `chmod`, `chown`, `truncate` are reflected after `attr_timeout` or when the inode is explicitly invalidated. For size changes from writes, the attribute cache on other nodes will show the old size until `attr_timeout` expires, but reads from a file opened after the write will see the new data: a node reads an inode's extent list from etcd unless it holds that inode's lock, and holding the lock is exactly the condition under which no other node can have changed it.
 
 ## Performance Trade-Offs
 

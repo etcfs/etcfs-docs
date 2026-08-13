@@ -189,7 +189,9 @@ The `offset` is the byte position within the file where reading starts. The `siz
 
 ### Processing
 
-The Go backend takes a shared lock on the inode, then reads the inode record and the inode's extent keys (`extent:<ino>/<chunk>`) as one serializable transaction (`Store.GetInodeAndExtents`). Both are needed before the read can be answered — the record to clamp the request to the file's size, the extents to resolve the range — and reading them together costs one round trip instead of two and answers both from a single revision. The read is serializable rather than linearizable because the shared lock, not the read's place in etcd's linear order, is what keeps a concurrent writer off the range.
+The Go backend takes a shared lock on the inode, then asks for the inode record and the inode's extent keys (`extent:<ino>/<chunk>`). Both are needed before the read can be answered — the record to clamp the request to the file's size, the extents to resolve the range.
+
+If this node already held the lock, both come from the snapshot cached under it and the read costs no etcd round trip at all (see [Lock Caching](../metadata/lock-caching.md)). Otherwise they are read as one serializable transaction (`Store.GetInodeAndExtents`): together rather than separately, so it is one round trip and one revision, and serializable rather than linearizable because the shared lock, not the read's place in etcd's linear order, is what keeps a concurrent writer off the range. A read that could not take the lock at all falls back to that same transaction and does not cache what it reads, since nothing would keep it true.
 
 For each extent, the handler parses the value `"logical_off,disk_off,length,generation"`. It finds the first extent that covers the requested offset and reads the data from the block device via `pread()` at the correct disk offset plus the offset within the extent.
 

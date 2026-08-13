@@ -166,12 +166,12 @@ WRITE is called when the kernel has data to write to a file. The Go backend rece
 
 ### Handler Flow
 
-1. Read the inode record from etcd. If the inode does not exist, return `ENOENT`.
+1. Take the inode's exclusive lock, then read the inode record and its extent list — from the snapshot cached under that lock when this node already held it, and from etcd in one transaction otherwise (see [Lock Caching](../metadata/lock-caching.md)). If the inode does not exist, return `ENOENT`.
 2. If no arena is acquired yet, acquire one from the global pool via CAS.
 3. Call `alloc.Allocate(dataLen)` to reserve disk blocks. Returns a list of runs — free space that is merely fragmented is still usable, so one write may be spread over several device ranges.
 4. Write the data bytes to the block device via `pwrite()`, one call per run.
 5. Call `sync_file_range()` on each written range to ensure data durability.
-6. Read the node's current fencing generation from `gen:<node_id>` in etcd.
+6. Stamp the extents with the fencing generation the commit will be guarded against — the node's own, already resolved, rather than a fresh read of `gen:<node_id>`. The two are the same number: a write whose stamp disagreed with its own guard could not commit.
 7. Store one extent entry per run in etcd at `extent:<ino>/<chunk>` with the value `"logical_off,disk_off,length,generation,sequence"`, in logical order. Chunk numbers continue from one past the highest currently in use, and every run of a single write shares one sequence — they are one write, over disjoint logical ranges.
 8. If the write extends beyond the current file size, update the inode size in etcd.
 9. Rewrite every extent this write buries to whatever it still leaves readable (see below).
@@ -206,7 +206,9 @@ A write is never an in-place update. Overwriting a range allocates fresh blocks 
 
 An extent covered entirely is deleted. One covered at its front or its back is trimmed to the single surviving piece under the original key. One covered in the *middle* leaves two pieces: the head keeps the original key and the tail is written under a fresh one, both in the same transaction, so a crash cannot leave the middle described twice.
 
-Each of these rewrites is a blind put of a value derived from the extent list this write read. It therefore carries a comparison that the record is still at the revision it was read at. Without it a stale read could resurrect an extent that was deleted in between — a real possibility, because the write path's extent read is deliberately served by whichever etcd member the node is connected to rather than by the leader. A comparison that fails is not an error: the write re-reads from the leader and proposes again.
+Each of these rewrites is a blind put of a value derived from the extent list this write worked from. It therefore carries a comparison that the record is still at the revision it was read at. Without it a stale view could resurrect an extent that was deleted in between — a real possibility, because that list is either the one cached under the lock or a serializable read served by whichever etcd member the node is connected to, neither of which is the leader's. A comparison that fails is not an error: the write re-reads from the leader and proposes again.
+
+That is also what makes working from the cached list safe rather than merely fast. Nothing in the proposal trusts the list to be current: the new extents are written under `CreateRevision == 0` comparisons, and every rewrite under the revision it was read at. A list that has fallen behind loses a comparison, and the write re-reads linearizably and proposes again. After the commit, the transaction's own operations are replayed over the list they were built from to produce the new cached view — so what the cache holds is derived from the write itself rather than described a second time, and every key the transaction wrote carries its revision for the next write's comparisons.
 
 Every surviving piece keeps its parent's sequence number. That is the reason the sequence lives in the value and not in the key: a piece ranked by its own key would claim to be newer than the extent it was cut from, and would then win over a genuinely newer extent overlapping it — reachable, because extents in another node's arena are never trimmed and so do overlap.
 

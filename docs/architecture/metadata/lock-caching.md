@@ -15,7 +15,7 @@ Implementation: `internal/ipc/lockcache.go`, `internal/ipc/retry.go`
 - [Minimum Hold Time](#minimum-hold-time)
 - [Mode Upgrades](#mode-upgrades)
 - [Cache Bound and Eviction](#cache-bound-and-eviction)
-- [Why There Is Nothing to Invalidate](#why-there-is-nothing-to-invalidate)
+- [What the Lock Makes Cacheable](#what-the-lock-makes-cacheable)
 - [Fencing and Shutdown](#fencing-and-shutdown)
 - [Correctness Invariants](#correctness-invariants)
 
@@ -152,28 +152,55 @@ currently in flight and releases its etcd key. An entry an operation is
 using is skipped, never waited for — a cache full of busy inodes is allowed
 to grow past the target rather than block a request trying to make room.
 
-## Why There Is Nothing to Invalidate
+## What the Lock Makes Cacheable
 
-This is what separates the mechanism from a GFS2 glock, which is two things
-at once: a mutual-exclusion token *and* the coherence token for the page
-cache it protects. That double duty is why demoting a glock obliges the
-holder to flush dirty pages and invalidate clean ones first — the lock is
-what made the cached pages trustworthy, so giving it up means the cache
-under it stops being trustworthy too.
+A held lock is not only a mutual-exclusion token here: while this node holds
+an inode's key, no peer can write that inode, so anything this node has read
+about it stays true. The daemon uses that directly — a `lockEntry` carries the
+inode's record and extent list alongside the lock, and an operation that finds
+them there answers with no etcd round trip at all. A read on a file this node
+already holds is pure device I/O; a write is a single commit, with the extent
+list it needs coming from the entry rather than from a read.
 
-EtcFS's cached lock guards nothing of the kind. The FUSE mount is opened
-with `direct_io = 1` and `keep_cache = 0` (`pkg/fuse/ops.c`), so the kernel
-holds no page-cache pages for a file's data on either the reading or the
-writing node, and the daemon re-reads an inode's extents from etcd on every
-single operation rather than caching them itself. Holding the lock longer
-therefore extends no cached data anywhere, and a recall has nothing to
-invalidate — it only has to wait for whatever operation is using the entry
-to finish, then delete a key.
+This is what a GFS2 glock does, and it brings the same obligation with it: the
+lock is what makes the cached data trustworthy, so giving the lock up means
+giving the data up in the same breath. Three rules discharge it.
 
-Attribute and directory-entry caching are governed separately, by their own
-timeouts and the `dirent:` watch (see
-[Cache Coherence](../consistency/cache-coherence.md)), and were never tied to
-lock acquisition before or after this change.
+**Releasing the key clears what was cached under it.** Every path that gives
+the key back — a recall, an eviction, an upgrade from shared to exclusive,
+shutdown — goes through `releaseKeyLocked`, and that function drops the
+snapshot as it drops the key. A re-acquired key carries a fresh holder token
+and the snapshot is tagged with the token it was read under, so a snapshot
+from before a recall cannot be mistaken for a current one even if it survived.
+
+**A mutation either publishes its outcome or invalidates.** The write path
+knows exactly what its transaction did, so it replays that transaction's own
+operations over the list it was built from and publishes the result — there is
+only one statement of what the write changed, and the cache is derived from it
+rather than described a second time. Every other mutation runs under the same
+exclusive lock and says nothing, and for those the default on release is to
+drop the snapshot. Being wrong in that direction costs one read; being wrong
+in the other serves a file's old extent list after it was rewritten.
+
+**The lock session's liveness bounds all of it.** A cached key is only as good
+as the lease it was written under. If that lease is gone — expired during a
+partition, or revoked — etcd deleted the key with it and a peer may already
+hold the inode, so `ensureLockKey` checks `LockSessionAlive` on every
+operation and drops both the key and the snapshot when it reads false. That
+check is a mutex and a channel poll, no round trip, and it is what bounds how
+long a partitioned node can answer from its own caches: the lock session's
+2-second TTL, not the self-fencing watchdog's much longer window. A node that
+still holds a live session still holds its locks, and a peer that cannot take
+the lock cannot have changed what the snapshot describes — which is why a
+stale read needs the session to be gone, and the session being gone is what
+clears the cache.
+
+The kernel's own caching is unaffected and unchanged: the FUSE mount is opened
+with `direct_io = 1` and `keep_cache = 0` (`pkg/fuse/ops.c`), so no page-cache
+pages are held for file data on either node. Attribute and directory-entry
+caching are governed separately, by their own timeouts and the `dirent:` watch
+(see [Cache Coherence](../consistency/cache-coherence.md)), and were never tied
+to lock acquisition.
 
 ## Fencing and Shutdown
 

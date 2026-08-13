@@ -43,7 +43,7 @@ The `Store` struct wraps an etcd client and a node identifier. Every method dele
 
 Key characteristics of the Store implementation:
 
-- **No caching.** Every `Get`, `GetPrefix`, and `Txn` call hits etcd directly. Caching is the responsibility of higher layers (the inode cache, the dentry cache in the FUSE daemon, the kernel VFS cache). The store is the single source of truth.
+- **No caching in the store.** Every `Get`, `GetPrefix`, and `Txn` call hits etcd directly. Caching is the responsibility of higher layers — the snapshot the IPC service keeps under a held inode lock (see [Lock Caching](lock-caching.md)), the dentry cache in the FUSE daemon, the kernel VFS cache — each of which owns the argument for why what it holds is still true. The store is the single source of truth.
 
 - **Serializable vs linearizable reads.** Reads are linearizable by default, which costs a leader round trip. A read asks for serializable consistency only where something else already establishes the ordering it needs: the data path's extent reads are covered by the inode lock, and the write path's proposal is re-checked by the comparison it commits under. Domain operations that depend on the read itself being ordered (lock acquisition, generation checks) stay linearizable.
 
