@@ -371,6 +371,22 @@ So durability policy is decided per write from `fi->flags` rather than per
 inode at open. It is also the more correct reading of POSIX: the flag belongs
 to the descriptor, and a file can be open twice with different ones.
 
-Not established: whether the asynchronous direct-IO path (`fuse_direct_IO` →
-`fuse_async_req_send`, used by AIO and io_uring) carries the same flags. Until
-measured, the guarantee should be claimed only for synchronous writes.
+The asynchronous direct-IO path (`fuse_direct_IO` → `fuse_async_req_send`, used
+by AIO and io_uring) carries the same flags. Measured rather than reasoned
+about, against a real mount on Linux 6.11, by logging the flags the daemon
+received for one 4 KiB write per case:
+
+| open flags | submission | flags the daemon received | `O_DSYNC` bit |
+|---|---|---|---|
+| none | `pwrite` | `32770` | clear |
+| `O_DSYNC` | `pwrite` | `36866` | set |
+| `O_SYNC` | `pwrite` | `1085442` | set |
+| none | `io_uring` | `32770` | clear |
+| `O_DSYNC` | `io_uring` | `36866` | set |
+| `O_DIRECT｜O_DSYNC` | `io_uring` | `53250` | set |
+
+The last row is the asynchronous direct-IO path specifically, and it carries
+both bits. So the guarantee holds for every submission path, not only for
+synchronous writes, and a database issuing `O_DSYNC` writes through io_uring is
+not silently given deferred ones. `O_SYNC` shows up as a superset of `O_DSYNC`,
+which is why one test of that single bit covers both.

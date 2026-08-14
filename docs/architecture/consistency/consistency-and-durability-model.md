@@ -289,9 +289,10 @@ legal on its own. What the durability *surface* has to keep promising:
    synchronous open produces no `FUSE_FSYNC` at all and waiting for one would
    wait forever. The flags arrive on every write instead — `fuse_send_write`
    sets `inarg->flags = fuse_write_flags(iocb)`, and libfuse surfaces it as
-   `fi->flags`. Confirmed for synchronous writes; the asynchronous direct-IO
-   path (AIO, io_uring) has not been checked, so the guarantee is claimed for
-   synchronous writes only.
+   `fi->flags`. Measured on a real mount for every submission path, including
+   the asynchronous direct-IO one that AIO and io_uring use — see
+   [Design Decisions](../../design-decisions.md#osync-and-odsync-are-read-from-each-write-not-latched-at-open)
+   for the numbers — so the guarantee is not limited to synchronous writes.
 4. **Buffered-IO mode flushes the device too.** Without `O_DIRECT` the bytes are
    in this node's page cache rather than on the volume, so `fsync` flushes the
    device as well as publishing the extent.
