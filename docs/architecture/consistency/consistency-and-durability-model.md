@@ -295,6 +295,11 @@ legal on its own. What the durability *surface* has to keep promising:
 4. **Buffered-IO mode flushes the device too.** Without `O_DIRECT` the bytes are
    in this node's page cache rather than on the volume, so `fsync` flushes the
    device as well as publishing the extent.
+5. **A write that drops the file's set-user-ID bits is never deferred.**
+   Deferring the bytes trades durability; deferring that trades privilege. A
+   peer reading the inode during the flush interval would be told the file is
+   still setuid, so a write that changes the mode commits before it is
+   acknowledged, exactly as every write did before.
 
 ### What makes it safe
 
