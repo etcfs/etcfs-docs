@@ -14,6 +14,7 @@ The distributed component that watches cluster membership, detects node failures
 - [Integration with Lock Reclamation](#integration-with-lock-reclamation)
 - [Integration with Arena Reclamation](#integration-with-arena-reclamation)
 - [Integration with the Self-Fencing Watchdog](#integration-with-the-self-fencing-watchdog)
+- [Recovering a Fenced Node](#recovering-a-fenced-node)
 
 ## Design Rationale
 
@@ -244,3 +245,55 @@ The self-fencing watchdog and the external fencing controller operate independen
 | Split-brain (node can write but not reach etcd) | Fires | Fires | Self-fence closes block FD; controller bumps gen; double protection |
 
 The self-fencing watchdog is always faster (10 seconds for 5s TTL), making it the primary mechanism. The external controller is the backup that ensures the fence is recorded even if the watchdog fails.
+
+## Recovering a Fenced Node
+
+A fence is deliberately not self-reversing. The detach (or NVMe preempt) that
+severs a node's device access is never undone by the controller, and nothing in
+the daemon re-attaches on startup. That is not an omission: a fence that undid
+itself the moment the fenced node came back would not be a fence, and the whole
+ordering argument above — sever, confirm, bump, only then release the arena —
+depends on the severance outlasting the node's own opinion of whether it is
+healthy.
+
+**The supported recovery is to replace the instance, not to resurrect it.** A
+replacement gets a fresh instance ID, attaches the shared volume itself (in
+user-data for an autoscaling group, or via `add-compute-node.sh`), registers
+new membership, and starts at the current generation. Every automated path in
+the repository does it this way: `add-compute-node.sh`, the chaos suite's
+node-replacement helpers, and the autoscaling user-data described in
+[Autoscaling](../../deployment/autoscaling.md).
+
+Restarting the daemon in place on a fenced instance does not work and should not
+be expected to. The volume is gone from that instance, so the daemon fails at
+startup with `open /dev/nvme1n1: no such file or directory` — which names the
+symptom rather than the cause. If a node reports that after having been up, the
+first thing to check is whether it was fenced:
+
+```
+aws ec2 describe-volumes --volume-ids <vol> \
+    --query 'Volumes[0].Attachments[].InstanceId'
+```
+
+`bootstrap-cluster.sh` is the one exception, and it re-attaches on purpose. It
+rebuilds a cluster from scratch — killing every daemon and wiping every etcd
+member — so by the time it runs there is no fenced node left running for the
+severance to protect the volume from, and the operator invoking it has already
+decided the previous incarnation is gone.
+
+### Why this shows up during benchmarking
+
+Anything that kills daemons and restarts them — a re-deploy loop, a benchmark
+sweep across builds — expires membership leases and is therefore indistinguishable
+from a cluster of dying nodes. The survivors fence correctly, and the volume ends
+up detached from whichever nodes were killed. This is the system working, but it
+makes a re-deploy loop progressively strip the cluster of its data volume.
+
+The failure is worse than it looks, because an EtcFS mount that does not come up
+leaves `/mnt/etcfuse` as an ordinary directory on the instance's root volume, and
+a benchmark pointed at it measures *that* volume. A root `gp3` outruns a modestly
+provisioned `io2` data volume, so the broken run reports numbers far above the
+device ceiling instead of failing. `benchmark.sh` and `benchmark-etcfs.sh` both
+check `mountpoint` before measuring for this reason. Any EtcFS figure above the
+data volume's provisioned IOPS on an `O_DIRECT` job should be treated as a
+misconfigured run until the mount and the attachments are confirmed.

@@ -38,7 +38,8 @@ renaming one is a breaking change; `test/harness/metrics_test.go` pins the list.
 | `etcfuse_pending_extents` | Gauge | — | Metadata keys written by acknowledged writes and not yet published to etcd |
 | `etcfuse_pending_bytes` | Gauge | — | Acknowledged write payload those keys stand for |
 | `etcfuse_metadata_flush_total` | Counter | `trigger` | Publications of deferred metadata (`interval`, `buffer_full`, `sync_write`, `operation`, `recall`, `eviction`, `shutdown`) |
-| `etcfuse_metadata_flush_failures_total` | Counter | `reason` | Flushes that did not publish (`error`, `rejected`, `fenced`) |
+| `etcfuse_metadata_flush_failures_total` | Counter | `reason` | Flushes that did not publish (`error`, `rejected`, `fenced`, `device`) |
+| `etcfuse_flush_coalesced_runs` | Histogram | — | Buffered write runs merged into a single device write at flush. A median of 1 means the merge is firing on nothing, so buffering that data is buying no reduction in device operations |
 | `etcfuse_metadata_flush_duration_seconds` | Histogram | — | Latency of publishing deferred metadata |
 | `etcfuse_block_io_total` | Counter | `op` | Block device operations (`read`, `write`) |
 | `etcfuse_block_io_bytes_total` | Counter | `op` | Bytes transferred to and from the device |

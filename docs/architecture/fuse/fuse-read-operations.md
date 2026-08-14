@@ -213,7 +213,7 @@ If the requested offset is beyond the file's last extent, the handler returns `d
 
 ## OPEN and OPENDIR
 
-OPEN and OPENDIR are called when a file or directory is opened. Both are acknowledged immediately with `fi->fh = 0`, `fi->direct_io = 1`, and `fi->keep_cache = 0`. The `direct_io = 1` flag tells the kernel to bypass its page cache for file data, sending all reads and writes directly to the FUSE daemon.
+OPEN and OPENDIR are called when a file or directory is opened. OPENDIR is answered locally with a fresh file handle. OPEN goes to the backend — `O_TRUNC` has to empty the file, and the descriptor is counted there so unlinking a file's last name can keep its record alive until the last close — and the reply carries the caching decision. The backend sets it, because only the backend knows whether it can take the pages back again: `fi->keep_cache = 1` and `fi->direct_io = 0` for a file this node holds a lock on, with the pages invalidated before that lock is yielded; otherwise `fi->direct_io = 1` and `fi->keep_cache = 0`, which sends every read and write straight to the daemon. See [FUSE Cache Management](fuse-cache-management.md#data-page-cache).
 
 ## Cache Timeouts
 

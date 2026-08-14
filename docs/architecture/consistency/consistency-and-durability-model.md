@@ -183,8 +183,13 @@ self-fence drops every cached lock ahead of the rest of shutdown.
 
 ## Blast Radius of a Stale Read
 
-Because no data is cached, every possible stale read is caused by stale
-metadata. The consequences split in two:
+Data is cached now — a kernel page for a held inode, and this node's own
+unflushed write payload — but neither widens this section, because both are
+tied to the lock and released with it. A stale *page* is bounded by the same
+window as a stale snapshot and carries the same consequence; the write buffer
+is this node's own writes, which cannot be stale to the node that made them.
+So every possible stale read still traces back to stale metadata, and the
+consequences split in two:
 
 **A mapping that is old but still points at this file's own blocks.** The read
 returns a previous version of the file's bytes, or the wrong length because
@@ -427,11 +432,13 @@ Its strong model is delegations: the server grants one, the client caches, and
 lock cache here, with etcd and want-keys standing in for the server and its
 callback channel.
 
-One asymmetry worth keeping straight: NFS caches in the kernel because a
-server can validate or recall; EtcFS does not cache data in the kernel because
-nothing could invalidate it — not because the hardware forbids it. The lock is
-that missing protocol, which is why data caching is a planned option rather
-than a closed door.
+One asymmetry worth keeping straight: NFS caches in the kernel because a server
+can validate or recall. EtcFS long did not, because nothing could invalidate a
+cached page — not because the hardware forbids it. The lock turned out to be
+that missing protocol, and the recall path is the callback channel, so kernel
+page caching is now enabled for a held inode and invalidated before the lock is
+yielded. The difference that remains is who initiates: NFS's server can call
+back unprompted, while a peer here has to ask by writing a want-key.
 
 NFS's throughput above its backing store comes from RAM in three forms:
 client page cache on reads, server page cache, and asynchronous writes that
