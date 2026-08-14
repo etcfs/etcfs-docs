@@ -355,7 +355,7 @@ legal on its own. What the durability *surface* has to keep promising:
    sets `inarg->flags = fuse_write_flags(iocb)`, and libfuse surfaces it as
    `fi->flags`. Measured on a real mount for every submission path, including
    the asynchronous direct-IO one that AIO and io_uring use — see
-   [Design Decisions](../../design-decisions.md#osync-and-odsync-are-read-from-each-write-not-latched-at-open)
+   [Design Decisions](../../design-decisions.md#o_sync-and-o_dsync-are-read-from-each-write-not-latched-at-open)
    for the numbers — so the guarantee is not limited to synchronous writes.
 4. **`fsync` publishes both halves, in order.** It puts the buffered payload on
    the device and then commits the extents naming it, and returns only once

@@ -22,6 +22,40 @@ histories actually recorded, and only against the model it is given. TLA+
 checks all interleavings of a model, but of a model — the gap between the
 specification and `pkg/fencing` is closed by review, not by tooling.
 
+## The invariants
+
+Caching an inode's lock, its metadata, its pages and its unpublished writes
+moved a great deal of correctness out of individual transactions and into
+obligations spread across several files. These are those obligations, stated
+once, with where each is enforced and what would catch it being broken. Every
+row is checked by something that can fail a build; a row whose only column is
+an argument does not belong here.
+
+| # | Invariant | Enforced in | Caught by |
+|---|---|---|---|
+| 1 | No two nodes hold conflicting locks on one inode, and no lock decision is made from a read — only from a transaction, or from a cached key whose lease identity still matches the session's | `internal/ipc/retry.go` (`ensureLockKey`, `acquireLockKey`) | `lock` and `lockkey` models; `CachedLock.tla` `NoTwoHolders`, whose `CachedLockNoLeaseIdentity` variant is precisely the lease-liveness mistake |
+| 2 | No node publishes an extent for an inode it does not hold the lock for, and no flush commits after the lock key is gone | `internal/ipc/delegate.go` (`flushLocked`, comparing the exact holder token) | `CachedLock.tla` `NoPublishWithoutLock` / `CachedLockNoFlushKeyCheck` |
+| 3 | Every block referenced by a live extent is owned by exactly one inode; no block is freed while an extent references it, and no block is freed twice | `pkg/arena` and the single release path `internal/ipc.freeBlocks`; the scrubber's orphan pass | `block` model; `fsck` |
+| 4 | A read never returns bytes from a block that was reallocated after the extent naming it was resolved | `internal/ipc/datapath.go` (`reclaimCovered`: metadata rewritten before the free) | `block` model (the reuse is visible as the double free that would allow it); `extent` model; `integrity-fuzz.sh` |
+| 5 | A fenced node never publishes anything | `internal/ipc/retry.go` (`commitGuarded`, the generation guard) | `generation` model; `Fencing.tla` `StaleWriteRejected` |
+| 6 | Data acknowledged to `fsync` is in etcd; data not acknowledged may vanish but never appears half-published | `internal/ipc/delegate.go` (`handleFsync`, and a failed flush keeping the buffer and failing every later `fsync`) | `extent` model's fsync barrier; `CachedLock.tla` `NoLostAckedWrite` |
+| 7 | No cached copy of an inode — metadata snapshot, kernel page, or buffered write — survives the yielding of that inode's lock | `internal/ipc/lockcache.go` (`releaseKeyLocked`, the one place the obligation is discharged) | `pagecache` check; `CachedLock.tla` `NoStalePages` and `ViewMatchesTruth`, with a broken variant per cache |
+| 8 | No extent is published before the bytes it names are on the volume | `internal/ipc/delegate.go` (`flushLocked`: `flushData` before the transaction) | `extent` model; `integrity-fuzz.sh` |
+
+Invariant 4 is the one with the weakest independent check: the block model sees
+the *conditions* for a stale resolution rather than the stale read itself,
+because a history records what a read returned and not which extent record it
+came from. Closing that would mean recording the resolution, and it has not
+been done.
+
+What no column names is a cluster under load: the models check recorded
+histories and a specification, and neither will exercise two nodes contending
+for one inode, a node killed with a full write buffer, or a recall storm unless
+a chaos scenario produces one. Those scenarios are the outstanding half of this
+work: the chaos suite's scenarios (`scripts/test/chaos-*.sh`) still predate the
+caching, and the contended, killed-mid-buffer and recall-storm cases are not
+among them.
+
 ## Consistency models, and why one checker is not enough
 
 EtcFS does not offer one uniform guarantee, and pretending otherwise would

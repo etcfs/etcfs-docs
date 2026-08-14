@@ -124,6 +124,60 @@ write path's internal serializable pre-read is retried linearizably on a
 stale answer before it commits, so nothing about it is externally visible.
 `verify.AllLinearizable` is the classifier for this model.
 
+Deferring writes changed what a write means here, and the model changed with
+it. A write is now acknowledged out of the node's own RAM: its bytes are on no
+device and in no etcd record until a flush publishes them, and a node that dies
+before that flush takes them with it. So each byte position carries not only a
+value but who still holds it unpublished, and three rules replace the single
+register:
+
+- a read never contradicts a write that was fsynced, from any node;
+- a read never contradicts a write from its own node, flushed or not, because
+  that node serves its own buffer;
+- a write that was never fsynced may vanish — but only for a node the caller
+  names as crashed (`--crashed`), and never for the node that wrote it, and
+  never once some read has already returned those bytes.
+
+That last relaxation is deliberately not automatic. A checker that let any
+unflushed write vanish would accept a history where the data simply
+disappeared under a healthy cluster, which is the failure this model exists to
+catch; a run that killed nothing is checked against the strict property. FSYNC
+and FLUSH are decoded as the barrier that makes the distinction, and a failed
+one is not a barrier at all.
+
+**Block** (`blocks.go`) — a two-state machine per 4 KiB block, free or
+reserved, built from reservation and release events the daemon records
+directly (`internal/ipc/histevents.go`). Reserving a range that is not wholly
+free is one violation; releasing a range that this history has already seen
+released is the other. Neither is visible in a WRITE/READ history, where a
+block handed to two inodes looks exactly like a lost write, which is why the
+events exist.
+
+A block *absent* from the model is not the same as a free one: an allocator is
+rebuilt from the extent records when a node restarts, so a node comes back
+holding blocks it never reserved inside the recorded window, and freeing one of
+those is ordinary rather than a double free. What is deliberately not a third
+state is publication — whether a *published* extent's blocks were freed
+underneath it is `fsck`'s question, since answering it needs the whole extent
+list rather than a history.
+
+**Page cache** (`pagecache.go`) — the one check here that is not a Porcupine
+model, because it is not a linearizability question: it is an ordering
+obligation between two events of a single node, and phrasing it as a model
+would hide a simple scan behind a solver. The property is that no node keeps
+the kernel's data pages for an inode once it has yielded that inode's lock key,
+and it is checkable only because the invalidation is recorded — a stale page is
+invisible in a read history, since it looks exactly like a read that was served
+correctly a moment earlier.
+
+Every yielded key must have an invalidation of its own inode, on the same node,
+that finished before the release began and after the previous release ended:
+the acknowledgement is what stops the peer from taking the inode while the pages
+are still there, and an invalidation that ended the *previous* hold says nothing
+about pages cached under this one. A FUSE session that has gone away counts as
+discharged — its page cache died with it — and that outcome is recorded as such
+rather than inferred.
+
 **Lock** (`lock.go`) — not phrased as a linearizability question at all: a
 lock has no value for a read to disagree about, so an ordinary
 register-linearizability check would accept any interleaving of acquires and
@@ -131,6 +185,15 @@ releases. What actually matters is mutual exclusion, checked as a state
 machine (`0` free, `-1` exclusive, `n` shared holders) over acquire/release
 events. Two exclusive holders, or a shared holder admitted during an exclusive
 hold, are both explicit invalid transitions.
+
+Two streams of events are recorded, not one. The per-operation stream spans
+the operation that took the lock; the key stream (`lockkey`) spans the *cached*
+hold of the etcd key itself, which is taken before that operation and kept
+afterwards against the next one. A subset of the true hold is the safe
+direction to be wrong in for a mutual-exclusion checker — it can only ever
+report overlaps that really happened — but it is blind to a key held past the
+operation that took it, which is exactly what caching the lock introduced. The
+same model runs over both.
 
 Each event is checked over the interval its own etcd transaction spanned, not
 as a point — the transaction commits at a single revision, but nothing in the
@@ -201,6 +264,18 @@ gap it must not mistake for one:
 - **Generation**: a commit succeeding after a fence is rejected even when its
   interval is unambiguous; overlapping healthy commits, and a legitimate
   restart-after-fence, are accepted.
+- **Deferred writes**: a write that vanished under a healthy cluster, one that
+  vanished after a successful fsync, a node failing to read back its own
+  buffer, and bytes disappearing after a reader had already returned them are
+  all rejected; a write lost with the node that was killed holding it, and one
+  lost after an fsync that returned `EIO`, are accepted.
+- **Block**: a block reserved by two nodes at once, an overlapping run, and a
+  range released twice are rejected; reuse after a release, a release of a
+  block reserved before the history began, and independent arenas are accepted.
+- **Page cache**: a key yielded with no invalidation, one whose invalidation
+  had not finished before the release, one that reuses the previous hold's
+  invalidation, and one after a failed invalidation are all reported; a lost
+  FUSE session, and a daemon that caches no pages at all, are not.
 - **Readdir**: a page is never treated as a complete listing; a dropped entry,
   a resurrected unlinked name, a wrong inode and an empty listing over a live
   name are all rejected.
@@ -233,6 +308,13 @@ system:
 - **Clock skew larger than an operation's own duration** degrades precision
   for the lock and generation models, though never correctness — an
   unorderable pair is simply treated as concurrent.
+- **Which extent record a read resolved through** is not recorded, so a read
+  served from a block that was reallocated after the resolution is caught only
+  through the conditions that would allow it (the block model) and not
+  directly.
+- **Publication is not a state of the block model.** Whether a live extent's
+  blocks were freed underneath it needs the whole extent list, which is
+  `fsck`'s job and not a history's.
 
 ## Results
 
@@ -249,9 +331,16 @@ checked against a real fence, not only the synthetic ones in its unit tests.
 End-to-end wiring is also checked against the compiled binaries directly, not
 only the Go test suite: `etcfuse-meta --history-log`, mounted through the real
 C daemon, exercised from a shell — the recorded history checks clean against
-all four models via `cmd/verify-history`.
+every model via `cmd/verify-history`.
+
+The models the caching work added — the fsync barrier and loss rules in the
+extent model, and the `lockkey`, `block` and `pagecache` checks — are so far
+checked by their own unit tests and by `cmd/verify-history` over recorded
+histories, not yet by a chaos run that contends two nodes on one inode or kills
+a node with a full write buffer. That run is what would exercise them properly,
+and it does not exist yet.
 
 ## Next
 
 A CI job running a short recorded history on every change, so a regression
-that breaks linearizability of any of the four models fails the build.
+that breaks linearizability of any model fails the build.

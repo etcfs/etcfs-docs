@@ -1,4 +1,4 @@
-# TLA+: the fencing protocol
+# TLA+: the fencing protocol and the cached lock
 
 Fencing is the part of EtcFS where a bug is silent, rare, and destroys data:
 two nodes writing to the same arena at the same time corrupts a filesystem in
@@ -13,7 +13,11 @@ The subject is the *protocol* described in
 — not the implementation. The gap between the spec and `pkg/fencing` is closed
 by review; the spec is the design's argument, not a proof about the Go code.
 
-The spec is `specs/Fencing.tla`. Run it with:
+Two specifications, one per layer of exclusion. `specs/Fencing.tla` is the
+fencing protocol, described below. `specs/CachedLock.tla` is the layer above
+it — the per-inode lock key, kept across operations rather than taken and
+released per operation, and the three caches that live under it — described in
+[The cached lock](#the-cached-lock). Run both with:
 
 ```bash
 make test-tla          # 2-node models, ~30s
@@ -160,6 +164,68 @@ symmetry reduction is unsound for some temporal properties.
 
 `.github/workflows/ci.yml`'s `test-tla` job runs the 2-node models on every
 push and pull request.
+
+## The cached lock
+
+Caching an inode's lock made three things possible that a per-operation lock
+did not: serving an inode's metadata from a snapshot, letting the kernel cache
+its data pages, and acknowledging writes out of RAM before publishing them.
+All three rest on one sentence — a node holding the key excludes every peer
+from that inode, so nothing it has cached can go stale underneath it — and the
+spec exists to check the obligations that sentence creates when it stops being
+true.
+
+Modelled: acquiring the key and the snapshot read under it; a write
+acknowledged into the buffer; a read the kernel may cache; the flush and its
+comparison on the node's own key; the recall, in the order the release runs
+in (publish, invalidate the kernel's pages, delete the key); the lock session
+expiring, which deletes the key in etcd while the node goes on believing it
+holds it; and the node noticing, on its next operation, that the key it cached
+was written under a session it no longer has.
+
+The properties:
+
+- `NoTwoHolders` — at most one node passes the test it *itself* applies before
+  operating on the inode. That test is the interesting part: not "is my
+  session alive" but "is the key I cached still written under the session I
+  have now". A dead session is replaced lazily by the next acquisition on any
+  inode, so liveness goes true again while this key — written under the
+  previous lease and deleted with it — is already gone.
+- `NoPublishWithoutLock` — nothing is published by a node that does not hold
+  the key, whether it never had it or lost it mid-buffer.
+- `NoLostAckedWrite` — a recall may not drop writes this node has already
+  acknowledged. A crash may lose them; a peer asking for the inode may not,
+  and the flush before the yield is what separates the two.
+- `NoStalePages` — no kernel page survives a key the node knows it gave up.
+- `ViewMatchesTruth` — what a node believes the inode is equals what etcd
+  records, plus whatever that same node has buffered. This is the property the
+  metadata cache and both data caches all rest on, and no other spec names it.
+
+Each broken variant takes exactly one guard away:
+
+| Configuration | What it takes away | Expected |
+|---|---|---|
+| `CachedLock` | nothing | no counterexample, 3,900 states |
+| `CachedLockNoLeaseIdentity` | the cached key is trusted while *any* session is alive | breaks `NoTwoHolders` |
+| `CachedLockNoFlushKeyCheck` | the flush's comparison on this node's own lock key | breaks `NoPublishWithoutLock` |
+| `CachedLockNoRecallFlush` | the flush a recall does before yielding | breaks `NoLostAckedWrite` |
+| `CachedLockNoInvalidate` | the kernel page invalidation before yielding | breaks `NoStalePages` |
+| `CachedLockStaleSnapshot` | dropping the metadata snapshot with the key | breaks `ViewMatchesTruth` |
+| `CachedLockKeepsCacheOnKeyLoss` | dropping every cache when the key is found gone | breaks `NoStalePages` |
+
+`NoStalePages` is stated against the node's own belief rather than against the
+holder test, and deliberately: between a session expiring in etcd and the node
+observing it, the node still thinks it holds the inode and its pages are still
+there. That window is real, bounded by the lock session's TTL, and the same
+window the metadata snapshot has.
+
+Not modelled, beyond what the fencing spec already leaves out: the want-key and
+the minimum hold time, which only ever *delay* a recall, so omitting them
+admits every behaviour they would have allowed and more; the crash case, where
+unflushed writes are legitimately lost, which belongs to
+[Porcupine](porcupine.md)'s extent model because it can see which node died and
+which writes were fsynced; and a second inode, since every action and every
+invariant is about one inode and nothing relates one to another.
 
 ## Next
 
