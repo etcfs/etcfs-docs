@@ -189,6 +189,61 @@ which also covers EFS provisioned-throughput mode (the fixed-budget analogue
 of `io2`'s `--iops`, since bursting mode has no such stated ceiling) and
 multi-node contention on a single shared file.
 
+## At the device ceiling: cached metadata and deferred publication
+
+A further re-run (`benchmark-etcfs.sh`, 60 s per job, same 3-node shape,
+1000-IOPS io2, `t3.medium`) after caching the inode's record and extent list
+under the held lock, and deferring extent publication while that lock is held:
+
+| Target | randwrite-4k IOPS | randwrite-4k p99 (ms) | randread-4k IOPS | randread-4k p99 (ms) | seqwrite-128k MiB/s |
+|---|---|---|---|---|---|
+| raw (1000-IOPS io2) | 1033 | 219 | 1006 | 219 | 252 |
+| EtcFS, metadata cached | 316 | 72 | 1008 | 11 | 52 |
+| EtcFS, publication deferred | **996** | 15 | 1004 | 11 | 36 |
+
+Reads reached the device ceiling with the metadata cache alone: a read under a
+lock this node already holds is one device I/O and nothing else. Writes did
+*not* move at that point, and the reason is worth recording, because the
+obvious conclusion was wrong. Deferral was working — 5.5 writes per etcd
+commit, zero flush failures — but the daemon was pinned at 150% CPU on a
+2-vCPU instance while etcd sat at 6%.
+
+The cost was in maintaining the cached extent list. Each write rebuilt it by
+re-encoding every existing extent into a map and decoding the whole thing back,
+which is work proportional to the *file*, on every write. Against an 8 MiB file
+under random overwrite that is ~2000 extents encoded, decoded and sorted per
+4 KiB write. It had always been there; each write also paying a Raft commit is
+what hid it. Applying the transaction's own operations to the list instead —
+the transaction is a handful of operations, the list is thousands — took the
+daemon to 19% CPU and the writes to the ceiling.
+
+The general lesson: removing the dominant cost promotes whatever was second,
+and the second one here was not on anybody's list. Measure again after every
+removal rather than reasoning forward from the accounting.
+
+### seqwrite is order-dependent and not comparable across runs
+
+The 128k sequential figure fell (52 → 36 MiB/s) while everything else improved.
+It is not a regression in the write path. `benchmark-etcfs.sh` runs the
+sequential job *after* the random-overwrite job, and the random phase now
+completes three times as much work in its 60 s, so it leaves the arena three
+times as fragmented. A 128k allocation then comes back as several runs instead
+of one, and each write publishes several extents rather than one.
+
+Measured directly on the same cluster: a 64 MiB sequential write on a clean
+arena ran at 84 MiB/s and produced exactly 512 extents for 512 writes; the same
+job after 30 s of random overwrite ran at 70 MiB/s and produced 657 — 28% more
+extents for the same bytes. The benchmark's own number is lower again because
+its sequential target is a single 8 MiB file rewritten in a loop, so every
+write also buries the one before it.
+
+Two consequences. The sequential row cannot be compared across runs whose
+random-write rate differs, which now includes every row above. And coalescing
+adjacent writes into larger device I/Os at flush time — already the one part of
+data buffering that would raise the *sustained* rate rather than the peak — is
+what would actually close this, by not letting a fragmented arena turn one
+logical write into several extents.
+
 ## Cost-per-IOPS
 
 Not computed here — it needs the FSx number to make the real comparison:
