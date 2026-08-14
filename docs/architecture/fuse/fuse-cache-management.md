@@ -54,6 +54,8 @@ The daemon decides rather than the C side because only the daemon knows whether 
 
 What makes the cached pages sound is the inode lock. While this node holds a lock on an inode, no peer can write it, so a page read under that lock cannot go stale underneath. **Before the lock key is yielded — recall, eviction, an upgrade from shared to exclusive, shutdown — the daemon issues `FUSE_NOTIFY_INVAL_INODE` for that inode and waits for the C side to confirm it, and a failure aborts the release.** Making the peer wait is the safe direction to fail in: a page cache has no timeout, so a page that outlived its lock would hide the next holder's writes indefinitely.
 
+A client that has gone away is the one failure that does not stop the release. The client *is* the FUSE session, so its pages died with it and there is nothing left to invalidate; refusing to yield would leave every inode the node had cached locked against the cluster until the process exited — an outage in exchange for invalidating a cache that no longer exists. A client that is still connected and reports the invalidation failed is a genuine failure, and that one does stop the release.
+
 The invalidation is carried out on the notification thread and must stay there. Calling `fuse_lowlevel_notify_inval_inode` from a request thread can deadlock against the kernel's own writeback of the inode being invalidated.
 
 Writes stay write-through: `FUSE_WRITEBACK_CACHE` is not negotiated, so every `write()` still reaches the daemon and the kernel caches only what it has read. The kernel's writeback cache changes the shape of every write request and is a separate matter.
