@@ -150,6 +150,8 @@ The sync is called as part of the data-then-metadata ordering protocol:
 
 The fsync guarantees that the data is durable on the block device before the metadata is committed to etcd. If the node crashes in between, the bytes are orphaned — on disk, referenced by nothing — and the blocks behind them come back when arena reconstruction rebuilds the bitmap from the committed extents at the next startup.
 
+Step 3 is deferred while this node holds the inode's exclusive lock: the extent is buffered and published in batches, so the window in which bytes sit on the device unreferenced is the flush interval rather than a single transaction. The ordering is unchanged and is what makes the deferral safe — the bytes are always on the volume before anything names them, and the same reconstruction recovers whatever was never published. See [Consistency and Durability](../consistency/consistency-and-durability-model.md#durability-under-write-delegation).
+
 ## io_uring (Planned)
 
 The current implementation uses a synchronous `pread`/`pwrite` interface. A planned io_uring integration will replace it for:

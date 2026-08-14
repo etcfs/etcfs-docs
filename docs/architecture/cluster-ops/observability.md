@@ -34,6 +34,12 @@ renaming one is a breaking change; `test/harness/metrics_test.go` pins the list.
 | `etcfuse_fuse_op_duration_seconds` | Histogram | `op` | End-to-end handler latency |
 | `etcfuse_etcd_txn_total` | Counter | `outcome` | etcd transactions, by outcome (`committed`, `rejected`, `error`) |
 | `etcfuse_etcd_txn_duration_seconds` | Histogram | — | etcd transaction round-trip latency |
+| `etcfuse_metadata_cache_total` | Counter | `result` | Data-path metadata lookups, by whether the lock-held snapshot answered them (`hit`, `miss`) |
+| `etcfuse_pending_extents` | Gauge | — | Metadata keys written by acknowledged writes and not yet published to etcd |
+| `etcfuse_pending_bytes` | Gauge | — | Acknowledged write payload those keys stand for |
+| `etcfuse_metadata_flush_total` | Counter | `trigger` | Publications of deferred metadata (`interval`, `buffer_full`, `sync_write`, `operation`, `recall`, `eviction`, `shutdown`) |
+| `etcfuse_metadata_flush_failures_total` | Counter | `reason` | Flushes that did not publish (`error`, `rejected`, `fenced`) |
+| `etcfuse_metadata_flush_duration_seconds` | Histogram | — | Latency of publishing deferred metadata |
 | `etcfuse_block_io_total` | Counter | `op` | Block device operations (`read`, `write`) |
 | `etcfuse_block_io_bytes_total` | Counter | `op` | Bytes transferred to and from the device |
 | `etcfuse_scrub_anomalies_total` | Counter | `type` | Anomalies found by the scrubber |
@@ -68,6 +74,12 @@ That detail stays in the daemon's logs and in `fsck` output.
 - `rate(etcfuse_scrub_anomalies_total{type!~"orphan|dead"}[5m]) > 0` — orphan
   and dead findings are routine and auto-remediated; the rest need a human.
 - `changes(etcfuse_fencing_generation[10m]) > 0` — this node was fenced.
+- `increase(etcfuse_metadata_flush_failures_total[5m]) > 0` — acknowledged
+  writes are not reaching etcd. `error` means they are still buffered and every
+  `fsync` on those inodes is returning `EIO`; `rejected` and `fenced` mean they
+  were discarded, which is data loss and is logged as such.
+- `etcfuse_pending_bytes` well above what the flush interval should allow — the
+  flusher has stalled, and that figure is what a crash would lose right now.
 - `increase(etcfuse_fenced_nodes_total{outcome="failed"}[10m]) > 0` — a fence
   was attempted and could not be confirmed, which leaves the target in the
   limbo state described in the external fencing controller page.

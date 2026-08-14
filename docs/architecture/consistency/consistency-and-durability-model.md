@@ -18,7 +18,7 @@ not built and must not be relied on.
 - [Blast Radius of a Stale Read](#blast-radius-of-a-stale-read)
 - [Lock Acquisition and Staleness](#lock-acquisition-and-staleness)
 - [Durability Today](#durability-today)
-- [Durability Under Write Delegation (planned)](#durability-under-write-delegation-planned)
+- [Durability Under Write Delegation](#durability-under-write-delegation)
 - [Why Caching Is the Only Way Past the Device Ceiling](#why-caching-is-the-only-way-past-the-device-ceiling)
 - [Comparison with NFS](#comparison-with-nfs)
 - [Summary Table](#summary-table)
@@ -31,6 +31,7 @@ cache in the system is private RAM belonging to one node.
 | Copy | Where it lives | Shared between nodes |
 |---|---|---|
 | `lockEntry.meta` — inode record + extent list | the daemon's Go heap | no |
+| `lockEntry.pending` — extents written and not yet published | the daemon's Go heap | no |
 | kernel dentry and attribute caches | that node's kernel | no |
 | kernel page cache for file data | that node's kernel | **disabled** (`direct_io = 1`, `keep_cache = 0`) |
 | the daemon's own page cache for the device | that node's kernel | **bypassed** (`O_DIRECT`) |
@@ -117,10 +118,12 @@ write after it is impossible while this node holds the lock.
 **What is not covered:**
 
 - **Attributes and directory entries.** `getattr`, `lookup`, `readdir`, statfs
-  and xattr read etcd linearizably and never consult the lock cache. On a
-  partition they *fail* rather than answer stale. But the kernel above them
-  may answer `stat()` from its own cache for `attr_timeout`, so another node's
-  view of a file's size lags independently of any of this.
+  and xattr read etcd linearizably. On a partition they *fail* rather than
+  answer stale. But the kernel above them may answer `stat()` from its own
+  cache for `attr_timeout`, so another node's view of a file's size lags
+  independently of any of this. The one value taken from local state is the
+  size of an inode this node is currently writing, which etcd is behind on by
+  up to the flush interval — see [below](#durability-under-write-delegation).
 - **Cross-file consistency.** Each inode is independently consistent. There is
   no snapshot across several inodes, and namespace operations are separate
   transactions.
@@ -242,16 +245,17 @@ is what makes the ordering safe in the other direction — a crash between steps
 free list on restart. See
 [Write Ordering Invariants](../storage/write-ordering-invariants.md).
 
-## Durability Under Write Delegation (planned)
+## Durability Under Write Delegation
 
-Not implemented. Recorded here because it changes the meaning of an
-acknowledged write, and that change must be understood before it lands.
+Step 3 is deferred. While this node holds an inode's exclusive lock, the extent
+record is buffered in RAM beside the cached metadata snapshot and published in
+batches; no peer can take even a shared lock in the meantime, so no peer can
+observe the gap. `--metadata-flush-interval` sets the bound (default 100 ms);
+`0` restores the behaviour above, one commit per write.
 
-The plan is to defer step 3: buffer the extent record in RAM while this node
-holds the exclusive lock, and flush in batches. Since no peer can take a
-shared lock while we hold the exclusive one, no peer can observe the gap. The
-consequence is local: **a write that was acknowledged but not yet flushed is
-lost if the node crashes.**
+The consequence is local and it changes the meaning of an acknowledged write:
+**a write that was acknowledged but not yet flushed is lost if the node
+crashes.**
 
 The loss is clean rather than corrupting. The bytes are on the volume, intact;
 what is lost is the only reference to them, so on restart the arena reclaims
@@ -260,46 +264,70 @@ torn content and no partial publication, because publication is a single
 transaction. Per inode the semantics are "rewind to last flush", never a
 mixture.
 
-For this to be POSIX-legal rather than merely fast, four things must hold, and
-none of them do today:
+### What makes it POSIX-legal
 
-1. **`fsync` must reach the daemon.** `ec_fsync` and `ec_flush` in
-   `pkg/fuse/ops.c` reply success without any IPC, and `ipcOpFsync`/`ipcOpFlush`
-   map to a no-op handler. That is correct only while nothing can be pending;
-   with deferral it would be a successful fsync for data that is nowhere.
-2. **A failed flush must not discard the buffer.** This is the Postgres
-   fsyncgate failure: dropping dirty state after a failed writeback makes the
-   *retry* succeed with the data gone. The buffer must survive, and `fsync`
-   must keep returning `EIO` until a flush commits.
-3. **`O_SYNC`/`O_DSYNC` must disable deferral for that write.** Several
-   databases rely on the open flag rather than calling `fsync`, and on this
-   mount the kernel sends no `FUSE_FSYNC` for them: a file opened with
-   `FOPEN_DIRECT_IO` is written through `fuse_direct_write_iter`, which never
-   calls `generic_write_sync`. The flags instead arrive on every write —
-   `fuse_send_write` sets `inarg->flags = fuse_write_flags(iocb)`, and libfuse
-   surfaces it as `fi->flags` — so the decision is made per write, not latched
-   at open. Confirmed for synchronous writes; the asynchronous direct-IO path
-   (AIO, io_uring) has not been checked.
-4. **Buffered-IO mode must flush the device too**, since there the bytes are
-   not durable on the pwrite.
+`write()` promises visibility, never durability, so deferring the commit is
+legal on its own. What the durability *surface* has to keep promising:
 
-Two ordering rules come with it. The flush must be rejected if this node's own
-lock key is gone — by exact holder token, since a prefix check is satisfied by
-the peer's key. And a flush must be forced before any namespace operation that
-publishes the inode, or a `rename` can name data that is not there: the ext4
-delayed-allocation trap.
+1. **`fsync` reaches the daemon.** `ec_fsync` and `ec_flush` send an IPC
+   request and block on it. `close()` sends a flush, so a program that never
+   calls `fsync` still publishes before its descriptor goes away. `fsyncdir`
+   remains a no-op: namespace operations commit before they are acknowledged
+   and are never deferred.
+2. **A failed flush does not discard the buffer.** Dropping dirty state after a
+   failed writeback is the Postgres fsyncgate failure — it makes the *retry*
+   succeed with the data gone. A flush that fails for a transient reason keeps
+   its buffer and every later `fsync` on that inode returns `EIO` until one
+   commits. The buffer is discarded only when it can never be published:
+   the lock key is gone, or the node is fenced. Both free the blocks back to
+   the arena and log loudly, and neither can lose data another node could see,
+   because nothing buffered was ever published.
+3. **`O_SYNC`/`O_DSYNC` disable deferral for that write.** The decision is made
+   per write, from the write request's own flags, not latched at open. It has
+   to be: a file opened with `FOPEN_DIRECT_IO` is written through
+   `fuse_direct_write_iter`, which never calls `generic_write_sync`, so a
+   synchronous open produces no `FUSE_FSYNC` at all and waiting for one would
+   wait forever. The flags arrive on every write instead — `fuse_send_write`
+   sets `inarg->flags = fuse_write_flags(iocb)`, and libfuse surfaces it as
+   `fi->flags`. Confirmed for synchronous writes; the asynchronous direct-IO
+   path (AIO, io_uring) has not been checked, so the guarantee is claimed for
+   synchronous writes only.
+4. **Buffered-IO mode flushes the device too.** Without `O_DIRECT` the bytes are
+   in this node's page cache rather than on the volume, so `fsync` flushes the
+   device as well as publishing the extent.
 
-Cross-node, the delegation costs a peer's `stat` freshness, bounded by the
-flush interval. Cross-crash, it costs unfsynced writes. It costs nothing to
-correctness, because a stale node cannot commit: quorum, the fencing guard and
-the lock-key comparison all stand in the way.
+### What makes it safe
+
+The flush carries the comparisons the buffered writes were planned against —
+each key asserted to be where this node last saw it — plus the fencing guard
+and **this node's own lock key, by exact holder token**. A prefix check would
+be satisfied by the key of the peer that took the inode away, which is
+precisely the case the comparison exists to reject. A flush arriving after a
+lost lease or a recall therefore cannot commit, and its blocks go back to the
+arena unreferenced.
+
+Ordering follows from the same rule. A recall publishes before the key is
+yielded, and refuses to yield if it cannot — making the peer wait is the safe
+direction to fail in. A flush is also forced before any operation that plans
+against what etcd holds rather than against the cached snapshot: `truncate`,
+`setattr` with a size, `fallocate`, `lseek`, and any namespace operation naming
+the inode, so `write(); close(); rename()` cannot publish a name for data that
+is not there — the ext4 delayed-allocation trap.
+
+### What it costs
+
+Cross-node, a peer's `stat` of an inode this node is writing lags by up to the
+flush interval; this node's own `getattr`, `lookup` and `readdirplus` serve the
+size from the buffer, so `write(); stat()` is coherent locally. Cross-crash, it
+costs unfsynced writes. It costs nothing to correctness, because a stale node
+cannot commit: quorum, the fencing guard and the lock-key comparison all stand
+in the way.
 
 ## Why Caching Is the Only Way Past the Device Ceiling
 
-With metadata reads removed, a read is one device I/O and a write is one
-device I/O plus one Raft commit. Removing the commit brings writes to the
-device ceiling. Nothing removes the device I/O except not performing it, which
-means serving from RAM.
+With metadata reads removed and the commit deferred, a read and a write are
+each one device I/O. Nothing removes that except not performing it, which means
+serving from RAM.
 
 This matters when reading benchmark numbers: any figure above the volume's
 provisioned IOPS is, by construction, not touching the volume. Caching raises
@@ -349,6 +377,6 @@ Current behaviour unless marked planned.
 | Can a read return another file's bytes? | No — arena ownership confines reclamation; one narrow scrubber window remains |
 | Can a lock be granted from a stale view? | No — acquisition is a transaction, never a read |
 | Can a node believe it holds a lock it doesn't? | Yes, within the lock session TTL after an unobserved lease loss |
-| Is an acked `write()` durable? | Today yes, in Raft. Planned: only after `fsync`, recall, or the flush interval |
+| Is an acked `write()` durable? | Only after `fsync`, `close`, a recall, or the flush interval; `--metadata-flush-interval=0` makes every `write()` durable again |
 | Can a crash corrupt a file? | No — a write is published atomically or not at all |
 | Is there cross-file/namespace atomicity? | No, beyond what a single transaction covers |

@@ -137,6 +137,8 @@ Reserved ──(write data)──► Written ──(etcd commit)──► Commit
 
 Only the etcd record distinguishes Written from Committed: a block in the Written state is reachable from nothing, which is exactly what makes arena reconstruction able to reclaim it.
 
+An acknowledged write now sits in the Written state for as long as the flush interval, rather than for the length of one transaction: while this node holds the inode's exclusive lock the extent is buffered in memory, and the same reconstruction reclaims it if the node crashes first. Nothing about the ordering changes — the bytes are on the device before anything names them, in both cases — and the buffered extent's blocks are held reserved in the arena until the flush commits, so the allocator cannot hand them out from underneath a record that is about to reference them. See [Consistency and Durability](../consistency/consistency-and-durability-model.md#durability-under-write-delegation).
+
 ## Multi-Node Implications
 
 The ordering invariants have specific implications in a multi-node cluster:

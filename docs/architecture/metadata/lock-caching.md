@@ -95,8 +95,13 @@ wait out a lock's own TTL. Instead:
    lock for is ignored — the watch is one per process, not one per inode, so
    the cost of not holding a lock is zero.
 3. The node that does hold it (`recallLock`) waits for whatever operation is
-   currently using the entry to finish, then deletes the etcd key
-   (`dropCachedLock`) — but keeps the cache entry itself.
+   currently using the entry to finish, publishes anything that inode has
+   buffered, then deletes the etcd key (`dropCachedLock`) — but keeps the cache
+   entry itself. If the publication fails the key is *not* yielded: a peer that
+   took the inode would read a file missing writes this node has already
+   acknowledged, and the flush could never land afterwards, since its own
+   comparison on the lock key would reject it. Making the peer wait is the safe
+   direction to fail in.
 4. The waiter's next `AcquireLock` attempt, within its retry budget, now
    succeeds. It withdraws its want key (`ClearLockWant`) off the request's
    critical path, in a background goroutine — a want key left standing would
@@ -148,9 +153,11 @@ one this same node wrote.
 
 The cache holds at most `lockCacheMax` (4096) inodes. Past that,
 `evictLocksLocked` picks the least-recently-used entry with no operation
-currently in flight and releases its etcd key. An entry an operation is
-using is skipped, never waited for — a cache full of busy inodes is allowed
-to grow past the target rather than block a request trying to make room.
+currently in flight, publishes anything it has buffered, and releases its etcd
+key. An entry an operation is using is skipped, never waited for — a cache full
+of busy inodes is allowed to grow past the target rather than block a request
+trying to make room, and an entry whose writes cannot be published is left in
+place for the same reason a recall leaves one.
 
 ## What the Lock Makes Cacheable
 
@@ -159,17 +166,31 @@ an inode's key, no peer can write that inode, so anything this node has read
 about it stays true. The daemon uses that directly — a `lockEntry` carries the
 inode's record and extent list alongside the lock, and an operation that finds
 them there answers with no etcd round trip at all. A read on a file this node
-already holds is pure device I/O; a write is a single commit, with the extent
-list it needs coming from the entry rather than from a read.
+already holds is pure device I/O.
+
+The same argument runs in the other direction for writes. If no peer can read
+the inode while this node holds its exclusive key, the extent a write produces
+does not have to be in etcd until the key is given up — so it is buffered in
+the entry beside the snapshot and published in batches, and a write is pure
+device I/O too. That is a durability trade rather than a free win, and it is
+described in
+[Consistency and Durability](../consistency/consistency-and-durability-model.md#durability-under-write-delegation);
+what matters here is that the buffer and the snapshot are two halves of one
+statement about the inode and live under the same mutex, the same validity
+rule and the same obligations below.
 
 This is what a GFS2 glock does, and it brings the same obligation with it: the
 lock is what makes the cached data trustworthy, so giving the lock up means
 giving the data up in the same breath. Three rules discharge it.
 
-**Releasing the key clears what was cached under it.** Every path that gives
-the key back — a recall, an eviction, an upgrade from shared to exclusive,
-shutdown — goes through `releaseKeyLocked`, and that function drops the
-snapshot as it drops the key. A re-acquired key carries a fresh holder token
+**Releasing the key publishes what is buffered under it, then clears what was
+cached under it.** Every path that gives the key back — a recall, an eviction,
+an upgrade from shared to exclusive, shutdown — goes through
+`releaseKeyLocked`, and that function drops the snapshot as it drops the key;
+`dropCachedLock` flushes ahead of it. A buffer that cannot be published because
+its key is already gone is discarded and its blocks returned to the arena,
+which loses nothing another node could ever have seen: nothing buffered was
+ever published. A re-acquired key carries a fresh holder token
 and the snapshot is tagged with the token it was read under, so a snapshot
 from before a recall cannot be mistaken for a current one even if it survived.
 
@@ -218,14 +239,23 @@ but a lock key it is still holding blocks a healthy peer for as long as it
 takes that process to actually exit. So a self-fence
 (`stopOnSignalOrFence` in `cmd/etcfuse-meta/main.go`) drops every cached lock
 immediately, ahead of the rest of the shutdown sequence, rather than waiting
-for the process to exit and the session lease to expire. A partitioned node
+for the process to exit. A fenced node's buffered writes cannot be published —
+the guard rejects them, which is exactly the point — so they are discarded and
+their blocks released rather than held hostage until the process exits, and it
+is logged as the data loss it is. A partitioned node
 that never gets the chance to self-fence loses the same keys within the
 lock's 2-second TTL regardless, the same guarantee lease expiry always
 provided.
 
-A graceful shutdown (`leaveCluster`) does the same before closing the lock
-session: `ReleaseCachedLocks` drops every entry, and only then does
-`CloseLockSession` end the lease, which would otherwise have cleared them
+A graceful shutdown is the ordinary case and does publish: `ReleaseCachedLocks`
+flushes each entry before dropping it, so a peer that takes an inode next sees
+every write this node acknowledged. A flush that fails there discards, because
+the process is exiting and the buffer dies with it either way — better to
+return the blocks to the arena than leave them for the next incarnation to
+reconstruct.
+
+`leaveCluster` runs it before closing the lock session, and only then does
+`CloseLockSession` end the lease, which would otherwise have cleared the keys
 anyway but only after the process had already stopped answering.
 
 ## Correctness Invariants
@@ -251,7 +281,11 @@ properties a future change to this file must not reintroduce):
    metadata is only true because no peer can write the inode while this node
    holds the lock, so the moment the key goes the snapshot is worthless.
    `releaseKeyLocked` clears both together, and the snapshot carries the
-   holder token it was read under so a re-acquired key cannot revive it.
+   holder token it was read under so a re-acquired key cannot revive it. The
+   buffered writes beside it are bound by the same rule and by one more: the
+   flush's own comparison names this node's lock key by exact holder token, so
+   a publication that arrives after the key is gone is rejected by etcd rather
+   than relying on this node to notice first.
 4. **A node that has lost its lock session holds nothing.** `ensureLockKey`
    compares the lease its key was written under against the session's current
    lease before trusting a cached key, so a partitioned node stops answering
@@ -291,6 +325,23 @@ by an acquire, and it is not atomic: a peer can take the inode in between. It
 is safe because the release clears the cached snapshot, so the operation
 re-reads under its new key rather than continuing from a view that predates
 the gap.
+
+**A flush landing after the lock is gone.** The buffer's whole risk is that it
+outlives the right to publish it. Three things stand in the way, in order:
+`ensureLockKey` discards it the moment it notices the session's lease has
+changed; the flush's comparison names this node's own lock key by exact holder
+token, so etcd rejects a transaction from a node whose key a peer has replaced;
+and the fencing guard rejects it if the node has been fenced. A rejected flush
+publishes nothing at all — publication is one transaction — so its blocks go
+back to the arena still unreferenced by anything in etcd.
+
+**A flush racing an operation on the same inode.** A flush rewrites exactly the
+keys an in-flight operation's comparisons were built against, so it never runs
+alongside one: every flush trigger holds the entry's write lock, and the
+interval sweeper uses `TryLock` and skips a busy inode until the next tick. An
+operation that does need etcd's view rather than the cached one — `truncate`,
+`setattr` with a size, `fallocate`, `lseek`, a `rename` or `link` naming the
+inode — flushes first, under the lock it already holds.
 
 **Eviction under load.** `evictLocksLocked` only takes an entry whose write
 lock it can acquire without waiting, so no operation is ever running under an
