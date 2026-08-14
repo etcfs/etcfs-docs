@@ -348,6 +348,17 @@ lock it can acquire without waiting, so no operation is ever running under an
 entry being evicted, and the eviction releases the key — and with it the
 snapshot — through the same path a recall does.
 
+**A flush whose reply is lost.** The same problem one level up, with the same
+answer. The transaction commits, the response does not arrive, and the retry
+re-proposes comparisons the first attempt has already invalidated — a
+`CreateRevision == 0` on a key it just created — so etcd rejects it. Believing
+that rejection would strand a buffer that was in fact published: `fsync` on the
+inode would return `EIO` for good and its reclaimed blocks would stay reserved.
+So a rejected flush first reads the inode back and checks whether its own
+transaction is already there. Only this node can have written those keys, since
+it holds the lock, so a key carrying exactly the value the flush proposed
+settles it.
+
 **An acquisition whose reply is lost.** The transaction may have committed
 while the response did not arrive, and every attempt mints a fresh holder
 token — so the retry's "no holder exists" comparison is then blocked by this

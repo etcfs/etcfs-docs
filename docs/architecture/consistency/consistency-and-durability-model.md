@@ -281,7 +281,13 @@ legal on its own. What the durability *surface* has to keep promising:
    commits. The buffer is discarded only when it can never be published:
    the lock key is gone, or the node is fenced. Both free the blocks back to
    the arena and log loudly, and neither can lose data another node could see,
-   because nothing buffered was ever published.
+   because nothing buffered was ever published. A rejection is also what a
+   committed flush whose reply was lost looks like — the retry re-proposes
+   comparisons the first attempt already invalidated — so before anything is
+   kept or discarded the flush checks whether its transaction is in fact
+   already in etcd, and adopts it if so. Only this node can have written those
+   keys, since it holds the lock, so a key carrying exactly the value the flush
+   proposed is proof that it landed.
 3. **`O_SYNC`/`O_DSYNC` disable deferral for that write.** The decision is made
    per write, from the write request's own flags, not latched at open. It has
    to be: a file opened with `FOPEN_DIRECT_IO` is written through
