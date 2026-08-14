@@ -57,6 +57,25 @@ If steps 3 and 4 were reversed (metadata before data):
 - A reader on another node reads the extent, finds its blocks referenced by etcd, reads from the block device, and gets stale data (the previous contents of those blocks) or zeros.
 - This is a data integrity failure.
 
+### Where the Ordering Moves When Writes Are Buffered
+
+With `--write-data-cache` (the default when extent publication is deferred at
+all), steps 2 and 4 both move off the write path and into the flush. The
+ordering between them does not move: the flush puts every buffered run on the
+device first, and only then commits the transaction publishing the extents that
+name those runs. Step 1 still happens as the write is served, which is what lets
+the extents carry their final disk offsets while the bytes are still in RAM.
+
+A device write that fails at flush time therefore stops the flush before it
+publishes anything. The buffer is kept and retried, exactly as a failed etcd
+transaction is, because the alternative — dropping it — would let a retried
+`fsync` succeed with the data gone.
+
+The crash exposure this adds is larger in size than deferring the commit alone,
+and identical in kind: the bytes are now lost along with the mapping rather than
+stranded on the volume, and an unpublished extent was unreachable either way. A
+file still reads back as it was at its last flush, never as a mixture.
+
 ## Metadata-Then-Data for Truncates
 
 Truncation reverses the ordering. When a file is truncated (or a range is deallocated with `fallocate(FALLOC_FL_PUNCH_HOLE)`):

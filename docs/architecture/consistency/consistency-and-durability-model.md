@@ -32,6 +32,7 @@ cache in the system is private RAM belonging to one node.
 |---|---|---|
 | `lockEntry.meta` — inode record + extent list | the daemon's Go heap | no |
 | `lockEntry.pending` — extents written and not yet published | the daemon's Go heap | no |
+| `lockEntry.pending` — the payload of those writes, not yet on the volume | the daemon's Go heap | no |
 | kernel dentry and attribute caches | that node's kernel | no |
 | kernel page cache for file data | that node's kernel | **disabled** (`direct_io = 1`, `keep_cache = 0`) |
 | the daemon's own page cache for the device | that node's kernel | **bypassed** (`O_DIRECT`) |
@@ -257,12 +258,44 @@ The consequence is local and it changes the meaning of an acknowledged write:
 **a write that was acknowledged but not yet flushed is lost if the node
 crashes.**
 
-The loss is clean rather than corrupting. The bytes are on the volume, intact;
-what is lost is the only reference to them, so on restart the arena reclaims
-those blocks and the file reads back as it was at the last flush. There is no
-torn content and no partial publication, because publication is a single
-transaction. Per inode the semantics are "rewind to last flush", never a
-mixture.
+The loss is clean rather than corrupting. What is lost is the reference to the
+bytes, so on restart the arena reclaims those blocks and the file reads back as
+it was at the last flush. There is no torn content and no partial publication,
+because publication is a single transaction. Per inode the semantics are
+"rewind to last flush", never a mixture.
+
+### The payload is buffered too
+
+`--write-data-cache` (on by default whenever the flush interval is non-zero)
+buffers the write's *bytes* beside its extents rather than putting them on the
+volume as the write is served, so a write costs no device I/O either. The
+blocks are still reserved from the arena at write time, which is what lets the
+buffered extents carry their final disk offsets.
+
+Three things keep that sound:
+
+1. **The flush writes data before it publishes metadata**, in that order,
+   always. Publishing an extent whose bytes are not on the volume is the one
+   inversion that turns a lost write into a read of garbage.
+2. **A read on this node consults the buffer before the device**, by disk
+   range, so a node reads back what it just wrote. No peer can read the inode
+   at all, because this node holds its lock.
+3. **The buffer is bounded and applies backpressure.** Past the cap a write
+   publishes the buffer before joining it, so the memory an inode's
+   unpublished data may occupy is the same bound that already limited how much
+   a crash could lose.
+
+The flush also coalesces runs that turn out to be adjacent into single, larger
+device writes. That is the one part of data buffering that raises the
+*sustained* rate rather than only the peak: a random 4 K workload allocating
+from one arena produces contiguous disk ranges even when its logical offsets
+are scattered.
+
+Crash exposure is larger in size and unchanged in kind: the bytes are now lost
+with the mapping instead of being stranded on the volume, which is observably
+identical because an unpublished extent was unreachable either way.
+`--write-data-cache=false` restores a device write per write, and
+`--metadata-flush-interval=0` restores full synchronous behaviour.
 
 ### What makes it POSIX-legal
 
@@ -299,9 +332,11 @@ legal on its own. What the durability *surface* has to keep promising:
    the asynchronous direct-IO one that AIO and io_uring use — see
    [Design Decisions](../../design-decisions.md#osync-and-odsync-are-read-from-each-write-not-latched-at-open)
    for the numbers — so the guarantee is not limited to synchronous writes.
-4. **Buffered-IO mode flushes the device too.** Without `O_DIRECT` the bytes are
-   in this node's page cache rather than on the volume, so `fsync` flushes the
-   device as well as publishing the extent.
+4. **`fsync` publishes both halves, in order.** It puts the buffered payload on
+   the device and then commits the extents naming it, and returns only once
+   both have happened. Without `O_DIRECT` the bytes are in this node's page
+   cache rather than on the volume even after the device write, so it flushes
+   the device as well.
 5. **A write that drops the file's set-user-ID bits is never deferred.**
    Deferring the bytes trades durability; deferring that trades privilege. A
    peer reading the inode during the flush interval would be told the file is
@@ -347,10 +382,11 @@ the peak, never the sustained average — a working set larger than RAM is still
 device-bound, and a cold random read is device-bound for every filesystem.
 
 The lock makes data caching legitimate for the same reason it makes metadata
-caching legitimate, so both directions are open (planned, not built): kernel
-page caching for inodes this node holds, invalidated on recall; and buffering
-write data in RAM ahead of the device. The second inverts nothing only if the
-flush writes bytes to the device *before* committing their extents.
+caching legitimate. Buffering write data in RAM ahead of the device is described
+above, and it inverts nothing because the flush writes bytes to the device
+*before* committing their extents. Kernel page caching for inodes this node
+holds, invalidated before the lock is yielded, is the read-side counterpart and
+is planned, not built.
 
 ## Comparison with NFS
 
@@ -390,5 +426,6 @@ Current behaviour unless marked planned.
 | Can a lock be granted from a stale view? | No — acquisition is a transaction, never a read |
 | Can a node believe it holds a lock it doesn't? | Yes, within the lock session TTL after an unobserved lease loss |
 | Is an acked `write()` durable? | Only after `fsync`, `close`, a recall, or the flush interval; `--metadata-flush-interval=0` makes every `write()` durable again |
+| Are an acked write's bytes on the volume? | Not necessarily — with `--write-data-cache` they land at the same flush that publishes them, never after it; `--write-data-cache=false` puts them down per write |
 | Can a crash corrupt a file? | No — a write is published atomically or not at all |
 | Is there cross-file/namespace atomicity? | No, beyond what a single transaction covers |
