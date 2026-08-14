@@ -60,8 +60,11 @@ If steps 3 and 4 were reversed (metadata before data):
 ### Where the Ordering Moves When Writes Are Buffered
 
 With `--write-data-cache` (the default when extent publication is deferred at
-all), steps 2 and 4 both move off the write path and into the flush. The
-ordering between them does not move: the flush puts every buffered run on the
+all), steps 2 and 4 can both move off the write path and into the flush. Step 2
+moves only for a write the flush can actually make cheaper — one continuing a
+contiguous device run, or one large enough to be latency-bound rather than
+rate-limited; every other write puts its bytes down as it is served, and defers
+only step 4. The ordering between them does not move: the flush puts every buffered run on the
 device first, and only then commits the transaction publishing the extents that
 name those runs. Step 1 still happens as the write is served, which is what lets
 the extents carry their final disk offsets while the bytes are still in RAM.

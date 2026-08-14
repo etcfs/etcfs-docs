@@ -299,11 +299,17 @@ Three things keep that sound:
    unpublished data may occupy is the same bound that already limited how much
    a crash could lose.
 
-The flush also coalesces runs that turn out to be adjacent into single, larger
-device writes. That is the one part of data buffering that raises the
-*sustained* rate rather than only the peak: a random 4 K workload allocating
-from one arena produces contiguous disk ranges even when its logical offsets
-are scattered.
+The payload is buffered only where doing so pays, which is not everywhere. A
+provisioned volume meters I/O operations per second rather than capping how
+many may be outstanding, so batching small scattered writes spends the same
+budget and only turns steady latency into a burst. Two cases escape that: a
+write that continues a contiguous device run, where the flush merges it with
+its neighbours into genuinely fewer operations; and a large write, where the
+workload is bound by device latency at queue depth one and issuing the batch
+against the device's queue is pure gain. Anything else is written through as
+it was before, with only its extent deferred. The flush issues whatever it does
+hold concurrently, for the same reason. Measurements in
+[Performance Benchmarks](../reliability/performance-benchmarks.md).
 
 Crash exposure is larger in size and unchanged in kind: the bytes are now lost
 with the mapping instead of being stranded on the volume, which is observably

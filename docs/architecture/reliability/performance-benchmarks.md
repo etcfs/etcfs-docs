@@ -239,10 +239,69 @@ write also buries the one before it.
 
 Two consequences. The sequential row cannot be compared across runs whose
 random-write rate differs, which now includes every row above. And coalescing
-adjacent writes into larger device I/Os at flush time — already the one part of
-data buffering that would raise the *sustained* rate rather than the peak — is
-what would actually close this, by not letting a fragmented arena turn one
-logical write into several extents.
+adjacent writes into larger device I/Os at flush time is what would actually
+close this, by not letting a fragmented arena turn one logical write into
+several extents — measured in the next section, where it recovers the
+sequential row to 40 MiB/s but turns out to help only where the arena handed
+out adjacent blocks in the first place.
+
+## Caching data: two device regimes, not one
+
+Buffering a deferred write's *payload* in RAM as well as its extents was
+supposed to raise the sustained rate by coalescing adjacent writes into larger
+device I/Os. A first build did it unconditionally, and measured (30 s per job,
+same 3-node shape, 1000-IOPS io2):
+
+| Build | randwrite-4k IOPS | randwrite-4k p99 (ms) | randread-4k IOPS | seqwrite-128k MiB/s |
+|---|---|---|---|---|
+| publication deferred (previous section) | 996 | 15 | 1004 | 36 |
+| + data buffered unconditionally | 850 | 65 | 969 | 12 |
+| + flush I/Os issued concurrently | 893 | 64 | 1014 | 44 |
+| + buffered only where it pays | **985** | **15** | 1014 | **40** |
+
+The middle row is the interesting one: buffering the data made randwrite p99
+four times worse and sequential throughput three times worse. Two separate
+mistakes, and they pull in opposite directions.
+
+**The flush issued its device writes one at a time.** A buffer holds as many
+writes as the transaction op cap allows — about 46, since each write
+contributes an extent plus its reclaim — so a buffer-full flush was ~46
+serialized device round trips with the inode's lock held. That is the same
+mistake a per-operation etcd commit made on the write path, and it has the same
+answer: issue them against the device's queue. Fixing it alone took sequential
+from 12 to 44 MiB/s.
+
+**But it did almost nothing for randwrite p99 (65 → 64 ms), and that is the
+part worth recording.** A provisioned volume meters I/O *operations per
+second*; it does not cap how many may be outstanding. Issuing 46 operations
+concurrently still spends 46 of the second's budget, so parallelism hides
+latency and buys no rate. For small scattered writes there was no rate to buy
+back in the first place: the metric added for this (`etcfuse_flush_coalesced_-
+runs`) showed a mean of 1.20 runs merged per I/O, 96.6% of them merging nothing
+at all. A random overwrite frees a scattered block per write and reallocates
+out of exactly those holes, so its runs are never adjacent and the merge cannot
+fire. Buffering was converting steady latency into a burst and returning
+nothing.
+
+So the payload is buffered only where one of two things is true:
+
+- **the write continues a contiguous device run**, so the merge is real and
+  fewer operations reach the device — the sequential case, and the only case
+  coalescing was ever going to help; or
+- **the write is large** (≥64 KiB), where the workload is bound by device
+  latency at queue depth one rather than by the operation rate, and issuing the
+  batch against the device's queue is pure gain.
+
+A small scattered write is written through as it always was. Its *extent* is
+still deferred — that is where the Raft commit was saved, and that saving is
+unconditional.
+
+The general lesson is the mirror of the previous section's. There, removing the
+dominant cost promoted a second one nobody had listed. Here, an optimisation
+that was correct for one regime was applied to a device that has two, and the
+regime it was wrong for is the one the headline benchmark measures. "Fewer,
+larger I/Os" and "more I/Os in flight" are different wins against different
+limits, and a rate-limited device grants only the first.
 
 ## Cost-per-IOPS
 
