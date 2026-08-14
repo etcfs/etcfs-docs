@@ -258,7 +258,8 @@ EtcFS handles this through the following mechanisms:
 | Layer | Mechanism | Latency |
 |---|---|---|
 | NVMe controller | BLKFLSBUF flushes write-side controller cache | ~1ms |
-| Kernel page cache | O_DIRECT bypasses the page cache | 0 |
+| Kernel page cache (daemon to device) | O_DIRECT bypasses the page cache | 0 |
+| Kernel page cache (applications on the mount) | Invalidated before the inode's lock is yielded | recall latency |
 | Reader cache | BLKFLSBUF before read invalidates stale cache | ~1ms |
 | Read-back verify | Writer confirms data is readable before returning success | ~0–20ms |
 | Lock held during write | No reader can see partial writes | 0 (readers wait) |
@@ -266,6 +267,18 @@ EtcFS handles this through the following mechanisms:
 The combination of these mechanisms ensures that when a write returns success, the data is on the EBS volume and accessible to any future read from any attachment. The lock guarantees atomicity: no reader can observe a partially-written extent.
 
 ## O_DIRECT and Kernel Page Cache
+
+Two page caches are in play and they are easy to conflate: the one the *daemon*
+uses for the shared block device, and the one the *kernel* keeps for files on
+the mount.
+
+The daemon's is bypassed with O_DIRECT, and that is what the rest of this
+section is about. The kernel's is enabled per open, for inodes this node holds
+a lock on, and invalidated before that lock is yielded — see
+[FUSE Cache Management](../fuse/fuse-cache-management.md#data-page-cache). The
+distinction is that the lock supplies the invalidation the device cannot: a
+peer cannot write an inode this node holds, and the recall protocol says when
+that stops being true. Nothing equivalent exists for the device below.
 
 O_DIRECT I/O bypasses the kernel page cache for the data path. Data is transferred directly between the user-space buffer and the block device. This eliminates the kernel cache as a source of cross-node staleness.
 

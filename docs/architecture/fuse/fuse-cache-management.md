@@ -7,6 +7,7 @@ Kernel-side caching policies, watch-driven cache invalidation, and the mechanism
 - [Cache Layers](#cache-layers)
 - [Entry Cache](#entry-cache)
 - [Attribute Cache](#attribute-cache)
+- [Data Page Cache](#data-page-cache)
 - [Negative Cache](#negative-cache)
 - [Watch-Driven Invalidation](#watch-driven-invalidation)
 - [Invalidation Flow](#invalidation-flow)
@@ -39,7 +40,25 @@ The attribute cache stores `struct stat` data for each inode. When `stat()`, `fs
 
 The cache duration is controlled by `attr_timeout`, returned in `fuse_reply_attr` and `fuse_reply_entry`. The default of 1.0 second is a reasonable balance: file sizes and timestamps rarely need sub-second accuracy, and 1 second of staleness is invisible to most applications.
 
-Attributes are invalidated together with entries: when a watch fires for a directory mutation, the daemon issues `FUSE_NOTIFY_INVAL_INODE` for any affected inodes, which flushes both the attribute cache and any open file handles that reference the stale attributes.
+Attributes are not invalidated proactively. A directory mutation on another node evicts the dentry, which is what makes the new or removed name visible; a change to an inode's own attributes becomes visible when `attr_timeout` expires. The one place `FUSE_NOTIFY_INVAL_INODE` is issued is the data page cache below, which also clears the attributes as a side effect.
+
+## Data Page Cache
+
+The kernel may hold an inode's file data across reads, so a re-read of recently read bytes costs no FUSE upcall at all. This is off for every open unless the daemon says otherwise: the reply to OPEN carries a flag, and the C side sets `keep_cache` and clears `direct_io` only when it is set.
+
+The daemon decides rather than the C side because only the daemon knows whether it can take the pages back. It says yes when:
+
+- page caching is enabled (`--page-cache`, on by default),
+- a client is connected to the notification socket to carry an invalidation, and
+- the open is not `O_SYNC`/`O_DSYNC` — a synchronous open keeps the direct-IO path its durability guarantee was measured on.
+
+What makes the cached pages sound is the inode lock. While this node holds a lock on an inode, no peer can write it, so a page read under that lock cannot go stale underneath. **Before the lock key is yielded — recall, eviction, an upgrade from shared to exclusive, shutdown — the daemon issues `FUSE_NOTIFY_INVAL_INODE` for that inode and waits for the C side to confirm it, and a failure aborts the release.** Making the peer wait is the safe direction to fail in: a page cache has no timeout, so a page that outlived its lock would hide the next holder's writes indefinitely.
+
+The invalidation is carried out on the notification thread and must stay there. Calling `fuse_lowlevel_notify_inval_inode` from a request thread can deadlock against the kernel's own writeback of the inode being invalidated.
+
+Writes stay write-through: `FUSE_WRITEBACK_CACHE` is not negotiated, so every `write()` still reaches the daemon and the kernel caches only what it has read. The kernel's writeback cache changes the shape of every write request and is a separate matter.
+
+A reader using `O_DIRECT` bypasses the page cache by definition, so page caching neither helps nor hinders it — which is also why it does not show up in a benchmark run with `direct=1`.
 
 ## Negative Cache
 
@@ -69,13 +88,15 @@ When a watch event arrives for a directory prefix:
 
 - **DELETE event** (file unlinked or renamed out): same invalidation. The kernel's negative cache for the name is also cleared, so a subsequent `stat()` gets a fresh ENOENT (or finds the file if it was recreated).
 
-- **Unknown event** (lease expiry, an unrecognised key change, etc.): issue a blanket `FUSE_NOTIFY_INVAL_INODE(parent_ino, 0, 0)` for the parent directory. This is more expensive (flushes all cached dentries for the directory) but safe for ambiguous events.
+- **Lock yielded** (this node is giving up an inode's lock to a peer): issue `FUSE_NOTIFY_INVAL_INODE(ino, 0, 0)` for that inode and wait for it to complete before the lock key is deleted. See [Data Page Cache](#data-page-cache).
 
 ### Notification API
 
 `FUSE_NOTIFY_INVAL_ENTRY` takes a parent inode, a name, and a name length. The kernel matches it against its dentry cache and evicts the matching entry. Subsequent lookups for that name trigger fresh FUSE LOOKUP calls.
 
-`FUSE_NOTIFY_INVAL_INODE` takes an inode number. The kernel evicts all cached attributes and any page-cache data for that inode. This is more aggressive — it also invalidates cached file data — and is only used when the inode's metadata has changed (size, permissions, timestamps).
+`FUSE_NOTIFY_INVAL_INODE` takes an inode number and a byte range; EtcFS passes the whole file. The kernel evicts all cached attributes and every cached data page for that inode. It is the more aggressive of the two and is issued only when this node is about to stop holding the inode's lock.
+
+Unlike `INVAL_ENTRY`, it is acknowledged: the Go daemon writes the message and blocks on a one-byte reply, because the release it precedes must not go ahead until the pages are actually gone. `INVAL_ENTRY` needs no such reply — a stale dentry is bounded by `entry_timeout`, and no correctness argument waits on it.
 
 ## Invalidation Flow
 
@@ -94,7 +115,7 @@ The total latency from Node A's create to Node B's cache invalidation is ~2× et
 
 The watch-driven invalidation provides **eventual consistency** for the kernel VFS cache:
 
-- **Data writes.** When Node A writes to a file and calls `fsync()`, Node B's cached data is not automatically invalidated. However, Node B's next `open()`+`read()` will see the new data because `open()` triggers a LOOKUP (which may be cached) and a GETATTR (which returns the new size). If the `attr_timeout` has expired, the new size is fetched from etcd.
+- **Data writes.** Node B can only have cached data for an inode while it held that inode's lock, and it drops those pages before yielding it — so Node A cannot have written the file while Node B still holds pages for it. Beyond the data itself, Node B's next `open()`+`read()` will see the new data because `open()` triggers a LOOKUP (which may be cached) and a GETATTR (which returns the new size). If the `attr_timeout` has expired, the new size is fetched from etcd.
 
 - **Directory mutations.** Creates, unlinks, and renames are immediately visible on other nodes after the watch fires — typically within the etcd RTT, not bounded by `entry_timeout`.
 

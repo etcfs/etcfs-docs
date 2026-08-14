@@ -34,17 +34,22 @@ cache in the system is private RAM belonging to one node.
 | `lockEntry.pending` — extents written and not yet published | the daemon's Go heap | no |
 | `lockEntry.pending` — the payload of those writes, not yet on the volume | the daemon's Go heap | no |
 | kernel dentry and attribute caches | that node's kernel | no |
-| kernel page cache for file data | that node's kernel | **disabled** (`direct_io = 1`, `keep_cache = 0`) |
+| kernel page cache for file data | that node's kernel | for inodes this node holds a lock on; invalidated before the lock is yielded |
 | the daemon's own page cache for the device | that node's kernel | **bypassed** (`O_DIRECT`) |
 | etcd's key-value store | replicated across the etcd members | yes, by Raft |
 | the block volume | the device itself | yes, with no caching semantics |
 
-The two disabled entries are deliberate and are the subject of
-[Cache Coherence](cache-coherence.md). A shared device provides no way to
-invalidate another attacher's page cache, so a cached data page would be
-silently wrong with no timeout and no notification — worse than a stale read
-bounded by a lease. `--allow-buffered-io` turns the second one off and is
-documented as a correctness change, not a fallback.
+The daemon's own page cache for the device stays bypassed, and that is
+deliberate: it is the subject of [Cache Coherence](cache-coherence.md).
+`--allow-buffered-io` turns it back on and is documented as a correctness
+change, not a fallback, because a write served back out of it never proves it
+reached the other attachers.
+
+The kernel page cache above it is a different matter, because the lock supplies
+the invalidation the device cannot. A page may be cached only for an inode this
+node holds a lock on, and the daemon drops those pages — and waits for the drop
+to complete — before it yields the key. `--page-cache=false` returns to
+unconditional `direct_io = 1`, `keep_cache = 0`.
 
 ## What the Shared Device Does and Does Not Provide
 
@@ -160,6 +165,15 @@ client observing it. It is bounded by the lock session's TTL (2 s,
 partitioned node's read failed at etcd; now it can be served from cache inside
 that window. That is the one safety property the caching work traded away, and
 it is recorded here rather than left implicit.
+
+The kernel page cache widens that window rather than opening a new one, and it
+is the one cache the daemon cannot simply drop from its own memory. When a lock
+key is yielded deliberately the pages go first and the yield waits for them.
+When the key is discovered to be already gone — a lease that expired
+unobserved — the invalidation is still issued, but it can only be attempted
+after the fact, so a read on this node can be answered from a page cached
+before the loss until it completes. `--page-cache=false` removes this case
+entirely.
 
 Fencing does not open a separate hole. A generation bump stops a node's
 writes but does not delete its lock keys, so a fenced node's cached reads are
@@ -382,11 +396,15 @@ the peak, never the sustained average — a working set larger than RAM is still
 device-bound, and a cold random read is device-bound for every filesystem.
 
 The lock makes data caching legitimate for the same reason it makes metadata
-caching legitimate. Buffering write data in RAM ahead of the device is described
-above, and it inverts nothing because the flush writes bytes to the device
-*before* committing their extents. Kernel page caching for inodes this node
-holds, invalidated before the lock is yielded, is the read-side counterpart and
-is planned, not built.
+caching legitimate, and both directions are taken. Buffering write data in RAM
+ahead of the device is described above, and it inverts nothing because the flush
+writes bytes to the device *before* committing their extents. Kernel page
+caching for inodes this node holds is the read-side counterpart: the pages are
+invalidated before the lock is yielded, and a failure to invalidate them stops
+the yield rather than being logged and ignored.
+
+Neither shows up in a benchmark whose client opens with `O_DIRECT`, which
+bypasses the client page cache and reaches the daemon for every read.
 
 ## Comparison with NFS
 
@@ -422,9 +440,11 @@ Current behaviour unless marked planned.
 |---|---|
 | Are file-content reads linearizable? | Yes, while the lock session's lease holds |
 | Are `stat`/`lookup`/`readdir` linearizable? | Reads of etcd are; the kernel may answer from its own cache for `attr_timeout` |
+| Can a read be served from this node's kernel page cache? | Only for an inode this node holds a lock on; the pages go before the lock does |
 | Can a read return another file's bytes? | No — arena ownership confines reclamation; one narrow scrubber window remains |
 | Can a lock be granted from a stale view? | No — acquisition is a transaction, never a read |
 | Can a node believe it holds a lock it doesn't? | Yes, within the lock session TTL after an unobserved lease loss |
+| Can a stale kernel page outlive its lock? | Not for a lock yielded deliberately — the yield waits for the invalidation; after an unobserved lease loss, until the invalidation that follows the discovery |
 | Is an acked `write()` durable? | Only after `fsync`, `close`, a recall, or the flush interval; `--metadata-flush-interval=0` makes every `write()` durable again |
 | Are an acked write's bytes on the volume? | Not necessarily — with `--write-data-cache` they land at the same flush that publishes them, never after it; `--write-data-cache=false` puts them down per write |
 | Can a crash corrupt a file? | No — a write is published atomically or not at all |
