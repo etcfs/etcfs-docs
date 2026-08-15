@@ -64,8 +64,8 @@ own latency.
 | `etcfuse_etcd_txn_total` | Counter | `outcome` | etcd transactions, by outcome (`committed`, `rejected`, `error`) |
 | `etcfuse_metadata_cache_total` | Counter | `result` | Data-path metadata lookups, by whether the lock-held snapshot answered them (`hit`, `miss`) |
 | `etcfuse_pending_extents` | Gauge | — | Metadata keys written by acknowledged writes and not yet published to etcd |
-| `etcfuse_pending_bytes` | Gauge | — | Acknowledged write payload those keys stand for |
-| `etcfuse_metadata_flush_total` | Counter | `trigger` | Publications of deferred metadata (`interval`, `buffer_full`, `sync_write`, `operation`, `recall`, `eviction`, `shutdown`) |
+| `etcfuse_pending_bytes` | Gauge | — | Acknowledged write payload those keys stand for, summed across every inode |
+| `etcfuse_metadata_flush_total` | Counter | `trigger` | Publications of deferred metadata (`interval`, `buffer_full`, `memory_pressure`, `sync_write`, `operation`, `recall`, `eviction`, `shutdown`) |
 | `etcfuse_metadata_flush_failures_total` | Counter | `reason` | Flushes that did not publish (`error`, `rejected`, `fenced`, `device`) |
 | `etcfuse_block_io_total` | Counter | `op` | Block device operations (`read`, `write`) |
 | `etcfuse_block_io_bytes_total` | Counter | `op` | Bytes transferred to and from the device |

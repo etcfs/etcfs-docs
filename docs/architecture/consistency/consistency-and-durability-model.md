@@ -306,10 +306,17 @@ Three things keep that sound:
 2. **A read on this node consults the buffer before the device**, by disk
    range, so a node reads back what it just wrote. No peer can read the inode
    at all, because this node holds its lock.
-3. **The buffer is bounded and applies backpressure.** Past the cap a write
-   publishes the buffer before joining it, so the memory an inode's
-   unpublished data may occupy is the same bound that already limited how much
-   a crash could lose.
+3. **The buffer is bounded and applies backpressure**, twice over. Past the
+   per-inode cap a write publishes that inode's buffer before joining it, so
+   the memory one inode's unpublished data may occupy is the same bound that
+   already limited how much a crash could lose. Past the process-wide cap —
+   256 MiB across every inode at once — the write drains *other* inodes'
+   buffers instead, because the per-inode bound multiplied by a thousand hot
+   files is no bound at all. Its own buffer is never flushed there: that would
+   invalidate the proposal the write is holding, and the write has already
+   established that its own buffer had room. An inode with an operation in
+   flight is skipped rather than waited for, so the total can overshoot by at
+   most one write per inode in flight.
 
 The payload is buffered only where doing so pays, which is not everywhere. A
 provisioned volume meters I/O operations per second rather than capping how
