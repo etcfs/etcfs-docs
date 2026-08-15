@@ -100,6 +100,10 @@ When a watch event arrives for a directory prefix:
 
 Unlike `INVAL_ENTRY`, it is acknowledged: the Go daemon writes the message and blocks on a one-byte reply, because the release it precedes must not go ahead until the pages are actually gone. `INVAL_ENTRY` needs no such reply — a stale dentry is bounded by `entry_timeout`, and no correctness argument waits on it.
 
+The wait is bounded at five seconds, and a client that keeps its socket open while answering nothing would cost that on every lock release, one after another, on a path that is a single socket served by a single thread. Three acknowledgement timeouts in a row therefore declare the client unresponsive, and for the next thirty seconds acknowledged messages fail immediately rather than waiting; any successful acknowledgement clears the count. The count deliberately survives reconnection, because a client that wedges, is dropped and reconnects to wedge again is the exact case this exists for.
+
+An unresponsive client is not treated as an absent one. A client that has gone away took its FUSE session — and every page it cached — with it, so a lock release may proceed. A wedged client still holds that session, and its pages may still hide what a peer is about to write, so the release fails instead. Failing the release is the safe direction: the peer waits, rather than reading through a cache nobody has invalidated.
+
 ## Invalidation Flow
 
 A complete multi-node coherence cycle for file creation:
