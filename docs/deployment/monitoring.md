@@ -5,6 +5,14 @@
 daemon (`etcfuse`) has no metrics of its own — everything observable is on
 the Go side, since that's where etcd, the block device and fencing all live.
 
+The same address also serves `/healthz` and `/readyz` for orchestrators:
+`/healthz` answers 200 for as long as the process runs, `/readyz` answers 503
+with a reason while the daemon cannot serve I/O — still starting, membership
+lease not live, or self-fenced. Probe readiness to decide where to send work,
+liveness to decide whether to restart; a fenced node is unready but perfectly
+healthy, and restarting it fixes nothing. See
+[Observability](../architecture/cluster-ops/observability.md#health-and-readiness).
+
 ## Prometheus
 
 Point Prometheus at every node's metrics port:

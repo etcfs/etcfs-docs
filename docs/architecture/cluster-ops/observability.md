@@ -12,6 +12,28 @@ The metrics are backed by `prometheus/client_golang`, so the endpoint also
 carries the standard Go runtime and process collectors alongside the EtcFS
 series below.
 
+## Health and readiness
+
+The same listener serves two endpoints an orchestrator can probe, and the
+distinction between them is the point:
+
+| Path | Answers | Meaning |
+| --- | --- | --- |
+| `/healthz` | always 200 while the process runs | The daemon is alive and restarting it fixes nothing. |
+| `/readyz` | 200, or 503 with the reason | The daemon will serve I/O rather than fail it. |
+
+`/readyz` reports not-ready in three cases: the IPC socket is not yet being
+served (the daemon is still starting), the membership lease is not live (peers
+may already be fencing this node), or self-fencing has triggered (every write
+will be rejected). None of those is a reason to kill the process — a fenced
+node is doing exactly what it should — which is why they do not affect
+`/healthz`.
+
+The server sets read, write and idle timeouts. The listener is reachable by
+anything that can route to the node, and without them a client that opens a
+connection and never finishes its request holds a goroutine and a file
+descriptor indefinitely.
+
 ## Instrumentation model
 
 Metrics are declared once, as package-level variables in `pkg/metrics`, and
