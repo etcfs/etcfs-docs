@@ -2,8 +2,10 @@
 
 How an inode's etcd lock key outlives the operation that took it, what still
 enforces mutual exclusion once it does, and how a blocked peer gets it back.
-Implementation: `internal/ipc/lockcache.go`, `internal/ipc/retry.go`
-(`lockInode`), `pkg/metadata/lock.go` (`AnnounceLockWant`, `ClearLockWant`,
+Implementation: `internal/ipc/lockcache.go` (what a cached lock obliges this
+node to do), `internal/ipc/lockmap.go` (which inode holds which entry, and
+which entry to evict), `internal/ipc/retry.go` (`lockInode`),
+`pkg/metadata/lock.go` (`AnnounceLockWant`, `ClearLockWant`,
 `WatchLockWants`).
 
 ## Table of Contents
@@ -152,7 +154,7 @@ one this same node wrote.
 ## Cache Bound and Eviction
 
 The cache holds at most `lockCacheMax` (4096) inodes. Past that,
-`evictLocksLocked` picks the least-recently-used entry with no operation
+`lockMap.evictLocked` picks the least-recently-used entry with no operation
 currently in flight, publishes anything it has buffered, and releases its etcd
 key. An entry an operation is using is skipped, never waited for — a cache full
 of busy inodes is allowed to grow past the target rather than block a request
@@ -276,7 +278,7 @@ properties a future change to this file must not reintroduce):
    Removing a busy entry lets a second caller build a fresh entry for the
    same inode and take a different `RWMutex`, so two operations run against
    one inode each believing it holds exclusion. `recallLock` demotes
-   in place; `evictLocksLocked` only removes an entry it has just taken the
+   in place; `lockMap.evictLocked` only removes an entry it has just taken the
    write lock of.
 2. **A caller must confirm its entry is still current after taking the local
    lock.** The entry can be evicted between the map lookup and the local
@@ -356,7 +358,7 @@ operation that does need etcd's view rather than the cached one — `truncate`,
 `setattr` with a size, `fallocate`, `lseek`, a `rename` or `link` naming the
 inode — flushes first, under the lock it already holds.
 
-**Eviction under load.** `evictLocksLocked` only takes an entry whose write
+**Eviction under load.** `lockMap.evictLocked` only takes an entry whose write
 lock it can acquire without waiting, so no operation is ever running under an
 entry being evicted, and the eviction releases the key — and with it the
 snapshot — through the same path a recall does.

@@ -42,7 +42,7 @@ The design does survive it, for the specific case of a fenced node writing file 
 
 **1. Data is written before metadata, and metadata is the only way to reach data.**
 
-`handleWriteBlock` (`internal/ipc/datapath.go`) writes to the device first, then commits the extent to etcd. A read resolves bytes exclusively through the published extent list (`handleRead` → `Store.GetExtents`). Bytes on the volume that no `extent:<ino>/<chunk>` key references are not part of any file; nothing can observe them.
+`handleWriteBlock` (`internal/ipc/datapath.go`, with the write's own state and proposal building in `internal/ipc/writeop.go`) writes to the device first, then commits the extent to etcd. A read resolves bytes exclusively through the published extent list (`handleRead` → `Store.GetExtents`). Bytes on the volume that no `extent:<ino>/<chunk>` key references are not part of any file; nothing can observe them.
 
 **2. Publication is a linearizable, generation-guarded transaction.**
 

@@ -120,6 +120,21 @@ panic barrier that keeps one bad request from ending every mount the daemon
 serves, the operation counters and latency histogram, and the history record
 every operation is written to.
 
+The handlers hang off one `Service`, but its state does not all live there.
+What the daemon holds while serving is split into collaborators the handlers
+reach through: `lockMap` (which inode has which cached lock entry, and which to
+evict), `recallSet` (the recalls already in flight), `openFiles` (this node's
+open descriptor counts and the inodes it has to delete when the last one
+closes), and `writeOp` (one write's reserved blocks, planned metadata and
+proposal). Each owns its own mutex, so what a lock protects is a property of the
+thing rather than a matter of remembering which of several mutexes on one struct
+covers which field.
+
+Everything decided once — the flush interval, the two caches, read-only mode,
+the block device, the history recorder — is passed to `NewService` as `Options`
+rather than set afterwards. As setters, nothing made them run before the socket
+started accepting, and each stayed writable for the process's lifetime.
+
 Payload bounds are not declared in the table. Every handler decodes through the
 bounded reader in the same file, which refuses to read past the payload it was
 given and leaves the handler to reply `EINVAL`; a declared arity would be a
