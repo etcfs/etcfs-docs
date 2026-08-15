@@ -204,6 +204,14 @@ shared device — gets its own separate 1000-IOPS volume per node instead (see
 Linux 2 rather than this suite's usual AL2023, since AL2023 dropped the
 gfs2-utils/dlm/corosync packages it needs.
 
+`ETCFS_BENCH_DIRECT=0 ./bench-etcfs.sh` runs the same EtcFS cluster with
+`direct=1` dropped from the fio job, which is the page-cache variant: with
+O_DIRECT gone, repeated reads of a working set that fits in RAM are served by
+the client's page cache rather than by the device, the way every other
+backend's read column already was. It reports under its own backend name, so
+the two runs never overwrite each other, and it is not part of `run-all.sh` —
+it is a variant of one backend, not a sixth backend.
+
 ## At the device ceiling: cached metadata and deferred publication
 
 A further re-run (`benchmark-etcfs.sh`, 60 s per job, same 3-node shape,

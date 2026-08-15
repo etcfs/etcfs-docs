@@ -125,7 +125,7 @@ bounded reader in the same file, which refuses to read past the payload it was
 given and leaves the handler to reply `EINVAL`; a declared arity would be a
 second copy of that fact, one that could disagree with the decoder.
 
-### Payload Formats (represented)
+### Payload Formats
 
 Each operation has a fixed binary payload format on the wire. For example, a LOOKUP request:
 
@@ -133,13 +133,15 @@ Each operation has a fixed binary payload format on the wire. For example, a LOO
 [u64:parent_ino] [u32:name_length] [name_bytes...]
 ```
 
-And the corresponding response:
+And the corresponding response — the *entry response*, shared by LOOKUP, MKDIR, MKNOD, SYMLINK and LINK, since all of them answer with a newly resolved inode. CREATE answers with the same layout plus a trailing `[u32:keep_cache]`, because it opens the file it created:
 
 ```
 [i32:error] [u64:ino] [attr: 72 bytes] [u32:entry_timeout] [u32:attr_timeout]
 ```
 
-The `attr` field is a compact binary representation of the inode metadata: inode number, size, blocks, timestamps (seconds + nanoseconds), mode, nlink, uid, gid, rdev, and blksize — 72 bytes total.
+The `attr` field is a compact binary representation of the inode metadata: inode number, size, blocks, timestamps (seconds + nanoseconds), mode, nlink, uid, gid, rdev, and blksize — 72 bytes total, mirroring the `InodeRecord` layout in the metadata store but with nanoseconds split out for kernel compatibility. `entry_timeout` is how long the kernel may cache the name-to-inode mapping; `attr_timeout` how long it may cache the attributes.
+
+This layout is written in exactly two places — `buf.wAttr` on the Go side and `rb_attr` in `pkg/fuse/ops.c` — and a width test pins the two together. It is described here and referenced elsewhere rather than transcribed, because three copies of a byte layout is three things to update when a field moves.
 
 ## Socket I/O
 

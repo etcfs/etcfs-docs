@@ -52,11 +52,7 @@ If the inode exists but the inode record cannot be decoded, the response contain
 
 ### Response
 
-```
-[i32:error] [u64:ino] [attr: 72 bytes] [u32:entry_timeout] [u32:attr_timeout]
-```
-
-The `entry_timeout` tells the kernel how long to cache the name-to-inode mapping. The `attr_timeout` tells the kernel how long to cache the inode's attributes.
+The [entry response](fuse-request-dispatch.md#payload-formats): the resolved inode number, its attributes, and the two cache timeouts.
 
 ### Callback
 

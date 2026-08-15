@@ -134,16 +134,4 @@ The read-only operations (1–4, 13–17) form the read-only surface. Write oper
 
 ### Payload Formats
 
-Each operation has a fixed binary payload format on the wire. For example, a LOOKUP request:
-
-```
-[u64:parent_ino] [u32:name_length] [name_bytes...]
-```
-
-And the corresponding response:
-
-```
-[i32:error] [u64:ino] [attr: 72 bytes] [u32:entry_timeout] [u32:attr_timeout]
-```
-
-The `attr` field is a compact binary representation of the inode metadata: inode number, size, blocks, timestamps (seconds + nanoseconds), mode, nlink, uid, gid, rdev, and blksize — 72 bytes total, mirroring the `InodeRecord` layout in the metadata store but with nanoseconds split out for kernel compatibility.
+Each operation has a fixed binary payload format on the wire: a LOOKUP request carries a parent inode and a name, and answers with the [entry response](fuse-request-dispatch.md#payload-formats) that every operation resolving an inode shares. The layouts are given once, in [Request Dispatch](fuse-request-dispatch.md#payload-formats).
