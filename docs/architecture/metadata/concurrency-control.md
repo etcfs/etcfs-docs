@@ -42,6 +42,8 @@ Etcd evaluates a comparison over a range as "true for every key in it", and an e
 
 If the comparison fails, the acquisition fails with `ErrConflict` and writes nothing, leaving nothing behind. The caller retries with backoff, having first asked the current holder to yield (see [Lock Caching](#lock-caching)), or reports the conflict to the application.
 
+The backoff (`retryDelay` in `internal/ipc/retry.go`) is a linear ramp — 10 ms plus 40 ms per attempt — jittered by up to a quarter of the delay in either direction. The jitter is not about the contended inode; it is about the cluster. Every node retries against the same etcd cluster, and a leader election stalls all of them simultaneously, so an exact schedule brings the whole cluster back in lockstep: each wave arrives together, contends, and fails together. Jitter spreads the waves while leaving the mean untouched, which is what keeps the attempt budgets sized against this ramp valid. Plain etcd calls get five attempts rather than three for the same reason — three spanned about 100 ms, and an election outlasting that surfaced as EIO on every node at once. The ceiling in every case is the request deadline, which the retry loop aborts on.
+
 ### The session lease
 
 Every lock a node holds is written under one lease, granted on the node's first acquisition and renewed for the life of the process. A lock acquisition is therefore a single Raft commit rather than three: granting a lease per lock and revoking it on release put two further commits on the critical path of every write, which the benchmark work identified as the dominant cost of a write (see [Performance Benchmarks](../reliability/performance-benchmarks.md)).
