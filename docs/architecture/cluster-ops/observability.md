@@ -25,6 +25,13 @@ worse than one that has no endpoint at all, because it looks healthy.
 Metric names are an API. Dashboards and alert rules are written against them, so
 renaming one is a breaking change; `test/harness/metrics_test.go` pins the list.
 
+One latency series is exported, and only one. The histograms that decomposed a
+request into its etcd, device and handler stages existed to tune the data path,
+and that question is answered; end-to-end handler latency stays, because it is
+the one an operator asks during an incident and the one no counter can
+reconstruct. For the stages beneath it, etcd and the device both export their
+own latency.
+
 ## The series
 
 | Metric | Type | Labels | Meaning |
@@ -33,14 +40,11 @@ renaming one is a breaking change; `test/harness/metrics_test.go` pins the list.
 | `etcfuse_fuse_errors_total` | Counter | `op` | Operations that returned an errno |
 | `etcfuse_fuse_op_duration_seconds` | Histogram | `op` | End-to-end handler latency |
 | `etcfuse_etcd_txn_total` | Counter | `outcome` | etcd transactions, by outcome (`committed`, `rejected`, `error`) |
-| `etcfuse_etcd_txn_duration_seconds` | Histogram | — | etcd transaction round-trip latency |
 | `etcfuse_metadata_cache_total` | Counter | `result` | Data-path metadata lookups, by whether the lock-held snapshot answered them (`hit`, `miss`) |
 | `etcfuse_pending_extents` | Gauge | — | Metadata keys written by acknowledged writes and not yet published to etcd |
 | `etcfuse_pending_bytes` | Gauge | — | Acknowledged write payload those keys stand for |
 | `etcfuse_metadata_flush_total` | Counter | `trigger` | Publications of deferred metadata (`interval`, `buffer_full`, `sync_write`, `operation`, `recall`, `eviction`, `shutdown`) |
 | `etcfuse_metadata_flush_failures_total` | Counter | `reason` | Flushes that did not publish (`error`, `rejected`, `fenced`, `device`) |
-| `etcfuse_flush_coalesced_runs` | Histogram | — | Buffered write runs merged into a single device write at flush. A median of 1 means the merge is firing on nothing, so buffering that data is buying no reduction in device operations |
-| `etcfuse_metadata_flush_duration_seconds` | Histogram | — | Latency of publishing deferred metadata |
 | `etcfuse_block_io_total` | Counter | `op` | Block device operations (`read`, `write`) |
 | `etcfuse_block_io_bytes_total` | Counter | `op` | Bytes transferred to and from the device |
 | `etcfuse_scrub_anomalies_total` | Counter | `type` | Anomalies found by the scrubber |

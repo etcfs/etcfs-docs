@@ -117,7 +117,8 @@ branch that has to stay correct.
 The dispatch layer is also where the cross-cutting concerns live, each applied
 once for every operation rather than per handler: the request deadline, the
 panic barrier that keeps one bad request from ending every mount the daemon
-serves, and the operation counters and latency histogram.
+serves, the operation counters and latency histogram, and the history record
+every operation is written to.
 
 Payload bounds are not declared in the table. Every handler decodes through the
 bounded reader in the same file, which refuses to read past the payload it was

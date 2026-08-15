@@ -291,9 +291,9 @@ part worth recording.** A provisioned volume meters I/O *operations per
 second*; it does not cap how many may be outstanding. Issuing 46 operations
 concurrently still spends 46 of the second's budget, so parallelism hides
 latency and buys no rate. For small scattered writes there was no rate to buy
-back in the first place: the metric added for this (`etcfuse_flush_coalesced_-
-runs`) showed a mean of 1.20 runs merged per I/O, 96.6% of them merging nothing
-at all. A random overwrite frees a scattered block per write and reallocates
+back in the first place: a histogram added to measure it — since removed, along
+with the rest of the tuning instrumentation — showed a mean of 1.20 runs merged
+per I/O, 96.6% of them merging nothing at all. A random overwrite frees a scattered block per write and reallocates
 out of exactly those holes, so its runs are never adjacent and the merge cannot
 fire. Buffering was converting steady latency into a burst and returning
 nothing.

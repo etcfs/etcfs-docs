@@ -95,7 +95,7 @@ nav:
           - Dual-Confirmed External Fencing (2026-08-05): reports/chaos-reports/2026-08-05-external-fencing-detach.md
           - Fuzz, Fencing Retry, Arena, NVMe (2026-08-10): reports/chaos-reports/2026-08-10-fuzz-fencing-retry-arena-nvme.md
       - Benchmark Reports:
-          - IOPS Ceiling, EFS Throughput Modes, Contention (2026-08-11): reports/benchmark-reports/2026-08-11-iops-ceiling-efs-throughput-contention.md
+          - EtcFS vs. JuiceFS, GlusterFS, GFS2, NFS (2026-08-15): reports/benchmark-reports/2026-08-15-etcfs-vs-juicefs-gluster-gfs2-nfs.md
       - CSI Reports:
           - EKS CSI Driver Validation (2026-08-12): reports/csi-reports/2026-08-12-eks-csi-driver-validation.md
   - Background:
