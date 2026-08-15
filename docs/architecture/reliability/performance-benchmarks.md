@@ -189,6 +189,25 @@ which also covers EFS provisioned-throughput mode (the fixed-budget analogue
 of `io2`'s `--iops`, since bursting mode has no such stated ceiling) and
 multi-node contention on a single shared file.
 
+## Comparison against other network filesystems
+
+`scripts/bench/compare/` runs the same fio job against EtcFS, JuiceFS,
+GlusterFS, GFS2 and self-hosted NFS (not EFS — that's the suite above), each
+on its own isolated 3-node cluster with a dedicated 1000-IOPS io2 Multi-Attach
+volume, torn down after its run. `bench-<backend>.sh` runs one backend
+standalone; `run-all.sh` runs all five and writes a combined
+`benchmark-results/compare/report.md` via `report.sh`. Each backend runs its
+real deployment shape rather than being forced onto one shared volume: etcfs
+and GFS2 (Red Hat's shared-disk cluster filesystem, the closest real
+competitor to etcfs's own model) both mount the cluster's raw Multi-Attach
+volume directly from all three nodes, NFS formats and serves it from one
+node, JuiceFS backs Redis metadata + a MinIO object store with it, and
+GlusterFS — which replicates across independent per-node storage, not one
+shared device — gets its own separate 1000-IOPS volume per node instead (see
+`compare_create_local_volumes` in `compare-lib.sh`). GFS2 runs on Amazon
+Linux 2 rather than this suite's usual AL2023, since AL2023 dropped the
+gfs2-utils/dlm/corosync packages it needs.
+
 ## At the device ceiling: cached metadata and deferred publication
 
 A further re-run (`benchmark-etcfs.sh`, 60 s per job, same 3-node shape,
