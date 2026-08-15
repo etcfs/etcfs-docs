@@ -225,7 +225,7 @@ stale read needs the session to be gone, and the session being gone is what
 clears the cache.
 
 The kernel's own caching of file data is now governed by the same lock. An open
-is answered with `keep_cache = 1` and `direct_io = 0` when this node can
+— or a create, which hands back an open descriptor — is answered with `keep_cache = 1` and `direct_io = 0` when this node can
 guarantee it will be able to take those pages back — which means page caching is
 enabled and a client is connected to carry the invalidation — and the daemon
 issues `FUSE_NOTIFY_INVAL_INODE` and waits for it before yielding the key. So a

@@ -62,7 +62,13 @@ The `mode` is the file type and permissions from the kernel. The `flags` are the
    - **Comparison 1:** `CreateRevision(dirent:parent/name) == 0` — the name must not already exist.
    - **Comparison 2:** `CreateRevision(inode:ino) == 0` — the inode number must not already be allocated.
    - **Success:** Create the dirent key and the inode key atomically.
-3. Return the new inode's metadata in the entry response format.
+3. Return the new inode's metadata in the entry response format, with the open descriptor's caching decision appended:
+
+```
+[i32:error] [u64:ino] [attr: 72 bytes] [u32:entry_timeout] [u32:attr_timeout] [u32:keep_cache]
+```
+
+The `keep_cache` flag is decided exactly as it is for OPEN — a create hands back an open descriptor, so it is answered by the same rule, and the C side sets `fi->keep_cache` and clears `fi->direct_io` only when it is set. See [FUSE Cache Management](fuse-cache-management.md#data-page-cache).
 
 ### Error Semantics
 
@@ -84,7 +90,7 @@ If the transaction fails because the inode number was claimed by a concurrent op
 
 MKDIR creates a new directory with the same structure as CREATE but with `S_IFDIR` mode and an initial `nlink` of 2 (representing `.` and `..`). The directory size is initialised to 4096 bytes (one block) by convention — this is a placeholder, as directories in EtcFS do not have a meaningful size.
 
-The IPC payload and response format are identical to CREATE, minus the open flags. The `umask` is applied to the mode, and the caller's `uid`/`gid` become the directory's owner. The handler calls `AtomicCreateDir` instead of `AtomicCreateFile`.
+The IPC payload is identical to CREATE minus the open flags, and the response is the plain entry format — a directory is not opened by the operation that creates it, so there is no `keep_cache` to answer. The `umask` is applied to the mode, and the caller's `uid`/`gid` become the directory's owner. The handler calls `AtomicCreateDir` instead of `AtomicCreateFile`.
 
 ## Deletion (UNLINK, RMDIR)
 

@@ -44,7 +44,7 @@ Attributes are not invalidated proactively. A directory mutation on another node
 
 ## Data Page Cache
 
-The kernel may hold an inode's file data across reads, so a re-read of recently read bytes costs no FUSE upcall at all. This is off for every open unless the daemon says otherwise: the reply to OPEN carries a flag, and the C side sets `keep_cache` and clears `direct_io` only when it is set.
+The kernel may hold an inode's file data across reads, so a re-read of recently read bytes costs no FUSE upcall at all. This is off for every open unless the daemon says otherwise: the reply to OPEN carries a flag, and the C side sets `keep_cache` and clears `direct_io` only when it is set. CREATE hands back an open descriptor too, so its reply carries the same flag and is answered by the same rule.
 
 The daemon decides rather than the C side because only the daemon knows whether it can take the pages back. It says yes when:
 
