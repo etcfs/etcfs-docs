@@ -298,7 +298,11 @@ properties a future change to this file must not reintroduce):
    compares the lease its key was written under against the session's current
    lease before trusting a cached key, so a partitioned node stops answering
    from its caches within the lock session's TTL rather than continuing until
-   the self-fencing watchdog fires.
+   the self-fencing watchdog fires. It does not have to wait for an operation
+   to reach that comparison, either: a watcher on the session drops every
+   cache written under a lease the moment that lease ends. It is scoped to the
+   dead lease, because by then an operation may already have granted a new
+   session and re-acquired an inode under it, and that entry's key is live.
 5. **No lock decision is ever made from a read.** Whether a lock can be taken
    is decided inside `AcquireLock`'s transaction, atomically with taking it.
    `GetLockInfo` and `IsLocked` exist for tooling and are marked observation
@@ -336,8 +340,9 @@ the gap.
 
 **A flush landing after the lock is gone.** The buffer's whole risk is that it
 outlives the right to publish it. Three things stand in the way, in order:
-`ensureLockKey` discards it the moment it notices the session's lease has
-changed; the flush's comparison names this node's own lock key by exact holder
+the session watcher discards it as soon as the lease ends, and
+`ensureLockKey` discards it in any case the moment an operation notices the
+lease has changed; the flush's comparison names this node's own lock key by exact holder
 token, so etcd rejects a transaction from a node whose key a peer has replaced;
 and the fencing guard rejects it if the node has been fenced. A rejected flush
 publishes nothing at all — publication is one transaction — so its blocks go

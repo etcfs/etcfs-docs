@@ -144,11 +144,18 @@ believe it holds a lock it does not. This is the standard lease caveat and it
 predates the caching work; what caching changed is that the node can now serve
 from RAM while it believes it, rather than failing at etcd.
 
-Two properties bound it:
+Three properties bound it:
 
 **The check is on the operation path, not a timer.** `ensureLockKey` validates
 before any cached key is trusted, so a process paused past its lease serves
 nothing while paused and revalidates before its first operation on resuming.
+
+**The loss is also acted on the moment it happens.** A watcher on the lock
+session drops every cache written under a lease as soon as that lease ends,
+rather than leaving each inode to be noticed by the next operation to touch
+it. It matters most for buffered writes: until the loss is acted on, the node
+keeps acknowledging writes into a buffer whose publication is certain to be
+rejected.
 
 **The check compares lease identity, not liveness.** A dead session is
 replaced lazily by the next acquisition on any inode, so "a session is alive"
