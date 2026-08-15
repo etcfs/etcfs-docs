@@ -20,9 +20,26 @@ etcfsctl [flags] <command> [args]
 | `fsck` | Run the offline filesystem checker. |
 | `scrub` | Run one scrub pass and report anomalies. |
 | `fence <node-id>` | Record a fence intent for a departed node. |
-| `quota` | Report usage against every quota root. |
-| `quota set <ino> --bytes=N --inodes=N` | Make a directory a quota root. |
+| `quota` | Report usage against every quota root. Advisory: see below. |
+| `quota set <ino> --bytes=N --inodes=N` | Make a directory a quota root. Advisory: see below. |
 | `quota clear <ino>` | Remove a quota root. |
+
+## Quotas are advisory
+
+A quota records a limit and `etcfsctl quota` reports usage against it. Nothing
+rejects a write for exceeding one: there is no enforcement on the write or
+create path, and a subtree may run past its limit until someone looks.
+
+That is a deliberate trade rather than a gap. An inode records no parent, so
+charging a write to its enclosing quota root as it happens would need either a
+parent pointer on every inode — a second source of truth to keep consistent
+with the directory entries — or another Raft round trip in the transaction that
+publishes the write. The write path is already bound by how many round trips it
+makes, and a policy limit is not worth paying that on every write. Usage is
+therefore as of the last time the report was run.
+
+Both `quota set` and `quota` print a note saying so, so a limit that rejects
+nothing is not mistaken for one that does.
 
 ## Flags
 

@@ -52,11 +52,13 @@ interchangeable in what they guarantee.
 
 ## Quotas
 
-Soft per-subtree quotas — a directory becomes a quota root with a byte
-and/or inode ceiling; usage is computed by `pkg/quota` and enforced at the
-next mutating operation under that root, not inline — see
-`docs/architecture/metadata/metadata-schema.md` for why soft. Configured
-live via `etcfsctl`, not a daemon flag:
+Advisory per-subtree quotas — a directory becomes a quota root with a byte
+and/or inode ceiling, and `pkg/quota` computes usage against it when the report
+is run. No write or create is rejected for exceeding a limit; charging a write
+to its enclosing root inline would cost a parent pointer on every inode or
+another Raft round trip on the write path, and neither is worth paying for a
+policy limit. See [etcfsctl](etcfsctl.md#quotas-are-advisory). Configured live
+via `etcfsctl`, not a daemon flag:
 
 ```bash
 etcfsctl quota set <inode> --bytes=10737418240 --inodes=100000   # 10 GiB, 100k inodes
