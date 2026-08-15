@@ -141,7 +141,11 @@ And the corresponding response — the *entry response*, shared by LOOKUP, MKDIR
 
 The `attr` field is a compact binary representation of the inode metadata: inode number, size, blocks, timestamps (seconds + nanoseconds), mode, nlink, uid, gid, rdev, and blksize — 72 bytes total, mirroring the `InodeRecord` layout in the metadata store but with nanoseconds split out for kernel compatibility. `entry_timeout` is how long the kernel may cache the name-to-inode mapping; `attr_timeout` how long it may cache the attributes.
 
-This layout is written in exactly two places — `buf.wAttr` on the Go side and `rb_attr` in `pkg/fuse/ops.c` — and a width test pins the two together. It is described here and referenced elsewhere rather than transcribed, because three copies of a byte layout is three things to update when a field moves.
+This layout is written in exactly two places — `buf.wAttr` on the Go side and `rb_attr` in `pkg/fuse/ops.c` — and it is described here and referenced elsewhere rather than transcribed, because three copies of a byte layout is three things to update when a field moves.
+
+Every fixed-width reply is pinned from both sides: `TestFixedWidthRepliesMatchTheCDaemon` measures what the daemon writes, and `test_fixed_reply_widths_match_the_daemon` in `test/c/test_ops.c` asserts what the C parser consumes, both against the same absolute byte counts. The two encoders never meet except at run time, so a field added on one side alone would otherwise show up as a parser reading the next reply's bytes rather than as a failure. Variable-length replies (READ, READDIR, READDIRPLUS, READLINK, the xattr pair) are excluded on purpose: their length rides in the frame and the reader is bounded, so a mismatch is a short read rather than a desynchronised stream.
+
+On the C side each handler's exchange goes through `ipc_call`, which sends the request, answers `EIO` if the socket failed, and answers the daemon's errno if it returned one — the three blocks that used to open all twenty-odd handlers, each one a chance to leak the response buffer on one path or reply twice on another. Handlers whose reply is nothing but an errno use `ipc_reply_status`, which is the whole operation.
 
 ## Socket I/O
 
