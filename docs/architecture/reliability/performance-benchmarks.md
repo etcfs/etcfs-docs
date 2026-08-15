@@ -183,11 +183,7 @@ exactly on — the bottleneck is no longer per-write RPC count in the way it
 was at the 100-105 baseline, but it has not become device-bound either; the
 extent read named in [Lock Caching and Recall](../metadata/lock-caching.md)
 as the next round trip on the list is the next thing worth measuring in
-isolation. See
-[Benchmark Reports: IOPS Ceiling, EFS Throughput Modes, Contention (2026-08-11)](../../reports/benchmark-reports/2026-08-11-iops-ceiling-efs-throughput-contention.md),
-which also covers EFS provisioned-throughput mode (the fixed-budget analogue
-of `io2`'s `--iops`, since bursting mode has no such stated ceiling) and
-multi-node contention on a single shared file.
+isolation.
 
 ## Comparison against other network filesystems
 
