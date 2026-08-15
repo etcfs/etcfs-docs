@@ -150,7 +150,9 @@ All socket operations are blocking `write()` and `read()` calls, wrapped in retr
 
 Both functions assume the socket is reliable (Unix stream socket, local machine). There is no message framing beyond the explicit length prefixes — the length fields in the headers tell the reader exactly how many bytes to expect.
 
-If the socket breaks (EOF, EPIPE, ECONNRESET), the IPC function returns -1, the handler calls `fuse_reply_err(req, EIO)`, and the FUSE daemon continues running. The Go daemon must be restarted to re-establish the connection.
+If an exchange fails for any reason — EOF, EPIPE, ECONNRESET, a response frame longer than the cap, or a peer that stops sending mid-frame — `ipc_sync()` closes the thread's connection through `etcfs_ipc_drop()` and returns -1; the handler calls `fuse_reply_err(req, EIO)`. Dropping the connection covers both failures at once: a broken stream and a desynchronised one are indistinguishable from this side, and reading the tail of an abandoned reply as the next request's header would be worse than reconnecting. The next request from that thread opens a fresh connection, so a Go daemon restart costs one EIO per worker rather than leaving the mount permanently broken.
+
+The failed request itself is never retried transparently. A request that has been written may already have been applied before the daemon went away, and not every operation is idempotent, so the error is surfaced and the retry decision left to the caller. `SIGPIPE` is ignored process-wide for the same reason the reconnect exists: its default action would kill the mount on the first write to a dead socket.
 
 ## Error Handling
 
