@@ -155,6 +155,21 @@ If the CAS fails due to concurrent contention (another node acquired an arena be
 
 In practice, arena acquisition contention is extremely rare because it happens only once per GiB of writes per node. With a 3-node cluster writing at full speed, arena acquisitions occur every ~10 seconds (at 300 MiB/s aggregate throughput), with a very low probability of collision.
 
+### Device Size
+
+The allocator refuses an arena whose range would end past the device (`SetDeviceSize`), which is the only thing standing between an arena ID and a write past the end of the volume.
+
+That size is read from the device at startup, but it is not fixed for the life of the process: a shared volume can be grown while every node stays mounted, and an EBS volume is routinely resized that way. So when `AcquireArena` fails with `ErrNoSpace`, the service re-reads the size (`blockio.Device.RefreshSize`) and retries once if the device turned out to be larger. Nothing polls: a filesystem that is not full never pays for the ioctl, and a filesystem that is full is by definition about to ask. A size that comes back *smaller* is ignored — shrinking a volume under a live filesystem is not supported, and honouring the smaller number would strand arenas already in use.
+
+### Reported Free Space
+
+`statfs` — what `df` prints — has to answer for the whole device, but the two halves of the answer are known in different places:
+
+- **Unclaimed space** is a cluster-wide fact. Counting the `arena:<node_id>/<arena_id>` records gives the arenas owned by anyone, and everything past them is space no node can be writing into. Arenas in the `free_arena:` pool are not counted: they have no owner and any node may claim one.
+- **Free space inside an arena** is known only to that arena's owner, because the bitmap is in-memory and per-node. Only this node's own slack can be added.
+
+The result under-reports: another node's unused space inside its own arenas is counted as used. That is a deliberate choice of which way to be wrong, and it is one direction rather than two. Deriving the whole figure from this node's occupancy — scaling the device size by the local `LiveRatio`, which is what this used to do — was wrong in both directions at once: it reported a nearly empty device as full whenever this node's own arenas filled, and a nearly full one as empty whenever they happened to be free.
+
 ## Block Allocation
 
 When a FUSE WRITE operation needs disk blocks, it calls `Allocate(size)` on the allocator:
