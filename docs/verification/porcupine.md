@@ -318,15 +318,18 @@ system:
 
 ## Results
 
-Full docker chaos suite (`chaos-test-single-cluster.sh docker all`, all seven
-scenarios back to back — daemon SIGKILLs, a network partition, a
-generation-bump fence, a 3-node crash, a mid-write crash, plus a directory
-listing on every node so the readdir checks are exercised): 169 recorded
-operations across 3 nodes, decoded into 39 namespace operations, 33 extent
-operations, 44 lock events and 11 guarded commits — every model
-**consistent**. S5 is the one worth noting: it bumps `n1`'s fencing generation
-mid-run and confirms the next write is blocked, so the generation model is
-checked against a real fence, not only the synthetic ones in its unit tests.
+Full docker chaos suite (`chaos-test-single-cluster.sh docker all`, all
+thirteen scenarios back to back — daemon SIGKILLs, a network partition, a
+generation-bump fence, a 3-node crash, a mid-write crash, a directory listing
+on every node so the readdir checks are exercised, plus S8-S13 for the
+caching work: cross-node contention on one inode, a crash with a full write
+buffer, lease loss under sustained write load, flush failure injection, a
+recall storm, and read-after-recall with the page cache on): 20/20
+assertions passed, every model **consistent** across 7/7 model runs. S5 is
+the one worth noting from the original seven: it bumps `n1`'s fencing
+generation mid-run and confirms the next write is blocked, so the generation
+model is checked against a real fence, not only the synthetic ones in its
+unit tests.
 
 End-to-end wiring is also checked against the compiled binaries directly, not
 only the Go test suite: `etcfuse-meta --history-log`, mounted through the real
@@ -334,11 +337,12 @@ C daemon, exercised from a shell — the recorded history checks clean against
 every model via `cmd/verify-history`.
 
 The models the caching work added — the fsync barrier and loss rules in the
-extent model, and the `lockkey`, `block` and `pagecache` checks — are so far
-checked by their own unit tests and by `cmd/verify-history` over recorded
-histories, not yet by a chaos run that contends two nodes on one inode or kills
-a node with a full write buffer. That run is what would exercise them properly,
-and it does not exist yet.
+extent model, and the `lockkey`, `block` and `pagecache` checks — are checked
+by their own unit tests, by `cmd/verify-history` over recorded histories, and
+now by S8-S13, which are exactly the contended-inode and killed-with-a-full-buffer
+run this section used to say did not exist. S8-S13 also now run against the
+AWS transport, not only docker — 20/20 assertions, `STATUS: ALL PASS`; see
+`docs/reports/chaos-reports/2026-08-15-caching-scenarios-on-aws.md`.
 
 ## Next
 

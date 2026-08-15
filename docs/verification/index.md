@@ -51,10 +51,14 @@ been done.
 What no column names is a cluster under load: the models check recorded
 histories and a specification, and neither will exercise two nodes contending
 for one inode, a node killed with a full write buffer, or a recall storm unless
-a chaos scenario produces one. Those scenarios are the outstanding half of this
-work: the chaos suite's scenarios (`scripts/test/chaos-*.sh`) still predate the
-caching, and the contended, killed-mid-buffer and recall-storm cases are not
-among them.
+a chaos scenario produces one. `scripts/test/chaos-test-single-cluster.sh`
+now carries these as S8 (cross-node contention), S9 (crash with a full
+buffer), S10 (lease loss under sustained write load), S11 (flush failure
+injection), S12 (recall storm), and S13 (read-after-recall with the page
+cache on), runnable against both the docker and the AWS transport. What is
+still outstanding is feeding their histories into the models above — the
+scenarios exist and pass, but the fsync-barrier and page-cache checks in the
+table are not yet wired to a history one of them produced.
 
 ## Consistency models, and why one checker is not enough
 

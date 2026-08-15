@@ -20,7 +20,7 @@ EtcFS operates with three cache layers, each at a different boundary:
 
 1. **Kernel VFS cache** — maintained by the Linux kernel for all filesystems. Caches dentries (name-to-inode mappings), inode attributes, and page-cache data. Controlled by the `entry_timeout`, `attr_timeout`, and `negative_timeout` parameters returned in FUSE reply messages.
 
-2. **FUSE daemon-side caches** (not yet implemented) — inode cache and extent cache maintained in the Go daemon's memory. These avoid etcd round-trips for frequently accessed metadata. Currently, every LOOKUP and GETATTR hits etcd directly.
+2. **FUSE daemon-side caches** — inode record and extent list cached in the Go daemon's memory (`internal/ipc/lockcache.go`), valid only while this node holds the inode's lock. Reads and LOOKUP/GETATTR are served from this cache with zero etcd round-trips; the cache is invalidated on recall, eviction, or a mode change, all funnelled through `releaseKeyLocked`.
 
 3. **etcd-side cache** — the etcd cluster itself maintains an in-memory B-tree index. A serializable read from a follower can return slightly stale data with lower latency than a linearizable read through the leader.
 
