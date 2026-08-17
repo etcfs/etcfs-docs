@@ -96,6 +96,19 @@ nav:
           - Fuzz, Fencing Retry, Arena, NVMe (2026-08-10): reports/chaos-reports/2026-08-10-fuzz-fencing-retry-arena-nvme.md
       - Benchmark Reports:
           - EtcFS vs. JuiceFS, GlusterFS, GFS2, NFS (2026-08-15): reports/benchmark-reports/2026-08-15-etcfs-vs-juicefs-gluster-gfs2-nfs.md
+          - Cross-Node Handoff (2026-08-16): reports/benchmark-reports/2026-08-16-cross-node-handoff.md
+          - Node-Kill Recovery (2026-08-16): reports/benchmark-reports/2026-08-16-node-kill-recovery.md
+          - Metadata Under Concurrency (2026-08-16): reports/benchmark-reports/2026-08-16-metadata-concurrency.md
+          - Small-File Metadata Storm (2026-08-16): reports/benchmark-reports/2026-08-16-smallfile-storm.md
+          - Single-Node Ceiling (2026-08-16): reports/benchmark-reports/2026-08-16-single-node-ceiling.md
+          - Deep Directory Walks (2026-08-16): reports/benchmark-reports/2026-08-16-deep-directory-walks.md
+          - fsync-Heavy Small Writes (2026-08-16): reports/benchmark-reports/2026-08-16-fsync-heavy-writes.md
+          - etcd Degraded (2026-08-16): reports/benchmark-reports/2026-08-16-etcd-degraded.md
+          - Node-Count Scaling Curve (2026-08-16): reports/benchmark-reports/2026-08-16-node-count-scaling.md
+          - Join Latency (2026-08-17): reports/benchmark-reports/2026-08-17-join-latency.md
+          - Leave and Rejoin Under Load (2026-08-17): reports/benchmark-reports/2026-08-17-leave-and-rejoin-under-load.md
+          - Online Volume Growth (2026-08-17): reports/benchmark-reports/2026-08-17-online-volume-growth.md
+          - Arena Fragmentation Soak (2026-08-17): reports/benchmark-reports/2026-08-17-arena-fragmentation-soak.md
       - CSI Reports:
           - EKS CSI Driver Validation (2026-08-12): reports/csi-reports/2026-08-12-eks-csi-driver-validation.md
   - Background:
