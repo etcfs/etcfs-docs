@@ -63,6 +63,7 @@ own latency.
 | `etcfuse_fuse_op_duration_seconds` | Histogram | `op` | End-to-end handler latency |
 | `etcfuse_etcd_txn_total` | Counter | `outcome` | etcd transactions, by outcome (`committed`, `rejected`, `error`) |
 | `etcfuse_metadata_cache_total` | Counter | `result` | Data-path metadata lookups, by whether the lock-held snapshot answered them (`hit`, `miss`) |
+| `etcfuse_readdir_page_total` | Counter | `result` | READDIR pages, by whether the listing resumed where the last reply stopped (`resumed`) or had to re-read the directory from the start (`rescanned`) |
 | `etcfuse_pending_extents` | Gauge | — | Metadata keys written by acknowledged writes and not yet published to etcd |
 | `etcfuse_pending_bytes` | Gauge | — | Acknowledged write payload those keys stand for, summed across every inode |
 | `etcfuse_metadata_flush_total` | Counter | `trigger` | Publications of deferred metadata (`interval`, `buffer_full`, `memory_pressure`, `sync_write`, `operation`, `recall`, `eviction`, `shutdown`) |

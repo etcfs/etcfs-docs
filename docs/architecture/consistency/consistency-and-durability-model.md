@@ -125,11 +125,21 @@ write after it is impossible while this node holds the lock.
 
 - **Attributes and directory entries.** `getattr`, `lookup`, `readdir`, statfs
   and xattr read etcd linearizably. On a partition they *fail* rather than
-  answer stale. But the kernel above them may answer `stat()` from its own
-  cache for `attr_timeout`, so another node's view of a file's size lags
-  independently of any of this. The one value taken from local state is the
-  size of an inode this node is currently writing, which etcd is behind on by
-  up to the flush interval — see [below](#durability-under-write-delegation).
+  answer stale. But the kernel above them may answer from its own caches, so
+  another node's view lags independently of any of this:
+  - `stat()` for `attr_timeout`, which nothing invalidates — no watch covers
+    an inode's own attributes, so a peer's write or `chmod` becomes visible
+    only when that timeout expires.
+  - a name's existence *or absence* for `entry_timeout`. A confirmed absence
+    is cached exactly as long as a confirmed presence; both are evicted by the
+    cluster-wide dirent watch, typically within one etcd round trip.
+  - a whole directory listing, until that same watch invalidates it or the
+    parent directory's mtime moves. A listing is not atomic against concurrent
+    creates and unlinks, and nothing pins it to one etcd revision.
+
+  The one value taken from local state is the size of an inode this node is
+  currently writing, which etcd is behind on by up to the flush interval —
+  see [below](#durability-under-write-delegation).
 - **Cross-file consistency.** Each inode is independently consistent. There is
   no snapshot across several inodes, and namespace operations are separate
   transactions.
@@ -466,7 +476,7 @@ Current behaviour unless marked planned.
 | Question | Answer |
 |---|---|
 | Are file-content reads linearizable? | Yes, while the lock session's lease holds |
-| Are `stat`/`lookup`/`readdir` linearizable? | Reads of etcd are; the kernel may answer from its own cache for `attr_timeout` |
+| Are `stat`/`lookup`/`readdir` linearizable? | Reads of etcd are; the kernel may answer `stat` from its own cache for `attr_timeout`, a name's existence or absence for `entry_timeout`, and a directory listing until the watch invalidates it or the parent's mtime moves |
 | Can a read be served from this node's kernel page cache? | Only for an inode this node holds a lock on; the pages go before the lock does |
 | Can a read return another file's bytes? | No — arena ownership confines reclamation; one narrow scrubber window remains |
 | Can a lock be granted from a stale view? | No — acquisition is a transaction, never a read |

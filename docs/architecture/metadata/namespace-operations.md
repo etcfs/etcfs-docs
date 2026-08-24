@@ -130,9 +130,15 @@ For cross-directory renames, every key is in the same transaction. Etcd serialis
 
 Directory listings use etcd's prefix-range scan over `dirent:<parent>/`. The lexicographic order of etcd keys means entries are naturally ordered by name, which matches POSIX expectations.
 
-For large directories (100,000+ entries), the paginated listing method is essential. It uses etcd's `WithRange` and `WithLimit` to fetch pages of configurable size, with a cursor-based offset. Each page includes a revision number that can be passed to subsequent pages to maintain a consistent snapshot — entries added or removed during the listing are invisible to the reader, producing a stable directory view.
+A FUSE `readdir` asks for a *position* — "skip the first N names" — and etcd cannot skip. A range starts at a key, so serving position N by reading means reading the N keys before it and discarding them, and a listing that does that once per page reads the whole directory once per page. That is quadratic in directory size, and measurably so: a 5,000-entry directory took 209 readdirplus calls and just under three seconds, having read a million entries out of etcd to return five thousand.
 
-The `ReadDir` FUSE operation uses this pagination to stream directory entries to the kernel. Each FUSE `readdir` call may fetch one or more pages from etcd, depending on the kernel's buffer size.
+What makes paging possible is that a scan is sequential — the offset a `readdir` asks for is the one the previous reply ended on. The daemon remembers the last name it handed out for a directory and answers a request continuing from exactly there with `ListDirentsAfter`, an etcd range starting after that name with `WithLimit` sized to the kernel's buffer. One scan then costs one pass over the directory however many pages it takes; the same 5,000-entry listing does one full read instead of 209.
+
+Anything that does not continue the previous reply — a `seekdir`, a second process scanning the same directory, a scan paused past the cursor's lifetime — misses and falls back to reading the directory and counting from the start, which is what every request did before. A miss is slow, never wrong.
+
+The cursor holds a *name*, not directory contents. It is used as the start of a fresh linearizable range read, so a stale cursor cannot produce a stale listing: the worst it can do is begin the page in the wrong place, and only in the way a position already can, since names inserted or removed behind a scan shift it either way. POSIX leaves the behaviour of a directory modified during a scan unspecified for exactly this reason. There is deliberately **no** revision pinning: pages are not a snapshot of one etcd revision, and a listing is not atomic against concurrent creates and unlinks.
+
+`etcfuse_readdir_page_total` counts pages by whether they resumed or had to re-read, which is how an operator sees a workload defeating the cursor.
 
 ## Extent Maps
 

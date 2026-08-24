@@ -22,7 +22,7 @@ The read-only FUSE operations are the ones that allow applications to discover a
 |---|---|---|---|
 | LOOKUP | `fuse_reply_entry` | `LookupDirent` + `GetInode` | Resolve a name to an inode |
 | GETATTR | `fuse_reply_attr` | `GetInode` | Return inode metadata |
-| READDIR | `fuse_reply_buf` | `ListDirents` | List directory contents |
+| READDIR | `fuse_reply_buf` | `ListDirentsAfter` (`ListDirents` on a cursor miss) | List directory contents |
 | READLINK | `fuse_reply_readlink` | `Get` (symlink key) | Return symlink target |
 | STATFS | `fuse_reply_statfs` | N/A (synthetic) | Return filesystem statistics |
 | OPEN | `fuse_reply_open` | None | Acknowledge file open |
@@ -106,7 +106,13 @@ The `offset` is a cookie from a previous READDIR response indicating where to re
 
 ### Processing
 
-The Go backend calls `ListDirents(ino)`, drops the entries the kernel already has — the cookie of an entry is its 1-based position, so the offset is the count already returned — and keeps only as many of the rest as the kernel's buffer can hold. At least one entry is always returned, because an empty reply is how a listing ends.
+The offset is a *position*, and etcd cannot skip to one: a range starts at a key. Reading position N by counting means reading the N keys before it and discarding them, so a listing that does that once per page reads the whole directory once per page — quadratic in directory size, and measured at three seconds for a 5,000-entry directory.
+
+A scan is sequential, so the daemon remembers the last name it handed out for a directory. A request continuing from exactly there is answered by `ListDirentsAfter`, an etcd range starting after that name with a limit sized to the kernel's buffer, and one scan then costs one pass over the directory however many pages it takes. Anything that does not continue the previous reply — a `seekdir`, a second process scanning the same directory, a cursor that has expired — falls back to `ListDirents(ino)` and counting from the start, which is what every request did before. A miss is slow, never wrong.
+
+Either way the page is trimmed to what the kernel's buffer can hold, from the names actually read. At least one entry is always returned, because an empty reply is how a listing ends.
+
+The cursor holds a name, not directory contents: it is the start of a fresh linearizable range read, so a stale one cannot produce a stale listing. See [Directory Listing](../metadata/namespace-operations.md#directory-listing).
 
 The inode records for that page are fetched in a single batched transaction rather than one `Get` per entry, which is what made a listing of a thousand-file directory a thousand sequential etcd round trips, repeated on every `ls`. Each record supplies the entry's dirent type (DT_REG, DT_DIR, DT_LNK), which the kernel needs to populate `d_type` in `struct dirent`.
 
