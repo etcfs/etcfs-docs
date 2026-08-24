@@ -7,6 +7,7 @@ The distributed component that watches cluster membership, detects node failures
 - [Design Rationale](#design-rationale)
 - [Controller Architecture](#controller-architecture)
 - [Membership Watch](#membership-watch)
+- [Intentional Departure](#intentional-departure)
 - [Fence Protocol](#fence-protocol)
 - [Dual-Confirmation Model](#dual-confirmation-model)
 - [Generation Bump](#generation-bump)
@@ -90,6 +91,8 @@ The controller calls `store.Watch(ctx, PrefixMembership, WithPrefix)` to watch t
 
 When a node starts, it creates a membership key bound to an etcd lease. When the node crashes or its lease expires, etcd deletes the key. The controller receives a DELETE event for `membership:<node_id>`.
 
+A DELETE on its own says nothing about *why* the key went: etcd's watch API reports an explicit `Revoke` and a lease that timed out identically. Distinguishing the two is what the departure marker below is for.
+
 ### Watch Reconnection
 
 If the watch channel is closed unexpectedly (etcd connection loss, compaction), the controller re-establishes it from the revision after the last event it observed:
@@ -105,9 +108,27 @@ A revision that has been compacted away cannot be resumed from, and retrying it 
 
 Reconnecting from "now" unconditionally instead silently dropped everything that happened during the gap. That mattered because a fence was only ever triggered by an event: a DELETE arriving in the reconnection window was fenced by nothing at all. Resuming from the last revision closes the routine case, and the authoritative sweep covers what remains — a revision compacted away, or a controller that was not running at the time.
 
+## Intentional Departure
+
+A node that shuts down on purpose is not fenced. Without this it was: every membership-key disappearance looked like a crash, so a node stopped with `SIGTERM` had its EBS volume detached out from under it and could not be restarted until an operator put the volume back.
+
+The departing node writes `departed:<node_id>`, and its peers skip the fence when they see it. Three things make that safe, none of which involves taking the node's word for anything.
+
+**It is atomic with leaving membership.** `MarkDeparted` is one transaction — `Put(departed:<node>)` together with `Delete(membership:<node>)`. A controller can therefore never observe the departure without already being able to see the marker, which is what removes the need for a grace window, and with it any dependence on clocks.
+
+**Only a live member can write one.** The transaction is conditioned on `membership:<node_id>` still existing. A node whose lease has already timed out is no longer a member and the comparison fails, so the node this whole protocol exists to contain — the partitioned one, the hung one — cannot come back and declare its departure intentional. It has no way to write itself an exemption.
+
+**The claim is checked, not believed.** Before honouring a marker the controller asks whether the cluster still records the node as owning any arena. A node that says it gave everything back while the records say otherwise has not, and is fenced exactly as it would have been. Both reads fail into fencing: fencing a node that left cleanly costs a detach and a manual reattach, while failing to fence one that did not is how two nodes end up writing to one arena.
+
+What the node does before writing the marker is the other half. `leaveCluster` runs only after the IPC server has stopped — a departing node is its own proof of quiescence, since no further write can be issued from it — and then gives back its cached locks, closes its lock session, and releases its arenas. Only if every arena actually came back is the departure announced; a partial release leaves the node recorded as an owner, and the only safe way for peers to reclaim that range is to fence it.
+
+The ordering is load-bearing rather than tidy. TLC breaks `ReleasedArenaHasNoLiveWriter` on a variant that publishes the marker from a node that gave its arenas back but has not stopped: the arena returns to the free pool while its previous owner can still write to it. Notably the arena check above does *not* catch that variant — the records are clean and the node is alive anyway — which is why quiescence has to come first rather than be inferred from the bookkeeping. See `specs/FencingDepartureNotQuiescent.cfg`.
+
+The marker describes one departure, not the node for ever: `Membership.grantAndRegister` deletes it as the node re-registers, alongside the stale fence intent and mark, so a node that leaves cleanly, comes back, and later dies badly is fenced like any other.
+
 ## Fence Protocol
 
-When the controller detects a DELETE event on a membership key, it executes the fence protocol:
+When the controller detects a DELETE event on a membership key for a node that did **not** announce an intentional departure, it executes the fence protocol:
 
 ### 1. Claim the Fence
 

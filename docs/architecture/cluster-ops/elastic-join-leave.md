@@ -134,7 +134,20 @@ Order matters: arenas are released before the membership key is deleted. This en
 
 The arena release makes the disk range available for other nodes to acquire. The blocks within the arena are not freed — only the ownership is transferred. The new owner of the arena can allocate from any blocks that were previously freed by the previous owner (or freed by truncation/deletion).
 
-After the membership key is deleted, the fencing controller's watch fires. In a graceful leave, the fencing controller should not fence the node because the node is already gone — but the controller's watch will still fire on the DELETE event. The controller checks the current generation before bumping; if the generation was not bumped by a concurrent fence, the controller does nothing (the node left cleanly, no fence needed).
+After the membership key is deleted, the fencing controller's watch fires — and a DELETE on its own says nothing about *why* the key went, because etcd reports an explicit lease `Revoke` and a lease that timed out identically. Every departure therefore used to be treated as a possible crash: a node stopped with `SIGTERM` had its device access severed on the way out and could not be restarted until an operator reattached the volume.
+
+What distinguishes the two is a marker the departing node writes, in the *same transaction* that deletes its membership key:
+
+```
+Txn:
+  If   CreateRevision("membership:<nodeID>") != 0
+  Then Put("departed:<nodeID>", <timestamp>)
+       Delete("membership:<nodeID>")
+```
+
+Peers skip the fence when they see it. It is trustworthy for reasons that do not involve believing the node: the transaction is atomic with leaving membership, so no controller can see the departure without the marker (no grace window, no clock); it is conditioned on the node still being a member, so one whose lease already timed out cannot go back and call its departure intentional; and the controller honours it only where the arena records agree that the node gave everything back. See [Intentional Departure](../fencing/external-fencing-controller.md#intentional-departure).
+
+The node writes it only after its IPC server has stopped and every arena has actually been returned — the ordering above is what the marker asserts, and a partial arena release means the node stays fenceable, because fencing is the only safe way for peers to reclaim a range it still owns.
 
 ## Ungraceful Leave
 
@@ -204,7 +217,7 @@ The membership subsystem interacts with fencing at three points:
 
 **Join fencing check.** Before acquiring resources, the joining node can check if it was previously fenced by reading `gen:<nodeID>`. If the generation is non-zero, the node was previously fenced. The join should still proceed — the fence is a historical record, not a permanent ban — but the generation counter must not be reset. The node starts with the same generation it had when it left.
 
-**Leave triggers fence watch.** When a node leaves gracefully, its membership key is deleted. The fencing controller's watch fires. The controller reads the generation and may attempt to bump it. In a graceful leave, the controller should recognise that the node left voluntarily (the application shut down, etc.) and should not initiate a full fence sequence. The distinction between graceful and ungraceful leave is determined by whether the fencing controller can still communicate with the node (graceful) or not (ungraceful).
+**Leave triggers fence watch.** When a node leaves gracefully, its membership key is deleted and the fencing controller's watch fires, exactly as it does for a crash. The controller tells the two apart by the `departed:<node_id>` marker described under [Graceful Leave](#graceful-leave) — not by whether it can still reach the node, which it cannot ask about a node that is already gone and could not trust the answer to if it could.
 
 **Crash recovery clears generation barrier.** When a crashed node restarts, its generation is whatever it was before the crash (possibly bumped by the fencing controller). The generation guard in metadata transactions uses the current generation. If the generation was bumped, the restarting node must ensure that all its pre-crash writes either completed their metadata commits (generation is not an issue) or were orphaned (generation guard prevented the commit, data is on the block device but not in etcd). The scrubber's generation consistency check detects any extent that was committed with a stale generation.
 

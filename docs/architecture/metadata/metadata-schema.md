@@ -31,6 +31,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 | `arena_alloc_log` | counter (8 bytes) | Global arena-ID allocation counter |
 | `membership:<node_id>` | membership metadata | Lease-backed liveness key for cluster membership |
 | `gen:<node_id>` | generation counter | Fencing epoch counter, bumped on confirmed fence |
+| `departed:<node_id>` | RFC3339 timestamp | Written atomically with the membership key's deletion; marks a departure as intentional so peers skip fencing |
 | `inode_alloc_counter` | counter (8 bytes) | Per-node inode-range reservation counter |
 | `extent:<ino>/<chunk>` | five comma-separated integers (ASCII) | One extent: a logical byte range of a file mapped onto the shared device |
 
@@ -55,6 +56,8 @@ That walk is why accounting is periodic rather than transactional, and the conse
 **Arena keys** own a contiguous 1 GiB range on the shared block device. Each node acquires arenas from a global free pool controlled by the `arena_alloc_log` counter. The key name includes the node ID to guarantee exclusive ownership.
 
 **Membership keys** are lease-backed liveness records. The presence of `membership:<node>` signals the node is alive and participating. Expiry of the backing lease triggers the fencing controller.
+
+**Departure keys** exist because that trigger cannot tell an intentional shutdown from a crash — etcd reports an explicit `Revoke` and a lease timeout as the same delete event. A node that is shutting down cleanly writes `departed:<node>` in the same transaction that removes its membership key, and its peers skip the fence. The transaction is conditioned on the membership key still existing, so a node whose lease has already expired cannot write one; it is dropped when the node registers again.
 
 **Generation keys** are the fencing epoch counter. The fencing controller bumps this value via a CAS transaction after confirming a node has been successfully fenced. Every metadata mutation that modifies extents checks this generation before committing.
 

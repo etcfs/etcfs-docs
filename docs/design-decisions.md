@@ -76,6 +76,34 @@ The mark is what makes (b) idempotent: the intent is gone after a fence, and a
 raised generation cannot distinguish this departure from an earlier one. It is
 cleared when the node is seen alive, so departures are fenced once each.
 
+## A departing node announces itself, and the announcement is checked
+
+*Options:* (a) leave every departure to be fenced, since etcd cannot tell an
+explicit `Revoke` from a lease timeout, (b) let a node write a "departing"
+marker that peers honour within a grace window, (c) write the marker in the
+same transaction that removes the node from membership, and honour it only
+where the cluster's own records agree.
+
+*Chosen:* (c). (a) is what the code did, and it meant a `SIGTERM` detached the
+node's volume: a clean scale-in cost an operator reattachment. (b) is the
+obvious fix and the one first sketched, but a grace window puts a clock in a
+fencing protocol, and the window has to be tuned against a partitioned node
+making the same claim.
+
+The transaction removes both problems. It is atomic with leaving membership, so
+no controller can observe the departure without already seeing the marker —
+there is nothing to wait for. It is conditioned on the membership key still
+existing, so a node whose lease has already expired cannot write one at all,
+which is exactly the node whose word is worth least. And the marker is honoured
+only when the arena records show the node gave everything back, so the claim is
+checked rather than believed.
+
+What the transaction cannot check is that the node actually stopped, so the
+ordering supplies it: the IPC server is down before anything is released, which
+is the same quiescence argument a confirmed fence otherwise has to establish
+from outside. TLC breaks `ReleasedArenaHasNoLiveWriter` on the variant that
+skips it.
+
 ## The generation check reports stamps from the future, not from the past
 
 Recording the writer's node ID in the extent makes the stamp comparable at all.

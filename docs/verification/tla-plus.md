@@ -101,6 +101,7 @@ exactly:
 | `FencingNoIncarnationCheck` | **off** | on | reliable | breaks `NoHealthyNodeSevered` |
 | `FencingNoGuard` | off | **off** | reliable | breaks `StaleWriteRejected` |
 | `FencingArenaBug` | on | on | none, **but reclaims arenas anyway** | breaks `ReleasedArenaHasNoLiveWriter` |
+| `FencingDepartureNotQuiescent` | on | on | reliable, **departure announced without stopping** | breaks `ReleasedArenaHasNoLiveWriter` |
 
 Three of these are worth reading past the pass/fail column:
 
@@ -111,6 +112,21 @@ deliberately broken — and the generation guard on, checking only
 after being fenced: the guard holds even when the layer above it fails, which
 is the design's central claim about why it has three independent layers and
 not one.
+
+**`FencingDepartureNotQuiescent` is what makes the departure ordering
+load-bearing.** A node that leaves on purpose is not fenced, which is safe only
+because it has already stopped serving before it gives anything back. This
+variant publishes the same departure marker from a node that returned its
+arenas but is still running and still believes it owns them — and the arena
+check the controller performs cannot see it, because the records are clean.
+TLC breaks `ReleasedArenaHasNoLiveWriter` at the departure itself: the arena is
+in the free pool while its previous owner can still write to it.
+
+The mutation was chosen after the obvious one proved nothing. Announcing a
+departure while *still recorded* as owning arenas is caught by the controller's
+own check, and a model of it passes — which is the right outcome, and the
+reason that variant is not the one checked in. The property worth a model is
+the one the bookkeeping cannot supply.
 
 **`FencingArenaBug` is the deliberate arena leak, checked rather than
 assumed.** `FencingNoFencer` passes: in single-signal mode nothing severs a
@@ -153,14 +169,15 @@ symmetry reduction is unsound for some temporal properties.
 
 | Configuration | Result |
 |---|---|
-| `Fencing` | pass, 115,232 states |
+| `Fencing` | pass, 127,126 states |
 | `Fencing3Nodes` | pass, 11,664,975 states |
-| `FencingNoFencer` | pass, 76,115 states |
-| `FencingUnreliableFencer` | pass, 1,020 states |
-| `FencingGuardIsBackstop` | pass, 1,211,154 states |
+| `FencingNoFencer` | pass, 86,185 states |
+| `FencingUnreliableFencer` | pass, 1,206 states |
+| `FencingGuardIsBackstop` | pass, 1,328,303 states |
 | `FencingNoIncarnationCheck` | counterexample found, as expected |
 | `FencingNoGuard` | counterexample found, as expected |
 | `FencingArenaBug` | counterexample found, as expected |
+| `FencingDepartureNotQuiescent` | counterexample found, as expected |
 
 `.github/workflows/ci.yml`'s `test-tla` job runs the 2-node models on every
 push and pull request.

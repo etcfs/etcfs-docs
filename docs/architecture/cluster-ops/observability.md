@@ -77,7 +77,7 @@ own latency.
 | `etcfuse_arenas_owned` | Gauge | — | Arenas currently owned by this node |
 | `etcfuse_membership_count` | Gauge | — | Live cluster members as last observed by this node |
 | `etcfuse_fencing_generation` | Gauge | — | This node's current fencing generation |
-| `etcfuse_fenced_nodes_total` | Counter | `outcome` | Nodes this node's controller fenced (`fenced`, `failed`) |
+| `etcfuse_fenced_nodes_total` | Counter | `outcome` | Departures this node's controller acted on (`fenced`, `failed`, `departed` — the last being an intentional leave that was not fenced) |
 
 Where each is updated:
 
