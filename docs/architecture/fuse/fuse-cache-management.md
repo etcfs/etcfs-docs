@@ -80,7 +80,15 @@ The kernel drops a cached listing when the directory's `i_version` moves or its 
 - every dirent change anywhere in the cluster arrives as an `INVAL_ENTRY`, and the kernel's handling of one bumps the parent's `i_version`;
 - every create and unlink also moves the parent directory's `mtime` in etcd, so a node that never received the notification still drops the listing once the parent's attributes expire.
 
-The second is why this does not depend on the notification path being healthy — the staleness of a listing is bounded by `attr_timeout` in the worst case rather than being unbounded — and it is also why the root directory is excluded. Root has no inode record; its attributes are synthesised by the C daemon with a fixed `mtime`, so a cached listing of it would have only the notification to invalidate it. Root is listed uncached, and every directory below it is cached.
+The first makes invalidation prompt. The second is the fail-safe for a notification that never arrives, and it is worth being precise about what it depends on, because it is the only thing bounding how long a cached listing can be wrong:
+
+- The kernel re-reads the directory's `mtime` only when a listing is requested **from offset 0** and only when **`FUSE_AUTO_INVAL_DATA`** was negotiated (`fuse_readdir_cached` gates the refresh on `fc->auto_inval_data`). EtcFS requests that flag explicitly in its `init` handler rather than relying on libfuse's default, and if the kernel does not offer it, `opendir` stops setting `FOPEN_CACHE_DIR` at all — an uncached listing is better than a cached one with nothing to bound it.
+- The re-read is still served from the attribute cache while that is valid, so the bound is `attr_timeout`, not zero.
+- `touchDir` is best-effort: it runs in a transaction after the one that changed the namespace, and its failure is logged rather than returned. A create whose `touchDir` failed leaves the parent's `mtime` unmoved, so for that change the fail-safe does not fire and the notification is the only invalidation.
+
+So the honest statement is: a cached listing is invalidated within an etcd round trip in the normal case, within `attr_timeout` if the notification was lost, and — in the compound case where the notification was lost *and* that change's `touchDir` also failed — until the next change that moves the `mtime`.
+
+Root is excluded for the same reason. It has no inode record; its attributes are synthesised by the C daemon with a fixed `mtime`, so a cached listing of it would have only the notification to invalidate it. Root is listed uncached, and every directory below it is cached.
 
 ## Watch-Driven Invalidation
 
