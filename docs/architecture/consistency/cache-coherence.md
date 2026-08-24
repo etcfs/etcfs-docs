@@ -150,7 +150,7 @@ Node A: CREATE /shared/hello.txt
 Node B's Go daemon:
   ← receives watch event (PUT, key="dirent:1/hello.txt")
   ← extracts parent=1, name="hello.txt"
-  ← sends [u32:type=1][u64:parent=1][name] to local C daemon
+  ← sends [u32:type=1][u64:parent=1][u32:name_len=9]["hello.txt"] to local C daemon
 
 Node B's C daemon:
   ← receives notification on dedicated socket
@@ -162,15 +162,19 @@ Next lookup on Node B: LOOKUP → IPC → etcd → fresh data
 
 ### Notification Channel
 
-The C daemon opens a second connection to the Go daemon on a dedicated Unix socket (`/tmp/etcfuse-notify.sock`). This connection is read-only from C's perspective — it receives one-way push messages from Go.
+The C daemon opens a second connection to the Go daemon on a dedicated Unix socket (`/run/etcfuse/etcfuse-notify.sock`, set with `--notify-socket` on the Go side and `ETCFS_NOTIFY_SOCKET` on the C side). Messages are pushed from Go; the only thing C writes back is the one-byte acknowledgement described under [Notification API](../fuse/fuse-cache-management.md#notification-api).
 
-A dedicated pthread in the C daemon (`notify_thread`) connects to this socket at startup and reads notification messages in a loop. The thread calls `fuse_lowlevel_notify_inval_entry` on the FUSE session handle when it receives an invalidation event.
+A dedicated pthread in the C daemon (`notify_thread`) owns that connection. It calls `fuse_lowlevel_notify_inval_entry` or `fuse_lowlevel_notify_inval_inode` on the FUSE session handle for each message it reads.
 
-The Go daemon accepts notification connections on the `/tmp/etcfuse-notify.sock` listener. Each connection is stored as the active notification target. When a watch fires, Go writes a binary invalidation message:
+The Go daemon accepts notification connections on that listener. Each connection is stored as the active notification target. Every message has the same shape — a fixed header, then a name of the length the header declares:
 
 ```
-[u32:be type=1][u64:be parent_ino][name bytes (variable)]
+[u32:be type][u64:be ino][u32:be name_len][name bytes]
 ```
+
+`type=1` is `INVAL_ENTRY`, where `ino` is the parent directory; `type=2` is `INVAL_INODE`, which carries no name and so declares a length of zero.
+
+The name length is load-bearing rather than cosmetic. This is a stream socket, so two messages written back to back can arrive in a single read. A reader that recovered the name as "whatever came with the header" would swallow the following message as part of it and then read every subsequent header from the middle of a message — and there is no resynchronising a stream with no delimiters. The length lets the reader take exactly one message at a time; a declared length beyond `NAME_MAX` means the stream is already out of step, and the reader drops the connection and reconnects rather than acting on what it decoded.
 
 ### Watch Setup
 
@@ -229,13 +233,17 @@ It does **not** cover:
 
 ### Connection Lifecycle
 
-1. C daemon starts → connects to Go's notification socket → starts `notify_thread`
+1. C daemon starts → `notify_thread` connects to Go's notification socket
 2. Go daemon accepts the connection → stores it → sets up etcd watch
 3. Watch fires → Go sends notification → C calls `fuse_lowlevel_notify_inval_entry`
 4. C daemon shuts down → notification socket closes → Go removes the connection
 5. C daemon restarts → re-connects → Go accepts and stores the new connection
 
-If the notification connection fails (C daemon crashes and restarts), Go detects the closed socket and waits for a new connection. The watch continues to fire, but invalidation events are dropped until a new C daemon connects. This is safe — the worst case is that kernel caches are stale for up to `entry_timeout` seconds.
+The connection is retried rather than attempted once. The two daemons start independently, so the C side can reach the socket before the Go side has bound it; and any error on an established connection — a write that fails, an acknowledgement that times out, a stream found to be out of step — closes it at both ends. `notify_thread` reconnects in either case, backing off from 100 ms to a ceiling of 5 s, and logs both the loss and the recovery.
+
+That retry is not only about dentries. The Go daemon answers an OPEN as cacheable *only while a notification client is connected* to take the pages back again, so a connection that is not up means the kernel caches none of the mount's file data and every read reaches the daemon. A single silent connect failure at startup used to leave a mount in that state permanently, indistinguishable from a slow coordination layer; the daemon now says so in its log the first time an open has to be answered that way.
+
+While no client is connected the watch continues to fire and invalidation events are dropped. This is safe for names — the worst case is a dentry stale for up to `entry_timeout` — because a client that is gone took its FUSE session, and every page it had cached, with it.
 
 The etcd watch itself is also re-established whenever it ends, which it can do without the daemon stopping — a compaction past the watched revision is the usual cause. A drain that stopped at the first closed channel would leave the daemon serving names, absences and directory listings from caches nothing could invalidate again, so the watch loop re-opens and logs that it did. A re-opened watch starts from current: changes during the gap are missed rather than replayed, and are bounded by the same entry and attribute timeouts.
 
