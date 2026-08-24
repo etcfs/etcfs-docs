@@ -9,6 +9,7 @@ Kernel-side caching policies, watch-driven cache invalidation, and the mechanism
 - [Attribute Cache](#attribute-cache)
 - [Data Page Cache](#data-page-cache)
 - [Negative Cache](#negative-cache)
+- [Directory Listing Cache](#directory-listing-cache)
 - [Watch-Driven Invalidation](#watch-driven-invalidation)
 - [Invalidation Flow](#invalidation-flow)
 - [Cache Coherence in Multi-Node Scenarios](#cache-coherence-in-multi-node-scenarios)
@@ -64,23 +65,34 @@ A reader using `O_DIRECT` bypasses the page cache by definition, so page caching
 
 ## Negative Cache
 
-The negative dentry cache remembers that a name does **not** exist in a directory. Without it, every `stat()` on a non-existent path triggers a FUSE LOOKUP → etcd round-trip, even if the file has never existed.
+The negative dentry cache remembers that a name does **not** exist in a directory. Without it, every `stat()` on a non-existent path costs a FUSE LOOKUP and an etcd read, even for a name that has never existed — the pattern a compiler walking an include path or a package manager probing for an optional config generates thousands of times over.
 
-The cache duration is controlled by `negative_timeout`. The default of 0.0 seconds disables negative caching entirely — every `ENOENT` causes a fresh LOOKUP. This is the safest default for a cluster filesystem: a file created on another node should become visible immediately, and a negative cache would hide it for the timeout duration.
+FUSE spells a cacheable absence as an *entry reply carrying inode 0*: the reply means "no such name", and its `entry_timeout` says how long the kernel may answer further lookups of that name without asking again. A LOOKUP answered with `ENOENT` instead leaves the kernel nothing to remember. EtcFS therefore answers a name the store confirms is absent with a negative entry, and reserves an errno for a lookup it could not *decide* — an etcd failure, or a dirent naming an inode with no record. Only a confirmed absence is a fact, and only a fact may be cached.
 
-A non-zero negative timeout is appropriate for single-node deployments or workloads where delayed visibility of new files is acceptable (e.g., a batch processing pipeline that creates files in advance).
+The timeout on a negative entry is the same one a found name gets. Both are invalidated by the same dirent watch below, so trusting one longer than the other would be arbitrary; the window either way is one second in which a name's existence may be stale on this node, which is the guarantee positive entries have always had.
+
+## Directory Listing Cache
+
+`opendir` returns `FOPEN_CACHE_DIR`, which lets the kernel keep the listing it is about to read instead of re-issuing READDIR — and behind each READDIR, an etcd prefix scan — on every pass. Without it a repeated walk of a tree costs exactly what the first walk did, which is what a warm `find` measured before this existed.
+
+The kernel drops a cached listing when the directory's `i_version` moves or its `mtime` changes, and EtcFS moves both:
+
+- every dirent change anywhere in the cluster arrives as an `INVAL_ENTRY`, and the kernel's handling of one bumps the parent's `i_version`;
+- every create and unlink also moves the parent directory's `mtime` in etcd, so a node that never received the notification still drops the listing once the parent's attributes expire.
+
+The second is why this does not depend on the notification path being healthy — the staleness of a listing is bounded by `attr_timeout` in the worst case rather than being unbounded — and it is also why the root directory is excluded. Root has no inode record; its attributes are synthesised by the C daemon with a fixed `mtime`, so a cached listing of it would have only the notification to invalidate it. Root is listed uncached, and every directory below it is cached.
 
 ## Watch-Driven Invalidation
 
 The kernel cache timeouts alone would be insufficient for a cluster filesystem. If Node A creates a file in `/shared/`, Node B's kernel cache would continue returning `ENOENT` for up to `entry_timeout` seconds — a full second where the file appears to not exist.
 
-The solution is **watch-driven cache invalidation**. The Go daemon maintains etcd watches on directories that have been recently accessed. When a watch fires (another node modified the directory), the daemon issues `FUSE_NOTIFY_INVAL_ENTRY` to the kernel, which immediately evicts the stale cache entry.
+The solution is **watch-driven cache invalidation**. When a dirent changes anywhere in the cluster, the Go daemon issues `FUSE_NOTIFY_INVAL_ENTRY` to the kernel, which immediately evicts the stale cache entry.
 
-### Watches Established
+### The Watch
 
-When the Go backend processes a LOOKUP or READDIR for a directory, it checks if a watch is already established for that directory's etcd prefix. If not, it creates one. The watch monitors the `dirent:<parent>/` prefix for PUT and DELETE events.
+There is one watch, not one per directory: a single etcd watch over the whole `dirent:` prefix, established at startup, whose events are consumed by a background goroutine that dispatches invalidations. Per-directory watches would have to be created, tracked and expired, and would still have to cover directories this node has never looked at, since a peer can create a name in one at any time.
 
-Watches are long-lived. They persist across multiple FUSE requests for the same directory and are only torn down if the daemon restarts or the etcd connection is lost. A background goroutine consumes watch events and dispatches invalidation notifications.
+The watch is re-established whenever it ends. That matters more than it looks: this one watch is what invalidates a cached name, a cached *absence* of a name, and a cached directory listing, and etcd ends a watch for reasons that have nothing to do with the daemon stopping — a compaction past the watched revision is the usual one. A re-opened watch starts from current, so changes during the gap are missed rather than replayed, which is what the entry and attribute timeouts bound.
 
 ### Invalidation Actions
 
@@ -134,7 +146,7 @@ The watch-driven invalidation provides **eventual consistency** for the kernel V
 | `entry_timeout = 0` | Every path traversal hits etcd | Maximum freshness, high latency |
 | `entry_timeout = 1.0` (default) | Kernel caches for 1s, watches provide sub-100ms invalidation | Balanced |
 | `entry_timeout = 10.0` | Cached for 10s, watches still fire but apps see stale state longer | Read-heavy, single-writer |
-| `negative_timeout = 0` (default) | No negative caching, ENOENT always re-checked | Multi-node with concurrent creates |
-| `negative_timeout = 1.0` | Negative entries cached for 1s | Single-node, or creating files in advance |
+
+Negative entries carry the same `entry_timeout` as positive ones and are not separately configurable: both are invalidated by the same watch, so there is nothing to trade off between them.
 
 The watch-driven invalidation dramatically reduces the freshness penalty of longer timeouts. With watches active, a 10-second `entry_timeout` does not mean 10 seconds of stale data — it means that data is stale for at most the watch delivery latency (<< 1 second) after a mutation, and for 10 seconds only if no mutation occurs.

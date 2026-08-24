@@ -237,6 +237,8 @@ It does **not** cover:
 
 If the notification connection fails (C daemon crashes and restarts), Go detects the closed socket and waits for a new connection. The watch continues to fire, but invalidation events are dropped until a new C daemon connects. This is safe — the worst case is that kernel caches are stale for up to `entry_timeout` seconds.
 
+The etcd watch itself is also re-established whenever it ends, which it can do without the daemon stopping — a compaction past the watched revision is the usual cause. A drain that stopped at the first closed channel would leave the daemon serving names, absences and directory listings from caches nothing could invalidate again, so the watch loop re-opens and logs that it did. A re-opened watch starts from current: changes during the gap are missed rather than replayed, and are bounded by the same entry and attribute timeouts.
+
 ### Verified Behaviour
 
 Tested on a 3-node cluster with EBS Multi-Attach:
@@ -315,9 +317,11 @@ While O_DIRECT bypasses the kernel page cache for file data, EtcFS still relies 
 
 ### Directory Operations Across Nodes
 
-When Node A creates a directory and Node B creates a file inside it, Node B must LOOKUP the directory path before CREATing the file. The directory inode is stored in etcd and is visible to all nodes. However, if Node B has a negative dentry for the directory in its kernel cache (because it previously received ENOENT before Node A created it), the LOOKUP may fail with ENOENT from the kernel cache.
+When Node A creates a directory and Node B creates a file inside it, Node B must LOOKUP the directory path before CREATing the file. The directory inode is stored in etcd and is visible to all nodes. However, if Node B looked for that name before Node A created it, Node B's kernel holds a negative dentry for it, and the LOOKUP is answered ENOENT from that cache rather than from etcd.
 
-This is mitigated by `negative_timeout = 0.0`, which disables negative dentry caching. In the current implementation, all LOOKUPs from the kernel trigger a FUSE operation, which hits etcd and returns the correct result.
+The window is the same one a *positive* dentry has always had, and it closes the same way: Node A's create puts `dirent:<parent>/<name>` in etcd, Node B's watch sees it, and the resulting `inval_entry` evicts the negative dentry — typically within one etcd round trip. The `entry_timeout` is the backstop for a notification that never arrives, not the mechanism.
+
+A negative dentry is only ever created from an absence the store confirmed. A LOOKUP that could not be decided — an etcd failure, or a dirent naming an inode with no record — is still answered with an errno, which the kernel cannot cache.
 
 ### Truncate Visibility
 
