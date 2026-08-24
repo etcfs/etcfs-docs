@@ -111,6 +111,7 @@ nav:
           - Arena Fragmentation Soak: reports/benchmark-reports/arena-fragmentation-soak.md
       - CSI Reports:
           - EKS CSI Driver Validation: reports/csi-reports/eks-csi-driver-validation.md
+  - Future Extensions: future-extensions.md
   - Background:
       - etcd/Raft Internals: background/etcd_raft_research.md
       - Cluster Filesystem Survey: background/cluster-fs-survey.md
