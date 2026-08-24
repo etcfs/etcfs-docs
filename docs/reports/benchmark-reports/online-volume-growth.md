@@ -1,6 +1,6 @@
 # Benchmark Report — Online Volume Growth
 
-Date: 2026-08-17.
+*2026-08-17*
 
 ## Summary
 

@@ -1,5 +1,7 @@
 # Chaos Testing Report — Concurrent Multi-Node Scale-Out
 
+*2026-08-04*
+
 Date: 2026-08-04, commit `1727ed6`.
 
 ## Summary

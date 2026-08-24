@@ -18,7 +18,7 @@ data you can't afford to lose. In particular:
   the fencing-generation guard, applied store-wide rather than per call
   site. See [`fencing-generation-protocol.md`](architecture/fencing/fencing-generation-protocol.md)
   § Implementation Status. Verified by `scripts/test/chaos-fencing-namespace.sh`.
-- The chaos/fuzz testing tiers (see [Reports](reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md))
+- The chaos/fuzz testing tiers (see [Reports](reports/chaos-reports/fresh-cluster-per-scenario.md))
   stress crash recovery, fencing, elastic membership changes, concurrent
   multi-node scale-out, and fault injection *during* a join/leave. Not yet
   covered: long-duration (multi-hour+) fuzz runs that would surface

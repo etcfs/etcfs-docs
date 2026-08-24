@@ -1,6 +1,6 @@
 # Benchmark Report — Node-Count Scaling Curve
 
-Date: 2026-08-16.
+*2026-08-16*
 
 ## Summary
 

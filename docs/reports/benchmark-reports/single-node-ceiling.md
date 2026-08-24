@@ -1,6 +1,6 @@
 # Benchmark Report — Single-Node Ceiling
 
-Date: 2026-08-16.
+*2026-08-16*
 
 ## Summary
 

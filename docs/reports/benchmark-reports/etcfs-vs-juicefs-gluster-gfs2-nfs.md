@@ -1,6 +1,6 @@
 # Benchmark Report — EtcFS vs. JuiceFS, GlusterFS, GFS2, and self-hosted NFS
 
-Date: 2026-08-15.
+*2026-08-15*
 
 ## Summary
 

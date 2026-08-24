@@ -1,6 +1,6 @@
 # Chaos Testing Report — S8-S13 (Caching/Delegation Scenarios) on AWS
 
-Date: 2026-08-15.
+*2026-08-15*
 
 ## Summary
 

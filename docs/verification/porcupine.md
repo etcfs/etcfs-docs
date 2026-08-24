@@ -342,7 +342,7 @@ by their own unit tests, by `cmd/verify-history` over recorded histories, and
 now by S8-S13, which are exactly the contended-inode and killed-with-a-full-buffer
 run this section used to say did not exist. S8-S13 also now run against the
 AWS transport, not only docker — 20/20 assertions, `STATUS: ALL PASS`; see
-`docs/reports/chaos-reports/2026-08-15-caching-scenarios-on-aws.md`.
+`docs/reports/chaos-reports/caching-scenarios-on-aws.md`.
 
 ## Next
 

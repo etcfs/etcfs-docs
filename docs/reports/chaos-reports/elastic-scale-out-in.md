@@ -1,5 +1,7 @@
 # Chaos Testing Report — Elastic Scale-Out / Scale-In
 
+*2026-07-31*
+
 Date: 2026-07-31, commit `2d63479` (base), plus uncommitted harness work from this session.
 
 ## Summary

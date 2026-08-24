@@ -1,6 +1,6 @@
 # Benchmark Report — Arena Fragmentation Soak
 
-Date: 2026-08-17.
+*2026-08-17*
 
 ## Summary
 

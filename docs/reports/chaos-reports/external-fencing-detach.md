@@ -1,6 +1,6 @@
 # Chaos Testing Report — Dual-Confirmed External Fencing (EBS Detach)
 
-Date: 2026-08-05.
+*2026-08-05*
 
 ## Summary
 

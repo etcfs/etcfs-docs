@@ -1,6 +1,6 @@
 # Chaos Testing Report — Fault Injection During Join/Leave
 
-Date: 2026-08-05.
+*2026-08-05*
 
 > **Update, same day.** Findings 1 and 3 have been fixed and re-verified (a real
 > product bug in the self-fencing watchdog; a test-harness bug in the AWS partition

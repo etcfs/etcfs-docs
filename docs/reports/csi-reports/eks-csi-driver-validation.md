@@ -1,6 +1,6 @@
 # CSI Driver Validation Report — EKS
 
-Date: 2026-08-12.
+*2026-08-12*
 
 ## Summary
 

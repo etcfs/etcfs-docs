@@ -1,5 +1,7 @@
 # Chaos Testing Report — Namespace Fencing Guard
 
+*2026-08-04*
+
 Date: 2026-08-04, commit `eb0c3ae`.
 
 ## Summary

@@ -1,6 +1,6 @@
 # Benchmark Report — Leave and Rejoin Under Load
 
-Date: 2026-08-17.
+*2026-08-17*
 
 ## Summary
 

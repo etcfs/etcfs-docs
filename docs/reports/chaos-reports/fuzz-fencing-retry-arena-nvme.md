@@ -1,6 +1,6 @@
 # Chaos Testing Report — Integrity Fuzz, Fencing Retry, Arena Collision/Reclaim, NVMe Fencing
 
-Date: 2026-08-10.
+*2026-08-10*
 
 ## Summary
 

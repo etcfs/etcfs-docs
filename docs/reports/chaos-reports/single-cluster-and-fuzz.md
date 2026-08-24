@@ -1,10 +1,12 @@
 # Chaos Testing Report — Single-Cluster Sequential Faults + Randomized Fuzz
 
+*2026-07-31*
+
 Date: 2026-07-31, commit `b72a786` (base), plus uncommitted harness work from this session.
 
 ## Summary
 
-Two new test tiers, beyond the existing fresh-cluster-per-scenario suite (`docs/reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md`):
+Two new test tiers, beyond the existing fresh-cluster-per-scenario suite (`docs/reports/chaos-reports/fresh-cluster-per-scenario.md`):
 
 1. **Single-cluster sequential** (`scripts/test/chaos-test-single-cluster.sh`) — provisions ONE cluster, runs all of S1/S2/S3/S5/S6/S7 back to back against it, tears down once at the end. Verifies the cluster recovers from repeated, unrelated faults in sequence, not just from a fault applied to a pristine cluster.
 2. **Randomized fuzz** (`scripts/test/chaos-fuzz.sh`) — concurrent random read/write/delete/rename/mkdir traffic from all 3 nodes against random files, while a chaos injector randomly kills daemons, partitions nodes, bumps fencing generations, or crashes all 3 nodes simultaneously on an 8-20s cadence. A liveness monitor asserts the cluster never goes fully unwritable for more than 2 consecutive 5s ticks.

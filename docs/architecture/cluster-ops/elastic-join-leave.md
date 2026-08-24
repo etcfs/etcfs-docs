@@ -94,7 +94,7 @@ inode 0 is not a valid inode and inode 1 is `FUSE_ROOT_ID`, the root directory
 that `seed-etcd` writes and the C daemon answers for locally. Handing out inode 1
 overwrites the root inode record and makes the entire mount return `EIO` — this
 was a real defect, found and fixed on 2026-07-30 (see
-[the chaos report](../../reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md)).
+[the chaos report](../../reports/chaos-reports/fresh-cluster-per-scenario.md)).
 
 The retry budget (20 attempts, exponential backoff *with jitter*) is also
 deliberate. Without jitter, callers that lose a race tend to restart in lockstep

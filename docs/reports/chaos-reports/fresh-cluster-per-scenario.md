@@ -1,5 +1,7 @@
 # Chaos Test Report — EtcFS
 
+*2026-07-30*
+
 Last verified: 2026-07-30, commit `660a14a` (`fix: reserved inode 1, fixed readdirplus desync, guarded writes against fencing generation`).
 
 ## Result

@@ -86,31 +86,31 @@ nav:
       - "Protocol Model Checking (TLA+)": verification/tla-plus.md
   - Reports:
       - Chaos Reports:
-          - Fresh Cluster Per Scenario (2026-07-30): reports/chaos-reports/2026-07-30-fresh-cluster-per-scenario.md
-          - Single-Cluster and Fuzz (2026-07-31): reports/chaos-reports/2026-07-31-single-cluster-and-fuzz.md
-          - Elastic Scale-Out/In (2026-07-31): reports/chaos-reports/2026-07-31-elastic-scale-out-in.md
-          - Namespace Fencing Guard (2026-08-04): reports/chaos-reports/2026-08-04-namespace-fencing-guard.md
-          - Concurrent Scale-Out (2026-08-04): reports/chaos-reports/2026-08-04-concurrent-scale-out.md
-          - Fault Injection During Join/Leave (2026-08-05): reports/chaos-reports/2026-08-05-fault-injection-during-join-leave.md
-          - Dual-Confirmed External Fencing (2026-08-05): reports/chaos-reports/2026-08-05-external-fencing-detach.md
-          - Fuzz, Fencing Retry, Arena, NVMe (2026-08-10): reports/chaos-reports/2026-08-10-fuzz-fencing-retry-arena-nvme.md
+          - Fresh Cluster Per Scenario: reports/chaos-reports/fresh-cluster-per-scenario.md
+          - Single-Cluster and Fuzz: reports/chaos-reports/single-cluster-and-fuzz.md
+          - Elastic Scale-Out/In: reports/chaos-reports/elastic-scale-out-in.md
+          - Namespace Fencing Guard: reports/chaos-reports/namespace-fencing-guard.md
+          - Concurrent Scale-Out: reports/chaos-reports/concurrent-scale-out.md
+          - Fault Injection During Join/Leave: reports/chaos-reports/fault-injection-during-join-leave.md
+          - Dual-Confirmed External Fencing: reports/chaos-reports/external-fencing-detach.md
+          - Fuzz, Fencing Retry, Arena, NVMe: reports/chaos-reports/fuzz-fencing-retry-arena-nvme.md
       - Benchmark Reports:
-          - EtcFS vs. JuiceFS, GlusterFS, GFS2, NFS (2026-08-15): reports/benchmark-reports/2026-08-15-etcfs-vs-juicefs-gluster-gfs2-nfs.md
-          - Cross-Node Handoff (2026-08-16): reports/benchmark-reports/2026-08-16-cross-node-handoff.md
-          - Node-Kill Recovery (2026-08-16): reports/benchmark-reports/2026-08-16-node-kill-recovery.md
-          - Metadata Under Concurrency (2026-08-16): reports/benchmark-reports/2026-08-16-metadata-concurrency.md
-          - Small-File Metadata Storm (2026-08-16): reports/benchmark-reports/2026-08-16-smallfile-storm.md
-          - Single-Node Ceiling (2026-08-16): reports/benchmark-reports/2026-08-16-single-node-ceiling.md
-          - Deep Directory Walks (2026-08-16): reports/benchmark-reports/2026-08-16-deep-directory-walks.md
-          - fsync-Heavy Small Writes (2026-08-16): reports/benchmark-reports/2026-08-16-fsync-heavy-writes.md
-          - etcd Degraded (2026-08-16): reports/benchmark-reports/2026-08-16-etcd-degraded.md
-          - Node-Count Scaling Curve (2026-08-16): reports/benchmark-reports/2026-08-16-node-count-scaling.md
-          - Join Latency (2026-08-17): reports/benchmark-reports/2026-08-17-join-latency.md
-          - Leave and Rejoin Under Load (2026-08-17): reports/benchmark-reports/2026-08-17-leave-and-rejoin-under-load.md
-          - Online Volume Growth (2026-08-17): reports/benchmark-reports/2026-08-17-online-volume-growth.md
-          - Arena Fragmentation Soak (2026-08-17): reports/benchmark-reports/2026-08-17-arena-fragmentation-soak.md
+          - EtcFS vs. JuiceFS, GlusterFS, GFS2, NFS: reports/benchmark-reports/etcfs-vs-juicefs-gluster-gfs2-nfs.md
+          - Cross-Node Handoff: reports/benchmark-reports/cross-node-handoff.md
+          - Node-Kill Recovery: reports/benchmark-reports/node-kill-recovery.md
+          - Metadata Under Concurrency: reports/benchmark-reports/metadata-concurrency.md
+          - Small-File Metadata Storm: reports/benchmark-reports/smallfile-storm.md
+          - Single-Node Ceiling: reports/benchmark-reports/single-node-ceiling.md
+          - Deep Directory Walks: reports/benchmark-reports/deep-directory-walks.md
+          - fsync-Heavy Small Writes: reports/benchmark-reports/fsync-heavy-writes.md
+          - etcd Degraded: reports/benchmark-reports/etcd-degraded.md
+          - Node-Count Scaling Curve: reports/benchmark-reports/node-count-scaling.md
+          - Join Latency: reports/benchmark-reports/join-latency.md
+          - Leave and Rejoin Under Load: reports/benchmark-reports/leave-and-rejoin-under-load.md
+          - Online Volume Growth: reports/benchmark-reports/online-volume-growth.md
+          - Arena Fragmentation Soak: reports/benchmark-reports/arena-fragmentation-soak.md
       - CSI Reports:
-          - EKS CSI Driver Validation (2026-08-12): reports/csi-reports/2026-08-12-eks-csi-driver-validation.md
+          - EKS CSI Driver Validation: reports/csi-reports/eks-csi-driver-validation.md
   - Background:
       - etcd/Raft Internals: background/etcd_raft_research.md
       - Cluster Filesystem Survey: background/cluster-fs-survey.md
