@@ -15,6 +15,7 @@ which entry to evict), `internal/ipc/retry.go` (`lockInode`),
 - [Node-Local Exclusion](#node-local-exclusion)
 - [Recall Protocol](#recall-protocol)
 - [Minimum Hold Time](#minimum-hold-time)
+- [Explicit Publish](#explicit-publish)
 - [Mode Upgrades](#mode-upgrades)
 - [Cache Bound and Eviction](#cache-bound-and-eviction)
 - [What the Lock Makes Cacheable](#what-the-lock-makes-cacheable)
@@ -137,6 +138,54 @@ worse than the case the cache exists to fix.
 This is GFS2's `gl_hold_time`, and it makes the same trade: a bounded extra
 wait for the peer, paid for by a bound on how often the lock can change
 hands. It costs nothing when uncontended, since nothing ever recalls it.
+
+## Explicit Publish
+
+The recall protocol above is reactive: the lock stays with whoever took it
+until somebody asks for it back, and the asking is what costs three etcd round
+trips on the *consumer's* critical path. For a producer/consumer pipeline that
+is the wrong node to charge. The producer knows when it has finished writing;
+the consumer only knows that the file it wants is locked by someone else.
+
+A writer can therefore hand the file over itself, by setting the
+`user.etcfs.publish` extended attribute on it:
+
+```sh
+setfattr -n user.etcfs.publish -v 1 /mnt/etcfs/output.bin
+```
+
+```python
+os.setxattr("/mnt/etcfs/output.bin", "user.etcfs.publish", b"1")
+```
+
+That publishes the node's buffered writes — bytes to the device, extents to
+etcd — and then gives up the inode's cached lock key without waiting for anyone
+to want it. A consumer on another node then finds a free lock and committed
+extents, and reads the same physical blocks the producer wrote: only the extent
+map crossed the network, and the data moves at device bandwidth rather than
+over it.
+
+It is an extended attribute rather than a new operation because it needs no new
+wire opcode, no C-side handler and no client library — `setfattr`, `os.setxattr`
+and every language's equivalent already reach it, which is what an application
+in a pipeline actually has to hand. The `user.` namespace because the caller is
+an ordinary process rather than an operator. The name is an *action*: it is
+carried out and deliberately not stored, so it never appears in a listing and
+reading it back gives `ENODATA`. Only that exact name is intercepted; anything
+else in the namespace is stored as usual.
+
+Publishing an inode this node holds no lock for succeeds and does nothing,
+which is what lets an application call it unconditionally when it closes a file
+without tracking whether it wrote anything.
+
+Two things it deliberately does not do. It does not flush the block device: a
+shared device is opened with `O_DIRECT`, so the write to it was the
+publication, and the buffered fallback exists only for an unshared device where
+there is no other node to hand anything to. And it does not fence out a
+concurrent writer on the same node — a write racing the publish lands in a
+buffer that has already been published and waits for the next flush. Publishing
+is a statement that the writer has finished, and it is the caller's to make
+truthfully.
 
 ## Mode Upgrades
 
