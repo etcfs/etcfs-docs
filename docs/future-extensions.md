@@ -124,3 +124,31 @@ coherence decision, not an optimisation. The latch fails in the safe direction,
 and the cost is one round trip on a path that is already yielding a lock. Worth
 doing only with a measurement that says it matters and a test that pins the skip
 condition.
+
+### One writer at a time per file, across nodes
+
+The lock unit is the whole inode, so several nodes writing disjoint ranges of
+one file hand the inode back and forth rather than proceeding in parallel. The
+handover cost is bounded — the hold time grows under sustained contention — but
+the serialisation is real, and it is what caps shared-file write bandwidth as
+nodes are added.
+
+Reviewed and left: byte-range locks are the right answer for that workload, and
+they are not a change to the lock key alone. The metadata snapshot, the extent
+chunk numbering and the page-cache invalidation all rest on one node excluding
+every peer from an inode, and both the TLA+ spec and the Porcupine lock checker
+are written over that same unit. See
+[Design Decisions](design-decisions.md#locks-are-whole-inode-and-byte-ranges-are-not-a-small-change-to-that).
+
+### A create is one Raft commit, and stays one
+
+A file creation commits before it is acknowledged. The inode number and the
+parent directory's timestamp were taken off that path — the first is reserved a
+block at a time, the second is coalesced — but the transaction that publishes
+the name is synchronous, so a single-threaded stream of creates runs at the rate
+etcd can commit.
+
+Reviewed and left: batching them means answering `create()` before its
+exclusivity comparison has been evaluated, which is a wrong answer rather than a
+widened crash window, and making it safe means locking directories. See
+[Design Decisions](design-decisions.md#creates-are-not-deferred-into-a-batch).

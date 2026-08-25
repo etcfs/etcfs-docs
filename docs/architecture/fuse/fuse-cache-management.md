@@ -75,7 +75,7 @@ The negative dentry cache remembers that a name does **not** exist in a director
 
 FUSE spells a cacheable absence as an *entry reply carrying inode 0*: the reply means "no such name", and its `entry_timeout` says how long the kernel may answer further lookups of that name without asking again. A LOOKUP answered with `ENOENT` instead leaves the kernel nothing to remember. EtcFS therefore answers a name the store confirms is absent with a negative entry, and reserves an errno for a lookup it could not *decide* — an etcd failure, or a dirent naming an inode with no record. Only a confirmed absence is a fact, and only a fact may be cached.
 
-#### Prefetching a directory's names
+### Prefetching a directory's names
 
 The kernel caches an absence, but only one it has already been told about: a build walking an include path, a package manager looking for an optional config, a linker walking a library search path all ask for thousands of names that do not exist, and each *first* question was a linearizable point read of etcd.
 
@@ -90,7 +90,7 @@ The rules that make it sound are the ones the page cache already follows:
 - **A fill overtaken by a change is discarded**, not installed: a range read describes one revision, and a change committed after it but delivered during it would be lost.
 - **A directory past 4096 names is not cached at all**, and the refusal is remembered so the next miss does not read it again to reach the same conclusion. At most 64 directories and 65536 names are held, evicting the least recently filled.
 
-#### Negative entry timeout
+### Negative entry timeout
 
 The timeout on a negative entry is the same one a found name gets. Both are invalidated by the same dirent watch below, so trusting one longer than the other would be arbitrary; the window either way is `entry_timeout` in which a name's existence may be stale on this node, which is the guarantee positive entries have always had.
 

@@ -436,3 +436,96 @@ both bits. So the guarantee holds for every submission path, not only for
 synchronous writes, and a database issuing `O_DSYNC` writes through io_uring is
 not silently given deferred ones. `O_SYNC` shows up as a superset of `O_DSYNC`,
 which is why one test of that single bit covers both.
+
+## Creates are not deferred into a batch
+
+*Options:* (a) hold created inodes in a short write-behind queue and flush them
+as one etcd transaction, the way an inode's extents are already deferred;
+(b) leave the create synchronous and take the *other* commits off its path.
+
+*Chosen:* (b). An unpacking archive was paying three sequential Raft commits per
+file — one to reserve the inode number, one to publish the file, one to move the
+parent directory's timestamp — and (a) was an attempt to batch the middle one.
+Two of the three turned out to be removable without touching what a create
+means: inode numbers are now reserved a block at a time
+(`internal/ipc/inodealloc.go`) and directory timestamps are coalesced
+(`pkg/metadata/dirtouch.go`). What is left is the one transaction that makes the
+file exist.
+
+That last one cannot be deferred, and the reason is not the crash window.
+Deferring an extent is safe because a node holding an inode's exclusive lock
+excludes every peer from that inode, so no peer can observe the gap between the
+write and the commit naming it. A create has no such exclusion: EtcFS does not
+lock directories, and a namespace mutation is a transaction that asserts
+`CreateRevision(dirent:<parent>/<name>) == 0` — the name is free — and commits
+if it still is.
+
+A batch therefore *can be rejected*, on a name a peer created while the batch
+sat in the queue. By then the `create()` has already returned success. There is
+no honest recovery: the caller holds a descriptor on an inode nothing names, and
+the file it believes it made belongs to the other node. That is not a widened
+crash window, which is what deferring an extent trades. It is a wrong answer to
+a call that has already returned, and it is a wrong answer specifically in the
+case the exclusivity comparison exists to decide.
+
+It also takes `O_EXCL` with it. Nothing in the daemon reads that flag: the
+kernel resolves `O_CREAT|O_EXCL` by looking the name up and, if absent, issuing
+CREATE, and the guarantee that two nodes racing for one name cannot both succeed
+is exactly the transaction's comparison being evaluated before the call returns.
+A deferred create answers before that comparison has been made.
+
+Making it safe means excluding peers from the directory for the length of the
+queue — a directory lock, with the recall, coherence and staleness machinery the
+inode lock already has, and with concurrent creates in one directory serialising
+across nodes where today they are independent transactions that contend on
+nothing. "No directory-level locking — namespace mutations via atomic etcd Txn"
+is a load-bearing property of this design and of the shared-directory numbers it
+produces, not an accident, so trading it for a create-batching optimisation is
+the wrong direction. The crash window would be the easy part; the exclusion is
+the whole cost.
+
+## Locks are whole-inode, and byte ranges are not a small change to that
+
+*Options:* (a) add a range to the lock key so writers to disjoint parts of one
+file proceed in parallel; (b) keep the inode as the unit and reduce what a
+handover costs.
+
+*Chosen:* (b), for now: the hold time adapts under contention (see
+[Lock caching](architecture/metadata/lock-caching.md#hold-time)) so a contended
+inode is not handed over once per operation. Several nodes writing disjoint
+ranges of one file still serialise, and that remains the honest limitation.
+
+(a) is not rejected because it is unhelpful — it is the right answer for that
+workload — but because the range is not the only thing that would have to
+change. What makes every cache in the lock layer sound is one sentence, and it
+is the sentence `specs/CachedLock.tla` is written around: *a node holding an
+inode's key excludes every peer from that inode, so nothing it has cached can go
+stale underneath it.* A range lock is precisely the case where that stops being
+true, and three things rest on it:
+
+- **The metadata snapshot.** A held lock caches the inode record and the whole
+  extent list, and every data-path operation is answered from it without a read.
+  Two nodes holding disjoint ranges both rewrite `extent:<ino>/...` and both may
+  grow `Size` in the same inode record, so neither snapshot describes the file
+  any more. It would need invalidating from a watch on the inode's extents, which
+  is a second coherence protocol beside the lock.
+- **Chunk numbering.** An extent's key is `extent:<ino>/<chunk>`, and a write
+  picks its chunk numbers by counting the extents it can see (`writeOp.countFrom`).
+  Two range holders counting independently pick the same numbers. The commit
+  rejects the collision rather than losing data, so it is a livelock rather than
+  corruption — but it means the numbering has to become a per-range or per-node
+  space before ranges are worth having.
+- **Page invalidation.** `invalidatePages` drops an inode's pages before its lock
+  is yielded, whole-inode. Yielding a range would have to drop that range, which
+  FUSE supports and this code does not do.
+
+And it invalidates both verification artifacts at once. `CachedLock.tla` models
+one lock per inode, so its safety properties would have to be restated over
+ranges. `test/verify/lock.go` checks mutual exclusion per inode, so two
+legitimate range holders would read as a violation and the Porcupine run would
+fail on correct behaviour.
+
+So the cost is a range structure in the lock key, a harder recall path, a new
+invalidation channel for the snapshot, a new chunk-numbering scheme, and two
+specs rewritten. That is a design with its own verification work, not an
+optimisation to land beside others.

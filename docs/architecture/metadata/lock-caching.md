@@ -14,7 +14,7 @@ which entry to evict), `internal/ipc/retry.go` (`lockInode`),
 - [What Changed and What Did Not](#what-changed-and-what-did-not)
 - [Node-Local Exclusion](#node-local-exclusion)
 - [Recall Protocol](#recall-protocol)
-- [Minimum Hold Time](#minimum-hold-time)
+- [Hold Time](#hold-time)
 - [Explicit Publish](#explicit-publish)
 - [Mode Upgrades](#mode-upgrades)
 - [Cache Bound and Eviction](#cache-bound-and-eviction)
