@@ -134,11 +134,11 @@ The critical property is that the unlink is a single atomic transaction that del
 
 EtcFS does not lock directories. When three nodes create files simultaneously in `/shared/concurrent/`, each create is an independent etcd transaction. The transaction's comparison (`CreateRevision == 0`) ensures that no two nodes create the same filename.
 
-The three nodes each allocate unique inode numbers from the global `inode_alloc_counter` (CAS) and unique filenames (the test assigns each node a disjoint range of names). The CAS on the inode counter prevents two nodes from getting the same inode number. The CAS on the dirent key prevents two nodes from creating the same name.
+The three nodes each allocate unique inode numbers from the global `inode_alloc_counter` and unique filenames (the test assigns each node a disjoint range of names). The CAS that reserves a node's block of the counter prevents two nodes from getting the same inode number. The CAS on the dirent key prevents two nodes from creating the same name.
 
 After all creates complete, the directory contains all files from all three nodes. The `FreshListDir` scan shows `perNode * 3` entries. Each inode number is unique — any collision in the inode counter would cause a CAS failure that the test would detect as a duplicate inode number.
 
-The result validates the design principle from the init plan: "A create is 'insert dirent if absent, insert inode if absent' in one transaction." Three nodes creating different names in the same directory do not contend on any key except the inode allocator counter, which is touched exactly once per file creation.
+The result validates the design principle from the init plan: "A create is 'insert dirent if absent, insert inode if absent' in one transaction." Three nodes creating different names in the same directory contend on no key at all in the steady state: the inode allocator counter is touched once per reserved block, not once per file.
 
 ## Cross-Node Lock Contention
 

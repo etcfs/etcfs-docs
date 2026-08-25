@@ -57,7 +57,7 @@ The `mode` is the file type and permissions from the kernel. The `flags` are the
 
 ### Handler Flow
 
-1. Allocate a fresh inode number via the global `inode_alloc_counter` (CAS-based sequential allocation).
+1. Take a fresh inode number from the block this node reserved from the global `inode_alloc_counter`; only an exhausted block CASes the counter forward.
 2. Call `AtomicCreateFile(parent, name, ino, mode &^ umask, uid, gid)` which executes a single etcd transaction:
    - **Comparison 1:** `CreateRevision(dirent:parent/name) == 0` — the name must not already exist.
    - **Comparison 2:** `CreateRevision(inode:ino) == 0` — the inode number must not already be allocated.

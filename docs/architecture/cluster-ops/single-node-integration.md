@@ -191,7 +191,7 @@ After a crash, the following state is reconstructed from durable storage:
 | Membership | etcd (`membership:<node_id>`) | Re-created at startup |
 | Fencing generation | etcd (`gen:<node_id>`) | Read on demand via GetGeneration |
 | Arena ownership | etcd (`arena:<node_id>/<arena_id>`) | Read at startup by the allocator |
-| Inode number counter | etcd (`inode_alloc_counter`) | Read on first allocation (CAS) |
+| Inode number counter | etcd (`inode_alloc_counter`) | Advanced by a block on the first allocation after a restart (CAS); numbers left in the previous block are stranded |
 
 The key insight is that the etcd cluster holds all durable metadata except the block device content. Crash recovery is primarily about reconnecting to etcd and re-reading the current state, not about replaying a journal or repairing a filesystem.
 
@@ -213,7 +213,8 @@ Kernel VFS:
 
   CREATE "data.txt" with O_WRONLY|O_CREAT → FUSE handler (ec_create)
     → IPC: op CREATE, parent=1, name="data.txt", mode=0644, flags=O_WRONLY
-    → Go: allocInode() → CAS on inode_alloc_counter → ino=42
+    → Go: allocInode() → next number of this node's reserved block → ino=42
+           (an exhausted block CASes inode_alloc_counter forward by 1024)
     → Go: AtomicCreateFile(1, "data.txt", 42, 0644, uid, gid)
            → Txn: check dirent doesn't exist, check inode 42 doesn't exist
                   → put dirent:1/data.txt, put inode:42

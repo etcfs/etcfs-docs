@@ -21,7 +21,7 @@ A node's membership in the EtcFS cluster is represented by a `membership:<node_i
 
 Each node requires one resource to operate: **an arena** — a 1 GiB contiguous disk range for block allocation, acquired from a global pool via a CAS transaction. It is acquired lazily, on the node's first write, not at join time.
 
-Inode numbers are **not** a per-node resource. They are drawn one at a time from a single global counter (`inode_alloc_counter`) on every file creation. See [Inode allocation](#inode-allocation).
+Inode numbers are drawn from a single global counter (`inode_alloc_counter`), but a node reserves a block of them at a time and hands them out from memory, so a file creation does not reach etcd for its number. See [Inode allocation](#inode-allocation).
 
 ## Join Protocol
 
@@ -71,19 +71,21 @@ The arena's disk range is computed from the arena ID: `DiskStart = ID * ArenaSiz
 
 ## Inode allocation
 
-There is no per-node inode range. Every file creation calls `Service.allocInode`
-(`internal/ipc/handlers.go`), which does a single CAS-retried increment of the
-global `inode_alloc_counter` key:
+Every file creation calls `Service.allocInode` (`internal/ipc/handlers.go`),
+which takes the next number from the block this node is holding
+(`internal/ipc/inodealloc.go`). Only an exhausted block reaches etcd, and it
+does so by CAS-reserving the next 1024 numbers of the global
+`inode_alloc_counter` key:
 
 ```
-NextCounter(key="inode_alloc_counter", floor=FirstUsableIno):
+ReserveCounter(key="inode_alloc_counter", floor=FirstUsableIno, count):
   for attempt in 0..19:
     current = Get(key) ?? 0
     reserved = max(current, floor)
     Txn:
       If (key unchanged since the read):
-        Put(key, reserved+1)
-        return reserved
+        Put(key, reserved+count)
+        return reserved          # the caller owns [reserved, reserved+count)
       Else:
         sleep(backoff + jitter); retry
   return error
@@ -102,19 +104,22 @@ and collide again on the same tick; 16 concurrent callers once exhausted an
 8-attempt budget with only 9 successes. See the comment on `NextCounter` in
 `pkg/metadata/alloc.go`.
 
-**Cost and scaling.** This is one etcd round trip per file creation, from every
-node, against one key. Unlike arena allocation it does not shard, so contention
-grows with node count. That is an accepted tradeoff at current scale, not an
-oversight — but it is the structure most likely to need reworking first if
-metadata-creation throughput becomes a target. A per-node-range scheme mirroring
-the arena allocator is the obvious direction, and is listed among the possible
-future extensions in the repository README.
+**Cost and scaling.** Reserving a block is one etcd round trip per 1024
+creations rather than one per creation, which takes the counter off the critical
+path of a create and leaves the single commit that publishes the file. Contention
+on the one key falls by the same factor, so it no longer grows meaningfully with
+node count.
 
-An earlier iteration of this document described exactly that range-based scheme
-as though it were implemented. It was not: `ReserveInodeRange`/`InodeRange`
-existed in `pkg/membership` but had no caller outside the test harness, and
-`pkg/membership.Manager` itself is never constructed in production. That dead
-code has been removed rather than left to read as live.
+What a block costs is the tail of one that a node stops holding: a daemon that
+exits, or is fenced, strands whatever numbers it had left. Nothing reclaims
+them and nothing needs to. Inode numbers are 64-bit and never reused, so the
+counter counts numbers handed out rather than files alive — which is exactly how
+`statfs` already reports it, as an upper bound on the file count.
+
+`pkg/membership` once carried a different range scheme (`ReserveInodeRange`/
+`InodeRange`) that had no caller outside the test harness; `pkg/membership.Manager`
+is never constructed in production. That dead code was removed rather than left
+to read as live.
 
 ## Graceful Leave
 
@@ -229,6 +234,6 @@ The scrubber cross-checks extents against all nodes' arenas:
 
 - **Orphan detection on arena release.** When an arena is released (node leaves, arena rebalanced), the scrubber checks that all extents within that arena either belong to valid inodes or are properly orphaned. An arena whose extents are not properly referenced by inodes is a candidate for reclamation.
 
-There is deliberately no inode cross-check. An earlier version of this document described one — "an inode number must fall within some node's reserved inode range" — but it was never implemented in `pkg/fsck` or `pkg/scrub`, and it could not be: no per-node inode ranges exist to check against. With a single global counter, the only invariant available is that inode numbers are unique and ≥ `FirstUsableIno`, which the allocator's CAS already guarantees at issue time. If per-node ranges are ever adopted, this check becomes both meaningful and worth building.
+There is deliberately no inode cross-check. An earlier version of this document described one — "an inode number must fall within some node's reserved inode range" — but it was never implemented in `pkg/fsck` or `pkg/scrub`, and it could not be. The block a node reserves lives in that node's memory and is recorded nowhere, so there is no per-node range in etcd to check an inode against. The only invariant available is that inode numbers are unique and ≥ `FirstUsableIno`, which the allocator's CAS already guarantees at issue time.
 
 The scrubber does not prevent nodes from joining or leaving — it only verifies that the metadata remains consistent after the fact.

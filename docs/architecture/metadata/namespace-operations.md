@@ -157,8 +157,10 @@ Extents are the bridge between the metadata layer (etcd) and the data layer (blo
 
 ## Inode Number Allocation
 
-Inode numbers come from a single `inode_alloc_counter` key, CAS-incremented once per allocation by `Store.NextCounter` (which also hands out arena IDs from `arena_alloc_log`). The CAS retries with backoff under contention, so two nodes never receive the same number.
+Inode numbers come from a single `inode_alloc_counter` key, CAS-advanced by `Store.ReserveCounter` (which also hands out arena IDs from `arena_alloc_log`, one at a time). The CAS retries with backoff under contention, so two nodes never receive the same number.
+
+A node reserves a block of 1024 numbers and hands them out from memory, so a creation reaches etcd for its number only once per block. That leaves the create path with the single transaction that publishes the file, and it drops contention on the shared key by the same factor.
 
 The counter has a floor of `FirstUsableIno` (2): 0 is never a valid inode and 1 is `FUSE_ROOT_ID`, the root directory the C daemon answers for locally.
 
-Per-node range reservation would remove the shared key from the path entirely, but it was measured as unnecessary at current contention and strands every number a node has reserved when it dies mid-range.
+A node that stops holding a block strands the rest of it. Inode numbers are 64-bit and are never reused, so nothing reclaims them: the counter says how many numbers have been handed out, not how many files exist, which is the upper bound `statfs` already reports it as.

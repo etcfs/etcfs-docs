@@ -32,7 +32,7 @@ All values are encoded as binary blobs. Integer values use big-endian byte order
 | `membership:<node_id>` | membership metadata | Lease-backed liveness key for cluster membership |
 | `gen:<node_id>` | generation counter | Fencing epoch counter, bumped on confirmed fence |
 | `departed:<node_id>` | RFC3339 timestamp | Written atomically with the membership key's deletion; marks a departure as intentional so peers skip fencing |
-| `inode_alloc_counter` | counter (8 bytes) | Per-node inode-range reservation counter |
+| `inode_alloc_counter` | counter (8 bytes) | Next inode number to hand out; a node CASes it forward by a whole block and allocates from that block in memory |
 | `extent:<ino>/<chunk>` | five comma-separated integers (ASCII) | One extent: a logical byte range of a file mapped onto the shared device |
 
 ### Key semantics
