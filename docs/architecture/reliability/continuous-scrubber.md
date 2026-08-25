@@ -234,10 +234,24 @@ The anomalies the scrubber auto-remediates are orphan extents and dead extents. 
 Remediation, in the same pass that detects them:
 1. The finding is logged with `AutoFix: true`, carrying the `disk_off` and `length` decoded from the extent's value, and the revision the record was at when the scan read it.
 2. `arena.Allocator.Owns(disk_off)` is consulted. A range outside every arena this node holds is reported and left alone — see below.
-3. The `extent:<ino>/<chunk>` key is deleted from etcd, in a transaction conditional on the record still being at that revision. This comes before the reclaim: the blocks must stop being reachable through metadata before they can be handed to another allocation, or a reader resolving the extent could land on data that has already been overwritten. A failed delete skips the reclaim, leaving both the key and its blocks for the next pass.
-4. `arena.Allocator.Free(disk_off, length)` returns the blocks to the free-list.
+3. `ipc.Service.Holds(ino)` is consulted. An inode with an entry in this node's own lock cache is left entirely alone, key and blocks both — see [Reclaiming under a local reader](#reclaiming-under-a-local-reader).
+4. The `extent:<ino>/<chunk>` key is deleted from etcd, in a transaction conditional on the record still being at that revision. This comes before the reclaim: the blocks must stop being reachable through metadata before they can be handed to another allocation, or a reader resolving the extent could land on data that has already been overwritten. A failed delete skips the reclaim, leaving both the key and its blocks for the next pass.
+5. `ipc.Service.Holds(ino)` is asked again, now that the record is gone. If the inode became locked here while the delete was in flight, the range is held back rather than freed, and retried at the start of every later pass.
+6. `arena.Allocator.Free(disk_off, length)` returns the blocks to the free-list.
 
-The comparison in step 3 is what makes the pass safe without an inode lock. A scrub pass works from a snapshot taken some time earlier and takes no lock on the inodes it visits, so a truncate or an overwrite can rewrite the record in between — reclaiming the extent itself, and freeing its blocks, which the allocator may then hand to another file. An unconditional delete cannot detect that, because deleting an already-absent key succeeds, and the pass would free the same range a second time, leaving two files owning the same blocks. Losing the comparison costs nothing: if the extent is still unreachable, the next pass finds it again.
+The comparison in step 4 is what makes the pass safe against *itself*. A scrub pass works from a snapshot taken some time earlier and takes no lock on the inodes it visits, so a truncate or an overwrite can rewrite the record in between — reclaiming the extent itself, and freeing its blocks, which the allocator may then hand to another file. An unconditional delete cannot detect that, because deleting an already-absent key succeeds, and the pass would free the same range a second time, leaving two files owning the same blocks. Losing the comparison costs nothing: if the extent is still unreachable, the next pass finds it again.
+
+### Reclaiming under a local reader
+
+The revision comparison does **not** cover a different case, and steps 3 and 5 are what do.
+
+A read on this node resolves an extent, then issues its device read. Between the two, its own lock key can be deleted by a lease expiry that etcd carried out and this node has not yet observed — etcd itself stays reachable, so nothing fails and nothing is logged. A peer takes the now-unguarded inode and buries that extent in an ordinary overwrite. This node's scrub pass sees the extent as dead, correctly, and frees its blocks; the allocator hands them to another file; and the read that started all of this lands on that other file's data. It is narrow — the whole sequence has to fit inside one read — but it is not excluded by construction.
+
+The revision comparison cannot help: the record really has moved, in a way the pass is right about, and the comparison exists to stop two passes freeing the same range rather than to protect a reader who resolved it first.
+
+What closes it is a question the scrubber can answer locally, with no round trip and no lock of its own: *does this node have an entry in its lock cache for that inode?* Every operation creates one before it reads any metadata, and an entry outlives the operation, so an in-flight read is always visible as one. The answer is a deliberate over-approximation — an inode this node merely touched recently reads as held — and the asymmetry is the point: a deferred reclaim costs a pass, and the opposite error costs a read of another file's data.
+
+Asking once, before the delete, leaves a window the width of the delete transaction: a read can begin inside it. So the question is asked again on the far side of the delete, where the record is already gone and leaving the blocks alone would leak them instead. Those ranges go on a held list, retried at the start of every later pass, and are given back as soon as the inode is quiet. Nothing can reach them in the meantime — no extent record names them — and a restart returns them anyway, because the allocator's bitmap is rebuilt from the records that remain.
 
 Step 2 is the ownership rule, and it is what keeps reclamation from leaking across nodes:
 
@@ -249,7 +263,7 @@ The rule costs nothing, because every arena has exactly one owner and every owne
 
 An extent in an arena that currently sits in the free pool is left alone by the same rule, and is still cleaned up: whoever claims that arena next marks the range live from the record that is still there, and its own next pass then finds it unreachable, owns it, and reclaims it.
 
-The reclaim is not durable, and does not need to be — a restart rebuilds the bitmap from the live extents in etcd, which no longer include the deleted file's, so the space returns that way instead.
+The reclaim is not durable, and does not need to be — a restart rebuilds the bitmap from the live extents in etcd, which no longer include the deleted file's, so the space returns that way instead. That is also what makes a held-back range safe to hold indefinitely.
 
 This is what makes file deletion actually return disk space. `AtomicUnlink` removes the dirent and, at `nlink == 0`, the inode record, but never touches the file's extent keys; without the reclaim step the blocks stay marked allocated with nothing referencing them, and space leaks on every deletion.
 
