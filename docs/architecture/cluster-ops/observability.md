@@ -63,6 +63,7 @@ own latency.
 | `etcfuse_fuse_op_duration_seconds` | Histogram | `op` | End-to-end handler latency |
 | `etcfuse_etcd_txn_total` | Counter | `outcome` | etcd transactions, by outcome (`committed`, `rejected`, `error`) |
 | `etcfuse_metadata_cache_total` | Counter | `result` | Data-path metadata lookups, by whether the lock-held snapshot answered them (`hit`, `miss`) |
+| `etcfuse_dirent_cache_total` | Counter | `result` | Lookups of a name that is not there, by whether this node's cached set of the directory's names answered it (`hit`) or it had to read etcd (`miss`). Sustained misses mean the directories are past the per-directory cap, or the dirent watch is not delivering and the cache is disarmed |
 | `etcfuse_readdir_page_total` | Counter | `result` | READDIR pages, by whether the listing resumed where the last reply stopped (`resumed`) or had to re-read the directory from the start (`rescanned`) |
 | `etcfuse_pending_extents` | Gauge | — | Metadata keys written by acknowledged writes and not yet published to etcd |
 | `etcfuse_pending_bytes` | Gauge | — | Acknowledged write payload those keys stand for, summed across every inode |
