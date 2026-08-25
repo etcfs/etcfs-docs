@@ -326,6 +326,12 @@ volume — which is a decision about the hardware being paid for rather than
 something a default can make. `ETCD_WAL_DIR` in the infra scripts and the
 `etcd*_wal` volumes in the compose file are where that is pointed.
 
+The path must be a directory *inside* the volume and never the mount point
+itself. etcd builds a fresh WAL as `<dir>.tmp` and renames it into place, and a
+rename onto a mount point fails with `EBUSY` — which panics the member on its
+first start and takes the whole compose cluster down with it. The compose file
+mounts the volume at `/etcd-wal` and passes `--wal-dir=/etcd-wal/wal`.
+
 ## The AWS setup path was rewritten to match chaos-lib.sh's proven bootstrap, not fixed in place
 
 *Context:* `setup-compute.sh` (TLS + systemd, for a persistent hand-poked test
@@ -443,14 +449,24 @@ which is why one test of that single bit covers both.
 as one etcd transaction, the way an inode's extents are already deferred;
 (b) leave the create synchronous and take the *other* commits off its path.
 
-*Chosen:* (b). An unpacking archive was paying three sequential Raft commits per
-file — one to reserve the inode number, one to publish the file, one to move the
-parent directory's timestamp — and (a) was an attempt to batch the middle one.
-Two of the three turned out to be removable without touching what a create
-means: inode numbers are now reserved a block at a time
-(`internal/ipc/inodealloc.go`) and directory timestamps are coalesced
-(`pkg/metadata/dirtouch.go`). What is left is the one transaction that makes the
-file exist.
+*Chosen:* (b). An unpacking archive was paying six sequential Raft commits per
+file — reserve the inode number, publish the file, move the parent's timestamp,
+acquire the file's lock on the first write, publish the extent at `close()`,
+release the lock when the cache evicted it — and (a) was an attempt to batch the
+second. Four of the six turned out to be removable without touching what a
+create means:
+
+- the inode number, reserved a block at a time (`internal/ipc/inodealloc.go`);
+- the parent's timestamp, coalesced (`pkg/metadata/dirtouch.go`);
+- the lock, taken by the create transaction itself (`Store.PrepareLock`,
+  `Service.seedCreatedLock`) — the inode number is known when the name is
+  published and no peer can be contending for a number nobody has been told
+  about;
+- the release, batched into one transaction per eviction sweep
+  (`Store.ReleaseLocks`).
+
+What is left is the transaction that makes the file exist, and the extent
+publication `close()` forces.
 
 That last one cannot be deferred, and the reason is not the crash window.
 Deferring an extent is safe because a node holding an inode's exclusive lock
@@ -483,6 +499,40 @@ is a load-bearing property of this design and of the shared-directory numbers it
 produces, not an accident, so trading it for a create-batching optimisation is
 the wrong direction. The crash window would be the easy part; the exclusion is
 the whole cost.
+
+## close() still publishes, and that is close-to-open consistency rather than durability
+
+*Options:* (a) answer `close()` from what the daemon already knows and let the
+interval sweep publish the buffer, so an archive's closes share one commit the
+way the sweep's other inodes do; (b) keep `close()` blocking on its own commit.
+
+*Chosen:* (b), after (a) was built and measured. The argument for (a) is sound
+as far as it goes: `close()` does not promise durability, POSIX asks it to
+surface an error the descriptor already suffered, and deferring the *extent* is
+exactly the trade write delegation already makes with a 100 ms bound. The
+coherence argument seemed to hold too — a peer cannot read the file without
+taking its lock, and it cannot take the lock without recalling this node's,
+which publishes before yielding.
+
+That last step is where it breaks, and only a cluster test showed it. **A peer's
+`stat` does not take the inode's lock**, so nothing recalls this node's lock on
+its behalf. The peer reads a size etcd has not been told about, and `cat` stops
+at the old one — an empty file where a complete one was closed a moment earlier.
+The single-cluster chaos suite went from 20 passes to 13, and the failures were
+not subtle: a peer reading nothing (S10, S11, S13) and a killed daemon losing
+what a closed file held (S2, S6).
+
+So the commit at `close()` is not paying for durability. It is what makes a file
+closed on one node readable in full on another, given that the attribute path is
+lock-free — and making the attribute path take the lock would put a Raft commit
+on every cold `stat`, which is far more expensive than the one it saved.
+
+What survives from (a) is the batching itself: `Service.flushEntries` publishes
+many inodes in one transaction, and the interval sweep and the shutdown flush
+both use it. It helps a workload with several inodes buffering at once and does
+nothing for a single-threaded archive, whose closes are serial by construction.
+Removing that last commit needs the peer's `stat` to be answerable without it,
+which is a different piece of work.
 
 ## Locks are whole-inode, and byte ranges are not a small change to that
 

@@ -398,6 +398,40 @@ legal on its own. What the durability *surface* has to keep promising:
    still setuid, so a write that changes the mode commits before it is
    acknowledged, exactly as every write did before.
 
+### One transaction for many inodes
+
+An inode's proposal asserts only things about that inode: the keys it is
+rewriting are where this node last saw them, and its own lock key still exists.
+Nothing in it refers to any other inode, so several inodes' proposals
+concatenate into one transaction that means precisely what the separate ones
+meant. The interval sweep (`Service.flushExpired`) and the shutdown flush do
+exactly that through `Service.flushEntries`: every inode whose buffer has aged
+past the interval is published together, for one Raft commit rather than one
+each.
+
+The sweep takes inodes in chunks of `flushBatchInodes` (64), and the etcd
+transaction op cap splits a chunk further when its inodes carry large buffers.
+Chunking is what bounds the wait it imposes: the sweep holds an inode's local
+lock from the moment it claims it until the transaction has committed, so an
+operation on a claimed inode waits one commit however many inodes the sweep
+finds.
+
+A batch is all-or-nothing, which is the wrong shape for a rejection — one inode
+whose lock key was lost would hold every other inode's writes unpublished. So a
+rejected batch is not diagnosed as a batch. Each member is retried alone through
+`flushLocked`, which has the per-inode handling a rejection needs: a commit
+whose reply was lost, a key the lease dropped, a key still held while a
+comparison failed anyway. The batch is the fast path; the single flush stays the
+one that decides what a failure meant.
+
+**`close()` is not batched, and deliberately so.** Deferring the publication a
+`close()` forces is what would let a single-threaded archive's closes share a
+commit, and it was measured to break close-to-open consistency: a peer's `stat`
+does not take the inode's lock, so nothing recalls this node's on its behalf,
+and a peer reading a size etcd has not been told about stops at the old one. The
+commit at `close()` is not the durability POSIX declines to promise there — it
+is what makes a file closed on one node readable in full on another.
+
 ### What makes it safe
 
 The flush carries the comparisons the buffered writes were planned against —

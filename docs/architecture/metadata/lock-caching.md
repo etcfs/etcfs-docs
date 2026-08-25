@@ -41,6 +41,14 @@ transaction that publishes it), and an uncontended read is none.
 This is a write delegation in the NFSv4 sense, scoped to the lock rather than
 to an open file descriptor.
 
+One acquisition is removed rather than cached: the *first* one on a file this
+node has just created. The lock key rides the create transaction — see
+[Atomic Create](namespace-operations.md#the-files-lock-rides-the-same-transaction)
+— so the write that follows the create finds it already held, and the entry is
+seeded with the record the create published. A file an archive creates and
+immediately writes therefore reaches etcd once, for the create, and not again
+until the extent is published.
+
 ## What Changed and What Did Not
 
 Caching touches only *how often the daemon asks etcd who holds a lock*. It
@@ -225,12 +233,31 @@ one this same node wrote.
 ## Cache Bound and Eviction
 
 The cache holds at most `lockCacheMax` (4096) inodes. Past that,
-`lockMap.evictLocked` picks the least-recently-used entry with no operation
-currently in flight, publishes anything it has buffered, and releases its etcd
-key. An entry an operation is using is skipped, never waited for — a cache full
-of busy inodes is allowed to grow past the target rather than block a request
-trying to make room, and an entry whose writes cannot be published is left in
-place for the same reason a recall leaves one.
+`lockMap.evictLocked` takes the `lockEvictBatch` (64) least-recently-used
+entries with no operation currently in flight, publishes anything they have
+buffered, and gives up all of their etcd keys **in one transaction**
+(`Store.ReleaseLocks`). An entry an operation is using is skipped, never waited
+for — a cache full of busy inodes is allowed to grow past the target rather than
+block a request trying to make room, and an entry whose writes cannot be
+published is left in place for the same reason a recall leaves one.
+
+A batch rather than one victim because a release is a Raft commit and one
+transaction of 64 deletes costs what one delete costs. It matters for a workload
+whose working set is far larger than the cache: an unpacking archive touches
+80,000 inodes against 4,096 entries, so it evicts one inode for every new one
+and used to pay that commit per file. Between sweeps the cache sits under its
+bound by up to a batch, which is 1.6% of it — the bound was already a target
+rather than an invariant in the other direction.
+
+Batching changes nothing about what a key stands for. Each key is still deleted
+individually, still by exact holder token, and everything owed before a key may
+be yielded is still discharged per inode and can still refuse: the buffer is
+published and the kernel's pages are invalidated, and an entry that fails either
+keeps its key and its place in the cache. The one thing that moves is the
+*recorded* hold: the batch's release is timed from the moment every one of its
+invalidations had finished, so a key's hold ends slightly later in the history
+than it did in reality. That is the safe direction for a mutual-exclusion
+checker, which can then only ever report overlaps that really happened.
 
 ## What the Lock Makes Cacheable
 
@@ -258,9 +285,10 @@ giving the data up in the same breath. Three rules discharge it.
 
 **Releasing the key publishes what is buffered under it, then clears what was
 cached under it.** Every path that gives the key back — a recall, an eviction,
-an upgrade from shared to exclusive, shutdown — goes through
-`releaseKeyLocked`, and that function drops the snapshot as it drops the key;
-`dropCachedLock` flushes ahead of it. A buffer that cannot be published because
+an upgrade from shared to exclusive, shutdown — goes through the same two steps:
+`prepareDropLocked` publishes the buffer and invalidates the kernel's pages, and
+`forgetKeyLocked` drops the snapshot as the key is given up. A single release
+and a batch of them differ only in how many deletes ride one transaction. A buffer that cannot be published because
 its key is already gone is discarded and its blocks returned to the arena,
 which loses nothing another node could ever have seen: nothing buffered was
 ever published. A re-acquired key carries a fresh holder token
