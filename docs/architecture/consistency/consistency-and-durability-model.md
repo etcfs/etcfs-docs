@@ -137,9 +137,13 @@ write after it is impossible while this node holds the lock.
     parent directory's mtime moves. A listing is not atomic against concurrent
     creates and unlinks, and nothing pins it to one etcd revision.
 
-  The one value taken from local state is the size of an inode this node is
-  currently writing, which etcd is behind on by up to the flush interval —
-  see [below](#durability-under-write-delegation).
+  Two values are taken from local state rather than from etcd, both because
+  etcd is behind on them by up to the flush interval: the size of an inode this
+  node is currently writing — see
+  [below](#durability-under-write-delegation) — and the timestamp of a
+  directory this node has just added an entry to, whose commit is coalesced
+  (see [Namespace operations](../metadata/namespace-operations.md)). A peer
+  reads both from etcd and so lags on both by that interval.
 - **Cross-file consistency.** Each inode is independently consistent. There is
   no snapshot across several inodes, and namespace operations are separate
   transactions.
@@ -354,8 +358,10 @@ legal on its own. What the durability *surface* has to keep promising:
 1. **`fsync` reaches the daemon.** `ec_fsync` and `ec_flush` send an IPC
    request and block on it. `close()` sends a flush, so a program that never
    calls `fsync` still publishes before its descriptor goes away. `fsyncdir`
-   remains a no-op: namespace operations commit before they are acknowledged
-   and are never deferred.
+   reaches the daemon too: namespace operations commit before they are
+   acknowledged and are never deferred, but the parent directory's *timestamp*
+   is queued rather than committed per entry, and `fsyncdir` publishes that
+   queue.
 2. **A failed flush does not discard the buffer.** Dropping dirty state after a
    failed writeback is the Postgres fsyncgate failure — it makes the *retry*
    succeed with the data gone. A flush that fails for a transient reason keeps

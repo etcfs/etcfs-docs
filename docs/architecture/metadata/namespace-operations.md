@@ -44,7 +44,17 @@ Attribute changes are written by the `setattr` handler as a CAS transaction pinn
 
 ### Directory Timestamps
 
-POSIX requires an operation that adds or removes an entry to mark the containing directory's `mtime` and `ctime` for update. `Store.touchDir` does this in its own CAS transaction *after* the namespace transaction commits, for both ends of a rename. Folding it into that transaction would mean pinning the parent's record in every create and unlink, so two nodes making unrelated entries in one directory would abort each other; a timestamp one commit late is the better trade, and a failure to record it is logged rather than failing an operation that already succeeded.
+POSIX requires an operation that adds or removes an entry to mark the containing directory's `mtime` and `ctime` for update. `Store.touchDir` does this *after* the namespace transaction commits, for both ends of a rename. Folding it into that transaction would mean pinning the parent's record in every create and unlink, so two nodes making unrelated entries in one directory would abort each other; a timestamp one commit late is the better trade, and a failure to record it is logged rather than failing an operation that already succeeded.
+
+The update is also **coalesced**. Committing one per entry made an unpacking archive pay two Raft commits per file — one to publish the file, one to say the directory it went into had changed, over and over for the same directory. `Store.StartDirTouchBatching` (`pkg/metadata/dirtouch.go`) queues the directory instead and writes it at most once per `--metadata-flush-interval`, so a stream of creates into one directory costs one timestamp commit per interval rather than one per create. Zero disables the queue and writes each one through, exactly as it commits every extent before acknowledging a write.
+
+What the queue changes, and what it does not:
+
+- The entry and the inode are still published by the transaction that returns to the caller. Nothing about the namespace itself is deferred, and the data-then-metadata ordering is untouched.
+- The node that made the change reads the new timestamp immediately: `Store.PendingDirTime` answers from the queue and the IPC handlers apply it to every `stat` (`Service.withPending`), so a create followed by a `stat` of its parent on the same node is never behind.
+- A peer sees the timestamp up to one interval late. Its cached listing is invalidated by the dirent watch, which fires on the entry itself rather than on the timestamp, so what actually lags is only the clock — the same lag deferred extent publication already gives a file's size.
+- A queued timestamp is only ever written forward. Something that folds the parent's `mtime` into its own transaction — `mkdir` does, through `adjustDirNlink` — may commit a newer one while a touch is still queued, and the flush skips its own value rather than taking the directory's clock backwards.
+- `fsync`, `fsyncdir` and shutdown publish the queue. `fsyncdir` used to be answered locally with success on the grounds that nothing was deferred; that is what makes it mean something now.
 
 ## Directory Entry Operations
 
