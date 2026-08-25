@@ -453,20 +453,13 @@ as one etcd transaction, the way an inode's extents are already deferred;
 file — reserve the inode number, publish the file, move the parent's timestamp,
 acquire the file's lock on the first write, publish the extent at `close()`,
 release the lock when the cache evicted it — and (a) was an attempt to batch the
-second. Four of the six turned out to be removable without touching what a
-create means:
+second. Two of the six turned out to be removable without touching what a create
+means: the inode number, reserved a block at a time
+(`internal/ipc/inodealloc.go`), and the parent's timestamp, coalesced
+(`pkg/metadata/dirtouch.go`).
 
-- the inode number, reserved a block at a time (`internal/ipc/inodealloc.go`);
-- the parent's timestamp, coalesced (`pkg/metadata/dirtouch.go`);
-- the lock, taken by the create transaction itself (`Store.PrepareLock`,
-  `Service.seedCreatedLock`) — the inode number is known when the name is
-  published and no peer can be contending for a number nobody has been told
-  about;
-- the release, batched into one transaction per eviction sweep
-  (`Store.ReleaseLocks`).
-
-What is left is the transaction that makes the file exist, and the extent
-publication `close()` forces.
+Two more were attempted on 2026-08-25 and **reverted** — see
+[the create-time lock](#the-create-time-lock-key-was-reverted) below.
 
 That last one cannot be deferred, and the reason is not the crash window.
 Deferring an extent is safe because a node holding an inode's exclusive lock
@@ -499,6 +492,75 @@ is a load-bearing property of this design and of the shared-directory numbers it
 produces, not an accident, so trading it for a create-batching optimisation is
 the wrong direction. The crash window would be the easy part; the exclusion is
 the whole cost.
+
+## The create-time lock key was reverted
+
+*Options:* (a) write the inode's exclusive lock key inside the create
+transaction, so the first write to a new file needs no acquisition of its own,
+and batch the eventual releases one transaction per eviction sweep; (b) leave
+both alone.
+
+*Chosen:* (b), after (a) was built, verified and measured. The reasoning behind
+(a) still looks right on paper: the inode number is known when the name is
+published, no peer can be contending for a number nobody has been told about,
+and the create transaction asserts exactly what `AcquireLock` asserts. It passed
+the chaos suite, the TLA+ models and the Porcupine checkers. It is the
+measurement that killed it.
+
+**What it did.** Nearly every eviction's page invalidation began to fail:
+
+```
+WARN "no client to invalidate kernel pages"
+     error="read unix /run/etcfuse/etcfuse-notify.sock->@: i/o timeout"
+```
+
+Invalidating an inode's kernel pages is a synchronous round trip to the FUSE
+daemon, which then calls into the kernel. With the create-time lock in place the
+ack stops arriving in time, the notify connection is torn down, and page caching
+is disabled and re-enabled in a loop. Batching the releases made it about four
+times worse, because a sweep issues its invalidations back to back with no gap;
+it also livelocked, since victims are chosen oldest-first and a failed release
+leaves the same entries at the front of the queue forever.
+
+Measured over 5,000 files against a deliberately shrunken lock cache, which
+reaches the same eviction turnover as 80,000 files against the real one:
+
+| build | notify failures | files/s |
+|---|---|---|
+| neither change | 0 | 63.4 |
+| create-time lock only | 4,681 | 35.5 |
+| both | 18,930 | 69.3 |
+| create-time lock removed, everything else kept | 0 | 63.0 |
+
+At full scale it stopped being a slowdown and became a failure: an 80,000-file
+copy died part way with `ENOENT`, and on AWS `m7i.large` the same workload took
+2325 s against 1698 s without the change.
+
+**Why it is not simply a bug to fix.** The cache-invalidation socket carries two
+kinds of traffic on one serial thread (`pkg/fuse/fuse.c`, `notify_thread`):
+`NOTIFY_INVAL_ENTRY`, fire-and-forget, one per create from the dirent watch; and
+`NOTIFY_INVAL_INODE`, which the backend **blocks on**, because it may not yield
+an inode's lock until the kernel's pages for that inode are gone.
+
+An unpacking archive floods that thread with entry invalidations. An inode
+invalidation queues behind thousands of them, the backend's read deadline
+expires, and the connection is dropped as out of step — which disables page
+caching for the whole mount until the next open re-enables it, whereupon it
+happens again. It is head-of-line blocking between acknowledged and
+unacknowledged traffic sharing one channel, not slowness, and no amount of
+making the daemon faster fixes it.
+
+Eviction holding the lock cache's own mutex across the invalidation is what
+masked it. That mutex is taken by every operation on the node, so holding it
+throttled the create stream and kept the queue shallow. Releasing it — correct
+in isolation, and necessary before releases could be batched at all — removed
+the throttle and let the queue run away.
+
+So the prerequisite is separating the two: acknowledged invalidations need a
+path that cannot queue behind unacknowledged ones, either their own socket and
+thread or an entry-invalidation queue the notify thread drains without holding
+up acks. Until then the create-time lock is not available, and the commit it
+would save stays on the per-file path.
 
 ## close() still publishes, and that is close-to-open consistency rather than durability
 
