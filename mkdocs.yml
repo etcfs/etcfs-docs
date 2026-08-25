@@ -95,11 +95,13 @@ nav:
           - Dual-Confirmed External Fencing: reports/chaos-reports/external-fencing-detach.md
           - Fuzz, Fencing Retry, Arena, NVMe: reports/chaos-reports/fuzz-fencing-retry-arena-nvme.md
       - Benchmark Reports:
+          - Overview — Wins and Losses: reports/benchmark-reports/overview.md
           - EtcFS vs. JuiceFS, GlusterFS, GFS2, NFS: reports/benchmark-reports/etcfs-vs-juicefs-gluster-gfs2-nfs.md
           - Warm Page Cache: reports/benchmark-reports/warm-page-cache.md
           - Negative Lookup: reports/benchmark-reports/negative-lookup.md
           - Cross-Node Handoff: reports/benchmark-reports/cross-node-handoff.md
           - Node-Kill Recovery: reports/benchmark-reports/node-kill-recovery.md
+          - Elasticity — Membership Change Cost: reports/benchmark-reports/elasticity.md
           - Metadata Under Concurrency: reports/benchmark-reports/metadata-concurrency.md
           - Small-File Metadata Storm: reports/benchmark-reports/smallfile-storm.md
           - Single-Node Ceiling: reports/benchmark-reports/single-node-ceiling.md

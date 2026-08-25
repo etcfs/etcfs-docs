@@ -1,6 +1,6 @@
 # Benchmark Report — Single-Node Ceiling
 
-*2026-08-16*
+*2026-08-24*
 
 ## Summary
 
@@ -12,7 +12,8 @@ Same five isolated 3-node clusters as the other reports; the raw-device number i
 
 | Backend | Raw seq write (MiB/s) | FS seq write (MiB/s) | % of raw bandwidth | % of raw IOPS |
 |---|---|---|---|---|
-| etcfs | 254.15 | 151.76 | 59.71% | 22.39% |
+| etcfs (2026-08-24) | 254.14 | 166.71 | 65.60% | 21.70% |
+| etcfs (2026-08-16) | 254.15 | 151.76 | 59.71% | 22.39% |
 | gfs2 | 254.06 | 212.25 | 83.54% | 99.61% |
 | nfs | 254.14 | 167.98 | 66.10% | 79.98% |
 | juicefs | 254.14 | 209.93 | 82.60% | 27.02% |

@@ -1,6 +1,6 @@
 # Benchmark Report — Small-File Metadata Storm
 
-*2026-08-16*
+*2026-08-24*
 
 ## Summary
 
@@ -12,7 +12,8 @@ Same five isolated 3-node clusters as the other reports.
 
 | Backend | Untar time | Creates/sec |
 |---|---|---|
-| etcfs | 4153.5 s (69.2 min) | 19.26 |
+| etcfs (2026-08-24) | 3327.1 s (55.5 min) | 24.05 |
+| etcfs (2026-08-16) | 4153.5 s (69.2 min) | 19.26 |
 | gfs2 | 29.8 s | 2688.89 |
 | nfs | 1054.0 s (17.6 min) | 75.90 |
 | juicefs | 864.0 s (14.4 min) | 92.60 |

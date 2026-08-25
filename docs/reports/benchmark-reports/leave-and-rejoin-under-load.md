@@ -1,6 +1,6 @@
 # Benchmark Report — Leave and Rejoin Under Load
 
-*2026-08-17*
+*2026-08-24*
 
 ## Summary
 
@@ -10,19 +10,21 @@ Single isolated 3-node etcfs cluster, same shape as the other reports. This scen
 
 ## Results
 
-| Metric | Value |
-|---|---|
-| Mean rejoin time (3 cycles) | 4.556 s |
-| Survivor baseline throughput | 246.87 MiB/s |
-| Worst survivor throughput (any cycle) | 243.48 MiB/s |
-| Worst survivor dip | 1.37% |
-| Arenas owned before | 4 |
-| Arenas owned after 3 cycles | 4 |
+| Metric | 2026-08-24 | 2026-08-17 |
+|---|---|---|
+| Mean rejoin time (3 cycles) | 4.047 s | 4.556 s |
+| Survivor baseline throughput | 253.29 MiB/s | 246.87 MiB/s |
+| Worst survivor throughput (any cycle) | 245.63 MiB/s | 243.48 MiB/s |
+| Worst survivor dip | 3.02% | 1.37% |
+| Arenas owned before | 3 | 4 |
+| Arenas owned after 3 cycles | 4 | 4 |
 
-Per-cycle rejoin times: 4.467s, 4.677s, 4.523s — consistent across all three, each one reattaching the volume it lost to fencing on the way out (see the join-latency report for why a clean leave still gets fenced).
+The 2026-08-17 run's per-cycle rejoin times were 4.467s, 4.677s and 4.523s, each one reattaching the volume it had lost to fencing on the way out. A clean leave no longer gets fenced — a departing node announces itself in the same transaction that removes it from membership — so the 2026-08-24 cycles reattach nothing, which is where the half-second went.
+
+One number moved in a direction worth watching: the cluster owned 3 arenas before the cycles and 4 after. The leaver's arena is released on departure and a fresh one is claimed on rejoin, and the count is read immediately after the last rejoin, so a reclaim still in flight explains it — but three cycles ending one arena up is exactly the shape a slow leak would have, and this scenario exists to catch that. The soak (see [Arena Fragmentation Soak](arena-fragmentation-soak.md)) is the run that would separate the two.
 
 ## Reading these numbers
 
-Both of the scenario's own questions come back clean. Survivor impact is small and roughly noise-level (1.37% worst-case dip, 246.87 → 243.48 MiB/s) — a rejoining node claiming its own arena really does cost the rest of the cluster close to nothing, unlike this report's sibling (join-latency, which measured a 30.93% dip under a very similar setup and flagged it as needing a follow-up to separate "joining costs something" from "this specific recovery path costs something"). The gap between the two reports' impact numbers is itself informative: rejoin-load's baseline throughput here (246.87 MiB/s, sequential 1M writes) is far higher than join-latency's (13.74 MiB/s, random 4K writes) — a workload with more slack to absorb a brief reattach-and-restart window shows a much smaller dip, which is consistent with the reattach cost being close to fixed while the room to hide it in scales with the survivors' own workload.
+Both of the scenario's own questions come back close to clean. Survivor impact is small (3.02% worst-case dip in the 2026-08-24 run, 253.29 → 245.63 MiB/s; 1.37% in the earlier one) — a rejoining node claiming its own arena really does cost the rest of the cluster close to nothing, unlike this report's sibling (join-latency, which measured a 30.93% dip under a very similar setup and flagged it as needing a follow-up to separate "joining costs something" from "this specific recovery path costs something"). The gap between the two reports' impact numbers is itself informative: rejoin-load's baseline throughput here (246.87 MiB/s, sequential 1M writes) is far higher than join-latency's (13.74 MiB/s, random 4K writes) — a workload with more slack to absorb a brief reattach-and-restart window shows a much smaller dip, which is consistent with the reattach cost being close to fixed while the room to hide it in scales with the survivors' own workload.
 
-Arena count held exactly steady (4 before, 4 after three full cycles) — arena reclaim keeps up with repeated leave/rejoin, and there is no visible leak over this run's length. A longer soak (the next scenario, arena fragmentation) is the more sensitive test of the same question over a much longer churn window.
+Arena count held exactly steady in the 2026-08-17 run (4 before, 4 after three full cycles) and ended one higher in the 2026-08-24 one (3 → 4); see the note under the table. Neither run establishes a leak, and neither rules one out at this length. The arena-fragmentation soak is the sensitive test of the same question over a much longer churn window.

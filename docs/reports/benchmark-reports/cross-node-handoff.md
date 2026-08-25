@@ -1,6 +1,6 @@
 # Benchmark Report — Cross-Node Handoff
 
-*2026-08-16*
+*2026-08-24*
 
 ## Summary
 
@@ -17,6 +17,38 @@ Same five isolated 3-node clusters as the earlier comparison report, each with i
 | nfs | 70 | 61 | 61 | 61 | 333.33 | 587.16 | 590.20 | 226.47 |
 | juicefs | 116 | 101 | 80 | 90 | 333.33 | 412.90 | 427.74 | 195.57 |
 | gluster | 89 | 66 | 66 | 67 | 250.00 | 463.77 | 308.16 | 244.16 |
+
+### etcfs re-run on a volume that does not cap it (2026-08-24)
+
+The table above was taken on a 1000-IOPS / 20 GB volume, which capped every
+backend at roughly the same ceiling. etcfs was re-run alone on a
+16,000-IOPS / 64 GB volume, with the producer publishing the file
+(`user.etcfs.publish`) before the consumer reads it — which is what the number
+was always supposed to measure, since without it the consumer's first read pays
+for a lock recall round trip that lands inside time-to-first-byte.
+
+| Size | TTFB (ms) | Read (MiB/s) |
+|---|---|---|
+| 1 MiB | 71 | 142.86 |
+| 64 MiB | 69 | 233.58 |
+| 1 GiB | 82 | 187.96 |
+| 8 GiB | 112 | 255.95 |
+
+The gap the scenario was designed to expose still does not appear, and the
+reason has moved rather than gone away. At 8 GiB etcfs reads a file another node
+has just written at **255.95 MiB/s**, and the raw-device ceiling measured on the
+same instance type in the same session
+([Single-Node Ceiling](single-node-ceiling.md)) is **254.14 MiB/s** — the
+handoff is now running at the device's own speed, so what binds is the
+t3.medium's EBS throughput allowance, not the volume's IOPS and not etcfs's
+coordination. Time-to-first-byte held at 69–112 ms across a 8000x range of file
+sizes, which is the property worth stating: on a shared device only the extent
+map crosses the network, so handing over a file costs the same whether it is
+1 MiB or 8 GiB.
+
+Separating etcfs from the network-relaying backends needs an instance class with
+more EBS bandwidth than any of these numbers, not a bigger volume. Until then
+this scenario measures the hardware.
 
 All five backends land in the same 60-330 MiB/s band and single-digit-to-low-hundreds-of-ms TTFB — the shared 1000-IOPS/20 GB io2 Multi-Attach volume caps every backend at roughly the same device ceiling here, so this run does not show the widening gap the scenario was designed to expose. That gap is expected to show up on a volume sized so the network-relaying backends (NFS, JuiceFS through object storage) are bandwidth-bound while etcfs/GFS2 stay device-bound — worth a follow-up sweep with a higher-IOPS volume or larger N before drawing conclusions about the win margin.
 

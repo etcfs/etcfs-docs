@@ -4,45 +4,66 @@
 
 ## Summary
 
-Repeated `stat()` of names that do not exist: 200 distinct missing names swept 200 times, probed in a directory holding 50 real entries. `scripts/bench/compare/bench-negative-lookup.sh`, five backends, each on its own isolated 3-node AWS cluster with a dedicated 1000-IOPS io2 Multi-Attach volume.
+Repeated `stat()` of names that do not exist — the pattern a compiler walking an
+include path generates, or a build system checking whether a target needs
+rebuilding (`scripts/bench/compare/bench-negative-lookup.sh`). 200 distinct
+missing names in a directory holding 50 real entries; one cold sweep with the
+caches dropped, then 200 warm sweeps of the same names.
 
-This is the pattern a compiler walking an include path generates, or a package manager probing for an optional config, or a build system checking whether a target needs rebuilding — thousands of lookups a second for files that are not there. Nothing else in this suite produces it: the rest is block I/O plus one directory walk, and a walk only ever asks about names that exist.
+A missing name is the one lookup a cluster filesystem can get badly wrong:
+answering it costs a full round trip to the metadata store unless the client is
+allowed to remember the absence, and "remember that something is absent" is
+exactly the claim another node invalidates by creating the file.
 
-It is worth its own scenario because a missing name is the one lookup a filesystem can answer without touching anything, if it is allowed to remember the absence. FUSE permits that: a `LOOKUP` reply carrying inode 0 means "no such name", and its `entry_timeout` says how long the kernel may answer further probes for that name without asking again (`negativeEntryResp` in `internal/ipc/socket.go`).
+All five backends were measured in the same session on the same day, which the
+previous version of this report could not say — its etcfs column came from a
+separate run.
 
 ## Results
 
-| Backend | Cold us/lookup | Warm us/lookup | Cold lookups/s | Warm lookups/s | Speedup |
-|---|---|---|---|---|---|
-| etcfs | 1,073.50 | **2.10** | 931.53 | 475,624.26 | 511.19x |
-| nfs | 272.50 | 3.64 | 3,669.72 | 274,725.27 | 74.86x |
-| gfs2 | **9.50** | 5.40 | 105,263.16 | 185,270.96 | 1.76x |
-| juicefs | 314.50 | 322.89 | 3,179.65 | 3,097.01 | 0.97x |
-| gluster | 511.50 | 693.36 | 1,955.03 | 1,442.25 | 0.74x |
+| Backend | cold (µs/lookup) | warm (µs/lookup) | warm speed-up |
+|---|---|---|---|
+| nfs | 231.50 | 3.68 | 62.9x |
+| gfs2 | 10.50 | 5.40 | 1.9x |
+| etcfs | 1474.50 | 8.81 | **167.4x** |
+| juicefs | 273.00 | 274.80 | 0.99x |
+| gluster | 507.50 | 501.62 | 1.01x |
 
-## Reading these numbers honestly
+## Reading these numbers
 
-**The 511x flatters EtcFS, and the warm column is the real result.** A speedup ratio rewards a slow starting point, and EtcFS has by far the slowest cold path of the five — 1,073.50 us, roughly 4x worse than nfs and 113x worse than gfs2. Every cold negative lookup is an etcd round trip. What the scenario actually establishes is the *warm* figure: at 2.10 us EtcFS answers a repeated missing-name probe faster than any of the other four, because after the first probe it answers from the kernel's negative dentry cache without a FUSE upcall at all.
+**Warm, etcfs answers a missing name in 8.81 µs** — within a factor of two of
+NFS (3.68 µs) and GFS2 (5.40 µs), and 30–60x faster than gluster or juicefs,
+neither of which caches absences at all at this set size (both are flat: their
+"warm" pass costs the same as their cold one).
 
-Warm against warm, which is the comparison that does not depend on how cold each backend's cold pass happened to be:
+**Cold, etcfs is the worst of the five by two orders of magnitude** (1474 µs
+against GFS2's 10.5 µs). That is the shape of the design showing through: a
+first lookup of a name nobody has asked about is an etcd read over the network,
+where GFS2 resolves it from structures already in the local kernel — which is
+also why GFS2's "cold" pass is not really cold at all, and why its 1.9x is not
+a caching failure. `compare_drop_caches` cannot make a GFS2 negative lookup cold.
 
-| Comparison | EtcFS advantage |
-|---|---|
-| vs. nfs (3.64 us) | 1.73x faster |
-| vs. gfs2 (5.40 us) | 2.57x faster |
-| vs. juicefs (322.89 us) | 154x faster |
-| vs. gluster (693.36 us) | 330x faster |
+**The 167x is therefore not a claim to make over the other backends.** A large
+ratio here mostly rewards a slow cold path, and etcfs has the slowest. The
+number that matters against a competitor is the warm one, and there etcfs is
+merely competitive, not ahead. What the ratio does establish is that the
+negative-entry cache works: without it every one of those 40,000 warm lookups
+would have cost the cold price.
 
-**gfs2's 1.76x is not a caching failure.** GFS2 is a shared-disk filesystem mounted directly over the Multi-Attach volume, so a missing name resolves from local in-kernel directory structures rather than a network round trip. `compare_drop_caches` cannot make it network-cold, because there is no network in its lookup path. Its cold path was already 9.50 us — faster than every other backend's *warm* path except EtcFS's. Comparing its ratio against EtcFS's compares two different quantities; the warm column above is the fair reading, and there EtcFS leads by 2.57x.
-
-**gluster and juicefs do not cache absences at all** at this working-set size. Gluster's warm pass is measurably *slower* than its cold one (0.74x) and juicefs is flat (0.97x). Both pay a full round trip on every missing name, which is what the scenario was built to expose.
-
-## Where EtcFS is worse
-
-Stated plainly, because the ratio hides it: **cold negative lookup is EtcFS's weakest measured result against gfs2 anywhere in this suite.** 1,073.50 us against 9.50 us is a 113x deficit. A workload that probes each missing name once and never again — a single cold `make` in a fresh checkout, a one-shot scan — gets no benefit from the negative dentry cache and pays an etcd round trip per probe. The caching only pays when the same absent names are probed repeatedly inside the entry timeout.
+**Set size is a real bound, and it is small.** A cached absence lives for one
+second on etcfs, and a cold lookup costs ~1.5 ms, so a sweep of more than ~500
+names cannot come back to its first name before that name has expired — every
+sweep then re-misses. Measured directly on an earlier cluster: 2000 names give
+1.54x, 200 names give 167–511x, same code. This is a genuine limit worth
+knowing: etcfs's negative caching helps a tight probe loop over a modest set of
+names, which is what the compiler/build-system pattern actually is, and stops
+helping when the working set of missing names outruns the entry timeout.
 
 ## Caveats
 
-- **The EtcFS column was measured on a separate run from the other four.** The four competitor backends ran today under one harness; the EtcFS figure is from the earlier run that established the 200-name configuration. Same script, same defaults, same cluster shape, but not the same day and not the same volume, so treat small differences as noise.
-- **The working set must sweep inside the client's entry timeout, and the result is sensitive to it.** At 200 names EtcFS gives 511x; the same script at 2,000 names gives 1.54x, purely because names begin expiring mid-sweep. That is not a cliff in the filesystem — it is the scenario measuring cache capacity instead of cache behaviour. The 200-name default is what all five backends above ran.
-- One client, single-threaded probes. This measures per-lookup latency, not concurrent lookup throughput.
+- One run per backend. etcfs's warm figure moved between 2.10 µs and 8.81 µs
+  across two runs on identical clusters; the order of magnitude is stable, the
+  digit is not.
+- 200 names, 200 warm sweeps, single-threaded `python3` on one node.
+- The cold column measures very different physical things per backend and should
+  not be read as a ranking of anything but "what a first lookup costs here".

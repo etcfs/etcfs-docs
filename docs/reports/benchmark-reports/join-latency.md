@@ -1,32 +1,63 @@
 # Benchmark Report — Join Latency
 
-*2026-08-17*
+*2026-08-24*
 
 ## Summary
 
-Time from a node's daemon starting to its first successful write, and the impact that join has on the throughput of nodes already running under load — etcfs only, since a joining node claims its own arena, so the expected impact on survivors is none, and that claim is what this measures (`scripts/bench/compare/bench-join-latency.sh`). GFS2 has no equivalent number to take: journals are allocated at mkfs, one per provisioned node, so a node past that count does not join slowly, it fails to join at all.
+Time from a node's daemons starting to its first successful write, and what that
+join does to the throughput of the nodes already running under load — etcfs only
+(`scripts/bench/compare/bench-join-latency.sh`). A joining node claims its own
+arena, so the expected impact on the survivors is none, and that claim is what
+this measures. GFS2 has no equivalent number to take: journals are allocated at
+mkfs, one per provisioned node, so a node past that count does not join slowly,
+it fails to join at all.
 
-Single isolated 3-node etcfs cluster, same shape as the other reports.
+The departing node now leaves *cleanly* — SIGTERM plus unmount — and a clean
+leave no longer causes a fencing detach, since a node that shuts down gracefully
+gives back its locks and arenas and announces the departure in the same
+transaction that removes it from membership. The published 4.49 s from
+2026-08-17 included an EBS reattach that this path no longer triggers, which is
+what this re-run was for.
+
+Single isolated 3-node etcfs cluster.
 
 ## Results
 
-| Metric | Value |
-|---|---|
-| Join time | 4.492 s |
-| Survivor baseline throughput | 13.74 MiB/s |
-| Survivor throughput during join | 9.49 MiB/s |
-| Survivor impact | 30.93% |
-
-## Bugs found and fixed during this run
-
-Three separate issues surfaced getting a real number out of this scenario, in order:
-
-1. **Reused the wrong kill mechanism.** The script originally called `compare_kill_node` (`killall -9`) to take the joiner offline "cleanly." A killed daemon is indistinguishable from a crash to the fencing controller, which detached the joiner's EBS volume for real after lease expiry — same as `bench-node-kill.sh`'s scenario, not a leave. Fixed to use `SIGTERM` + explicit unmount, matching `bench-rejoin-load.sh`'s own established pattern.
-2. **No timeout on the mount-wait poll.** With the volume genuinely detached, `compare_etcfs_start`'s poll loop waited forever for a mount that could never appear — the run hung silently overnight. Traced, fixed, and written up separately: **a graceful leave still gets fenced by design** (etcd's watch API can't distinguish an explicit lease revoke from a TTL expiry, so the fencing controller can't tell intentional departure from a crash). Full explanation and the deferred protocol fix are now in `TODO.md`. For these benchmark scripts specifically, `compare_etcfs_start` now reattaches the volume before restarting (mirroring what `bootstrap-cluster.sh` already does for a full cluster rebuild), and the poll loop now times out at 120s instead of hanging.
-3. **Launch-order race between the two daemons.** Even after the reattach, restarts kept failing: `etcfuse` (the FUSE client) does not retry a missing socket, and launching it back-to-back with `etcfuse-meta` via bare `nohup ... &` raced the socket's creation. `bootstrap-cluster.sh`'s first-boot sequence already sidesteps this with a flat `sleep 4` between the two; `compare_etcfs_start` now polls for the socket file instead of guessing a fixed delay. This fix applies to `bench-rejoin-load.sh` too, since both share the same helper.
+| Metric | 2026-08-24 | 2026-08-17 (with reattach) |
+|---|---|---|
+| Join time | 6.685 s | 4.492 s |
+| Survivor baseline throughput | 2.39 MiB/s | 13.74 MiB/s |
+| Survivor throughput during join | 1.44 MiB/s | 9.49 MiB/s |
+| Survivor impact | 39.75% | 30.93% |
 
 ## Reading these numbers
 
-4.49s to rejoin and pass a write, including the reattach this scenario now honestly measures (see above) — not a bare daemon restart, which is faster on its own (this report's debugging aside above sits at 4-12s cold), but the realistic cost of what "clean leave" currently means on this system.
+**The join itself is a process start, not a stall: 6.7 s from launching two
+daemons to a mount that answers a write.** That is slower than the previous
+run's 4.5 s despite no longer paying for an EBS reattach, so the reattach was
+evidently not the dominant term — daemon start, etcd membership registration and
+arena claim are. Both runs are in the same 4–7 s band, which is the honest
+statement about this number.
 
-The survivor impact (30.93%, 13.74 → 9.49 MiB/s) is a genuine result worth flagging against the scenario's own prediction of "none." Two candidate causes, not distinguished by this run: the reattach and restart itself briefly adds load to the shared etcd cluster (membership re-registration, arena reclaim/re-claim) that the survivors' own commits compete with; or the joiner's write load in `join-baseline` vs. `join-during` genuinely isn't apples-to-apples, since `join-during` runs concurrently with the reattach-and-restart sequence rather than against a fully steady-state joined node. A follow-up run isolating steady-state post-join throughput from the reattach window itself would separate "joining costs the cluster something" from "this specific recovery path costs the cluster something," which are different claims.
+**The survivor-impact percentage should not be read as a throughput claim in
+either direction.** The load here is 4 KiB random writes with `direct=1` on a
+1000-IOPS volume, so the survivors' baseline is 2.39 MiB/s — roughly 600 IOPS
+across two nodes — and a 40% "impact" is a swing of about 240 IOPS on a volume
+whose provisioned rate the two survivors and the joiner are all sharing. Under a
+load that small, a joiner doing its own first writes is enough to move the
+number, and nothing here separates "membership costs the cluster something" from
+"a third writer appeared on a 1000-IOPS volume".
+
+The scenario that answers the same question under a load worth measuring is
+[Elasticity](elasticity.md), where the load is 1 MiB sequential writes at
+258 MiB/s and the join costs the survivors 11.3% with a 0.09 s worst stall, and
+[Leave and Rejoin Under Load](leave-and-rejoin-under-load.md), where three
+leave/rejoin cycles cost 3.0%. Those are the numbers to quote; this one is a
+join *time*.
+
+## Caveats
+
+- One run.
+- The survivor load is deliberately the small-random-write shape, which makes
+  the percentage column noisy; see above.
+- etcfs only, by design — there is no comparable operation on GFS2.

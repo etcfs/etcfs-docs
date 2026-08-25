@@ -3,6 +3,7 @@
 #
 # 403 to datacentre IPs (bot protection):
 https://access\.redhat\.com/.*
+https://www\.ibm\.com/.*
 https://medium\.com/?$
 # Intermittent 5xx:
 https://ceph\.io/?$

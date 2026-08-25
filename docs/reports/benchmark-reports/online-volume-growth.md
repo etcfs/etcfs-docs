@@ -1,6 +1,6 @@
 # Benchmark Report — Online Volume Growth
 
-*2026-08-17*
+*2026-08-24*
 
 ## Summary
 
@@ -14,7 +14,7 @@ Single isolated 3-node etcfs cluster, same shape as the other reports. Ran clean
 |---|---|
 | Filled with | 40 × 512 MiB files (20 GiB volume) |
 | Grown by | 10 GiB (20 → 30 GiB) |
-| New space allocatable after | 3.221 s |
+| New space allocatable after | 3.896 s (2026-08-24); 3.221 s (2026-08-17) |
 
 ## Reading these numbers
 

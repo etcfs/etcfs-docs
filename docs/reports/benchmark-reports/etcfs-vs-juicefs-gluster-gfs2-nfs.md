@@ -1,6 +1,6 @@
 # Benchmark Report — EtcFS vs. JuiceFS, GlusterFS, GFS2, and self-hosted NFS
 
-*2026-08-15*
+*2026-08-25*
 
 ## Summary
 
@@ -17,13 +17,47 @@ Single fio client (`psync` for the FUSE-based backends — EtcFS and JuiceFS —
 
 ## Results
 
+All five backends re-measured in one session on 2026-08-25:
+
 | Backend | randwrite IOPS | randwrite p99 (us) | randread IOPS | randread p99 (us) |
 |---|---|---|---|---|
-| etcfs | 681 | 39059 | 1016 | 11207 |
-| juicefs | 393 | 67633 | 66937 | 100 |
-| gluster | 1041 | 0 | 8030 | 0 |
-| nfs | 681 | 238027 | 48434 | 8847 |
-| gfs2 | 972 | 0 | 1010 | 0 |
+| gluster | 1041 | 288,768 | 8620 | 35,584 |
+| gfs2 | 973 | 432,128 | 1007 | 242,688 |
+| etcfs | 934 | **17,957** | 1016 | 11,076 |
+| nfs | 675 | 244,318 | 44,504 | 8585 |
+| juicefs | 389 | 61,080 | 69,243 | 87 |
+
+The 2026-08-15 run of the same table, for reference: etcfs 681/39,059/1016/11,207,
+juicefs 393/67,633/66,937/100, gluster 1041/0\*/8030/0\*, nfs
+681/238,027/48,434/8847, gfs2 972/0\*/1010/0\*.
+
+\* Those zeros were a reporting bug, now fixed, and they were hiding the most
+interesting column on this page. gfs2 and gluster need the AL2 AMI, which ships
+fio 2.14; that version reports latency percentiles under `clat` in microseconds
+and has no `clat_ns` object at all, which is the only key the summariser read.
+Both backends' p99 figures came out as 0 and were published as "missing data".
+`compare_p99_us` (`compare-lib.sh`) now reads either dialect.
+
+## Reading these numbers
+
+**Throughput is a four-way tie at the device ceiling, and the tail is not.**
+gluster, gfs2 and etcfs all land within 10% of each other on random writes
+(1041 / 973 / 934 IOPS) because a 1000-IOPS volume is what they are all writing
+to. What separates them is p99 latency, where etcfs is **24x better than gfs2**
+(17.96 ms against 432.13 ms), 16x better than gluster (288.77 ms) and 13.6x
+better than nfs (244.32 ms) — for the same throughput, on the same hardware, in
+the same session. The one backend with a better write tail is juicefs
+(61.08 ms), which achieves it by doing 2.4x less work.
+
+That inversion — competitive median throughput, far tighter tail — is the
+clearest single-number case for the design in this whole suite, and it was
+invisible until the fio-2.14 parsing bug above was fixed.
+
+**The read column is not comparable across backends and should not be read as
+one.** nfs's 44.5k and juicefs's 69.2k read IOPS are client page-cache hits on a
+working set that fits in RAM; etcfs's 1016 is the device, because `direct=1` is
+in every job and etcfs honours it. The next section is the experiment that
+established that.
 
 ## Follow-up: does EtcFS's page cache do anything under `direct=1`?
 
@@ -47,6 +81,8 @@ default (`true`):
 | direct=1, run 2 | 1010 | 13828 | 1007 | 10027 |
 | direct=0, run 1 | 878 | 19530 | 1016 | 11469 |
 | direct=0, run 2 | 950 | 16318 | 1016 | 10813 |
+| direct=1, 2026-08-25 | 934 | 17957 | 1016 | 11076 |
+| direct=0, 2026-08-25 | 971 | 15794 | 1016 | 11600 |
 
 Read IOPS is identical across both modes (~1010-1016, pinned to the device
 ceiling) and write IOPS overlaps within run-to-run noise (681-1010 vs.
