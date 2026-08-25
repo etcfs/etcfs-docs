@@ -172,7 +172,7 @@ The Go daemon accepts notification connections on that listener. Each connection
 [u32:be type][u64:be ino][u32:be name_len][name bytes]
 ```
 
-`type=1` is `INVAL_ENTRY`, where `ino` is the parent directory; `type=2` is `INVAL_INODE`, which carries no name and so declares a length of zero.
+`type=1` is `INVAL_ENTRY`, where `ino` is the parent directory; `type=2` is `INVAL_INODE`, which drops an inode's data pages; `type=3` is `INVAL_ATTR`, which drops its cached attributes and leaves the pages alone. The last two carry no name and so declare a length of zero.
 
 The name length is load-bearing rather than cosmetic. This is a stream socket, so two messages written back to back can arrive in a single read. A reader that recovered the name as "whatever came with the header" would swallow the following message as part of it and then read every subsequent header from the middle of a message — and there is no resynchronising a stream with no delimiters. The length lets the reader take exactly one message at a time; a declared length beyond `NAME_MAX` means the stream is already out of step, and the reader drops the connection and reconnects rather than acting on what it decoded.
 
@@ -227,9 +227,9 @@ The watch-driven invalidation covers **all directory entry mutations** across al
 - `AtomicRename` — old entry deleted, new entry created
 
 It does **not** cover:
-- **Inode attribute changes** (size, mode, timestamps) — these are handled by `attr_timeout` and the per-inode lock
+- **Inode attribute changes** (size, mode, timestamps) — these are handled by the cluster-wide inode watch, which pushes an `INVAL_ATTR` for every inode a peer writes, with `attr_timeout` and the per-inode lock behind it
 - **Data writes** — handled by O_DIRECT + locking (the extent is in etcd, the data is on the block device)
-- **Truncation** — the inode size is updated in etcd, but no `INVAL_INODE` is sent. A subsequent `fstat()` returns the cached size (up to `attr_timeout`). The next `read()` triggers a GETATTR which returns the new size, after which the read proceeds against the correct extent list.
+- **Truncation** — the inode size is updated in etcd, and the inode watch turns that into an `INVAL_ATTR` on every other node, so a subsequent `fstat()` reaches the daemon. `attr_timeout` remains the bound for a watch that could not be resumed. The `read()` that follows resolves against the extent list in etcd either way.
 
 ### Connection Lifecycle
 
@@ -245,7 +245,13 @@ That retry is not only about dentries. The Go daemon answers an OPEN as cacheabl
 
 While no client is connected the watch continues to fire and invalidation events are dropped. This is safe for names — the worst case is a dentry stale for up to `entry_timeout` — because a client that is gone took its FUSE session, and every page it had cached, with it.
 
-The etcd watch itself is also re-established whenever it ends, which it can do without the daemon stopping — a compaction past the watched revision is the usual cause. A drain that stopped at the first closed channel would leave the daemon serving names, absences and directory listings from caches nothing could invalidate again, so the watch loop re-opens and logs that it did. A re-opened watch starts from current: changes during the gap are missed rather than replayed, and are bounded by the same entry and attribute timeouts.
+The etcd watch itself is also re-established whenever it ends, which it can do without the daemon stopping — a leader change, a dropped connection, or a compaction past the watched revision. A drain that stopped at the first closed channel would leave the daemon serving names, absences and directory listings from caches nothing could invalidate again, so the watch loop re-opens and logs that it did.
+
+It re-opens **from the revision after the last one it delivered**, so an ordinary reconnection replays the changes in the gap rather than skipping them. That is what makes a long `entry_timeout` or `attr_timeout` defensible: the timeout stops being the only thing between a stale name and a wrong answer.
+
+One case cannot be replayed — etcd compacting past the revision being resumed from, which discards the history the replay would have read. The loop reports that as a gap, restarts from current, and says in the log that every cache this watch keeps fresh is now trusted only until it times out. That is the single window in which the timeouts are load-bearing.
+
+All three cluster-wide watches — dirents, inode records, and peers' lock requests — run on this one loop (`internal/ipc/watch.go`). The lock-request watch had the same hole and the same consequence: a peer's request to have a cached lock back would go unheard for the life of the daemon, and that peer would spend its acquisition budget and take an `EIO`.
 
 ### Verified Behaviour
 
@@ -335,7 +341,7 @@ A negative dentry is only ever created from an absence the store confirmed. A LO
 
 When Node A truncates a file, the extent list in etcd is updated. Node B's subsequent read checks the extent list and reads from the remaining blocks. However, Node B's kernel may have the old file size cached (from before the truncate). If the kernel does not issue a GETATTR before the read, it may read fewer bytes than expected or read past the end of file.
 
-The `attr_timeout = 1.0s` provides an upper bound on how long stale size information can persist.
+The inode watch invalidates the attributes of any inode a peer writes, so a stale size normally lasts one watch delivery; `attr_timeout` is the upper bound for the case where the watch could not be resumed at all.
 
 ### Partial Block at EOF
 

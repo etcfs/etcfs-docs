@@ -31,7 +31,7 @@ The kernel VFS cache provides the most impactful latency reduction, since it eli
 
 The entry cache maps a `(parent_ino, name)` pair to a `(child_ino, attributes)` result. When the kernel needs to look up a name in a directory, it first checks this cache. If the entry is found and has not expired, no FUSE upcall is made.
 
-The cache duration is controlled by `entry_timeout`, returned in every `fuse_reply_entry` response. The default of 1.0 second means that after a successful LOOKUP, repeated accesses to the same path component within 1 second are entirely kernel-local — no IPC, no etcd traffic.
+The cache duration is controlled by `entry_timeout`, returned in every `fuse_reply_entry` response and set by `--entry-timeout` (default 60s). After a successful LOOKUP, repeated accesses to the same path component within that window are entirely kernel-local — no IPC, no etcd traffic. It used to be one second, which is shorter than a walk of any real tree: a sweep of eighty thousand files takes about eleven, so every name had expired before the walk came back to it and a warm `find` cost exactly what a cold one did.
 
 A longer timeout improves performance for read-heavy workloads (build systems, web servers) but delays the visibility of remote changes. The invalidation mechanism (§5) mitigates this by proactively evicting stale entries when watches fire.
 
@@ -39,9 +39,13 @@ A longer timeout improves performance for read-heavy workloads (build systems, w
 
 The attribute cache stores `struct stat` data for each inode. When `stat()`, `fstat()`, or `lstat()` is called, the kernel checks this cache. If the attributes are fresh, the call returns immediately without a FUSE upcall.
 
-The cache duration is controlled by `attr_timeout`, returned in `fuse_reply_attr` and `fuse_reply_entry`. The default of 1.0 second is a reasonable balance: file sizes and timestamps rarely need sub-second accuracy, and 1 second of staleness is invisible to most applications.
+The cache duration is controlled by `attr_timeout`, returned in `fuse_reply_attr` and `fuse_reply_entry` and set by `--attr-timeout` (default 60s).
 
-Attributes are not invalidated proactively. A directory mutation on another node evicts the dentry, which is what makes the new or removed name visible; a change to an inode's own attributes becomes visible when `attr_timeout` expires. The one place `FUSE_NOTIFY_INVAL_INODE` is issued is the data page cache below, which also clears the attributes as a side effect.
+Attributes *are* invalidated proactively, by a cluster-wide watch on the `inode:` prefix that is the counterpart of the dirent watch: a peer's write, `chmod` or `truncate` rewrites the inode record, and every other node turns that event into an `INVAL_ATTR` for the inode. That is what makes a 60-second timeout defensible; without it the timeout was the entire guarantee and had to stay at one second, which is why a `du` over a large tree never benefited from a warm cache.
+
+`INVAL_ATTR` invalidates attributes only — `fuse_lowlevel_notify_inval_inode` with a negative offset. The data pages are governed by the inode's lock and are dropped separately, before that lock is yielded; throwing them away here would discard a cache the node is entitled to keep.
+
+An inode whose lock key this node currently holds is skipped: no peer can have written it, so the change is this node's own and the kernel already has it from the reply that made it. Without that filter a stream of creates would invalidate each new file's attributes immediately after handing them over.
 
 ## Data Page Cache
 
@@ -71,7 +75,7 @@ The negative dentry cache remembers that a name does **not** exist in a director
 
 FUSE spells a cacheable absence as an *entry reply carrying inode 0*: the reply means "no such name", and its `entry_timeout` says how long the kernel may answer further lookups of that name without asking again. A LOOKUP answered with `ENOENT` instead leaves the kernel nothing to remember. EtcFS therefore answers a name the store confirms is absent with a negative entry, and reserves an errno for a lookup it could not *decide* — an etcd failure, or a dirent naming an inode with no record. Only a confirmed absence is a fact, and only a fact may be cached.
 
-The timeout on a negative entry is the same one a found name gets. Both are invalidated by the same dirent watch below, so trusting one longer than the other would be arbitrary; the window either way is one second in which a name's existence may be stale on this node, which is the guarantee positive entries have always had.
+The timeout on a negative entry is the same one a found name gets. Both are invalidated by the same dirent watch below, so trusting one longer than the other would be arbitrary; the window either way is `entry_timeout` in which a name's existence may be stale on this node, which is the guarantee positive entries have always had.
 
 ## Directory Listing Cache
 
@@ -94,7 +98,7 @@ Root is excluded for the same reason. It has no inode record; its attributes are
 
 ## Watch-Driven Invalidation
 
-The kernel cache timeouts alone would be insufficient for a cluster filesystem. If Node A creates a file in `/shared/`, Node B's kernel cache would continue returning `ENOENT` for up to `entry_timeout` seconds — a full second where the file appears to not exist.
+The kernel cache timeouts alone would be insufficient for a cluster filesystem. If Node A creates a file in `/shared/`, Node B's kernel cache would continue returning `ENOENT` for up to `entry_timeout` seconds — a full minute, at the default, where the file appears not to exist. The watches are what make the timeout a backstop rather than the mechanism, which is also why raising it is defensible.
 
 The solution is **watch-driven cache invalidation**. When a dirent changes anywhere in the cluster, the Go daemon issues `FUSE_NOTIFY_INVAL_ENTRY` to the kernel, which immediately evicts the stale cache entry.
 
@@ -155,10 +159,12 @@ The watch-driven invalidation provides **eventual consistency** for the kernel V
 
 | Configuration | Effect | Suitable For |
 |---|---|---|
-| `entry_timeout = 0` | Every path traversal hits etcd | Maximum freshness, high latency |
-| `entry_timeout = 1.0` (default) | Kernel caches for 1s, watches provide sub-100ms invalidation | Balanced |
-| `entry_timeout = 10.0` | Cached for 10s, watches still fire but apps see stale state longer | Read-heavy, single-writer |
+| `--entry-timeout=0` | Every path traversal hits etcd | Debugging a coherence complaint; takes the kernel cache out of the picture |
+| `--entry-timeout=1s` | Kernel caches for 1s, watches provide sub-100ms invalidation | The old default; a walk of a large tree gets no warm benefit |
+| `--entry-timeout=1m` (default) | Cached for a minute, invalidated by the watch within an etcd round trip | Balanced; the watch is what bounds staleness, not the clock |
 
 Negative entries carry the same `entry_timeout` as positive ones and are not separately configurable: both are invalidated by the same watch, so there is nothing to trade off between them.
 
-The watch-driven invalidation dramatically reduces the freshness penalty of longer timeouts. With watches active, a 10-second `entry_timeout` does not mean 10 seconds of stale data — it means that data is stale for at most the watch delivery latency (<< 1 second) after a mutation, and for 10 seconds only if no mutation occurs.
+The watch-driven invalidation is what makes a longer timeout cheap. With watches active, a 60-second `entry_timeout` does not mean 60 seconds of stale data — it means data is stale for at most the watch delivery latency (well under a second) after a mutation, and for 60 seconds only if the watch could not deliver at all.
+
+That last case is now narrow. A watch is re-opened whenever etcd ends it, and re-opened *from the revision after the last one delivered*, so an ordinary reconnection — a leader change, a dropped connection — replays what it missed rather than skipping it. The one thing that cannot be replayed is etcd compacting past the resume point, which discards the history; that is logged as a gap, the watch restarts from current, and for that window the timeout really is the only bound. This applies equally to the dirent watch, the inode watch and the lock-request watch, which all run on the same loop (`internal/ipc/watch.go`).
