@@ -52,6 +52,16 @@ Metadata operations/second in one shared directory:
 | gluster | 665.57 | 1087.65 | 1470.20 | 2.21x |
 | etcfs | 140.92 | 178.77 | 188.44 | 1.34x |
 
+> **The etcfs row predates the 2026-08-25 metadata changes and was not
+> re-measured.** On the 3-node
+> [metadata-concurrency](metadata-concurrency.md) scenario the same workload
+> went from 179.58 to 327.34 ops/s once the inode-number reservation and the
+> parent directory's timestamp came off the per-file path, so the absolute
+> figures here are low by roughly that factor. Whether the *shape* — the part
+> this scenario exists for — moves with them is unmeasured: nothing in the
+> change touches how the curve responds to node count, but that is a
+> prediction, not a result.
+
 \* juicefs's 4- and 6-node bandwidth jobs returned empty fio result files on
 every node, the same failure this scenario recorded at 4 nodes in its previous
 run and that [Elasticity](elasticity.md) hit during its join phase. Its metadata

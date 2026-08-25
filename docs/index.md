@@ -120,9 +120,11 @@ that notices.
   membership churn under load. [Reports](reports/chaos-reports/fresh-cluster-per-scenario.md)
 
 **Where it costs.** Every structural mutation is a Raft commit, and the
-benchmarks say what that is worth: an 80,000-file untar is 112x slower than
-GFS2, shared-directory metadata 8.4x slower, O_DSYNC 4 KiB writes 6.4x slower, a
-cold negative lookup 140x slower. The
+benchmarks say what that is worth: an 80,000-file untar is 75x slower than GFS2,
+shared-directory metadata 4.6x slower, O_DSYNC 4 KiB writes 6.4x slower, `du -s`
+over 80,000 files 312x slower than NFS. The first two were 112x and 8.4x before
+the inode-number reservation and the parent directory's timestamp came off the
+per-file path — the class comes down, and it does not come down to nothing. The
 [overview](reports/benchmark-reports/overview.md) lists every one of them beside
 the wins.
 
