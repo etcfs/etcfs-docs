@@ -237,8 +237,9 @@ there. That window is real, bounded by the lock session's TTL, and the same
 window the metadata snapshot has.
 
 Not modelled, beyond what the fencing spec already leaves out: the want-key and
-the minimum hold time, which only ever *delay* a recall, so omitting them
-admits every behaviour they would have allowed and more; the crash case, where
+the hold time, which only ever *delay* a recall, so omitting them admits every
+behaviour they would have allowed and more — that remains true of the adaptive
+hold, which changes how long the delay is and not that it is a delay; the crash case, where
 unflushed writes are legitimately lost, which belongs to
 [Porcupine](porcupine.md)'s extent model because it can see which node died and
 which writes were fsynced; and a second inode, since every action and every

@@ -126,7 +126,7 @@ exclusive acquisition's CAS compares the whole of `lock:<ino>/` against
 "empty" — a want key stored inside that range would block the very
 acquisition it exists to unblock.
 
-## Minimum Hold Time
+## Hold Time
 
 A freshly acquired lock is held for at least `minHoldTime` (10 ms) before a
 recall is honoured, even if a want key arrives sooner. Without that floor,
@@ -138,6 +138,28 @@ worse than the case the cache exists to fix.
 This is GFS2's `gl_hold_time`, and it makes the same trade: a bounded extra
 wait for the peer, paid for by a bound on how often the lock can change
 hands. It costs nothing when uncontended, since nothing ever recalls it.
+
+**The hold adapts.** A floor answers a recall that arrives moments after an
+acquisition, but not a workload where every handover does — several nodes
+writing disjoint ranges of one file, where the inode changes hands continuously
+and each turn buys one operation before the next recall. So the hold doubles
+whenever a request arrives inside the current one, up to `maxHoldTime` (100 ms),
+and halves whenever one arrives after it, back down to the floor. The state
+lives on the cache entry, which survives a recall, so it is the inode's own
+recent history that decides.
+
+Each direction answers a real failure. Doubling is what stops a contended file
+paying a round trip per operation. Halving is what stops an inode that was
+fought over once from making every later peer wait for a contention that has
+ended.
+
+What the growth spends is the waiting peer's latency, which is why the ceiling
+is not open-ended: a peer waits at most `maxHoldTime` per handover, against an
+acquisition budget that runs to the request deadline, and 100 ms is also the
+flush interval that a recall already has to wait out. `etcfuse_lock_handover_hold_seconds`
+is the distribution — pinned at the ceiling means an inode is being fought over
+continuously and the waiters are paying for it; pinned at the floor means
+recalls are arriving after the holder had finished anyway.
 
 ## Explicit Publish
 
