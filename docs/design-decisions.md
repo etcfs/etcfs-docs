@@ -306,7 +306,25 @@ avoided.
 The fencing controller resumes its membership watch from the last revision it
 saw, so it has to handle that revision being compacted away: it restarts from
 the current revision and lets the authoritative sweep cover the gap, rather than
-retrying a revision that will never come back.
+retrying a revision that will never come back. The daemon's own cluster-wide
+watches — dirents, inode records, peers' lock requests — resume the same way,
+and report the compacted case as a gap so the caches behind them are dropped
+rather than trusted.
+
+## The etcd WAL gets its own directory
+
+Every structural operation this filesystem performs is a Raft commit — a
+create, a lock acquisition, an extent publication — and a Raft commit is a WAL
+fsync. Left in `--data-dir`, those fsyncs queue behind snapshot writes and
+compaction I/O in the same directory, which is why etcd's own tuning guide puts
+the WAL somewhere else. All three deployments now pass `--wal-dir`.
+
+The default puts it in a second directory on the same volume, which separates
+the two workloads but not the device underneath them. Getting the rest means
+mounting that path on a different device — an instance store, or a second EBS
+volume — which is a decision about the hardware being paid for rather than
+something a default can make. `ETCD_WAL_DIR` in the infra scripts and the
+`etcd*_wal` volumes in the compose file are where that is pointed.
 
 ## The AWS setup path was rewritten to match chaos-lib.sh's proven bootstrap, not fixed in place
 
