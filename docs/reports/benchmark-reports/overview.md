@@ -60,14 +60,22 @@ synchronous small writes, per-file metadata walks. The multiples are 4.6x to 75x
 against GFS2: one commit per mutation, on a three-member etcd colocated with the
 data path on a 1000-IOPS volume.
 
-They come down by counting commits and removing them, and the 2026-08-25 round
-is the evidence. An untarred file cost six Raft commits; two were removed — the
-inode-number reservation, now a per-node block, and the parent directory's
-timestamp, now coalesced — and six to four predicts 1.50x against a measured
-1.48x. That took the untar from 112x to 75x behind GFS2 and shared-directory
-metadata from 8.4x to 4.6x. Three of the four that remain are removable the same
-way, without changing what a create means; the
-[small-file storm](smallfile-storm.md) report enumerates all six.
+They come down by counting commits and removing them. An untarred file cost six
+Raft commits; two went first — the inode-number reservation, now a per-node
+block, and the parent directory's timestamp, now coalesced — and six to four
+predicts 1.50x against a measured 1.48x. That took the untar from 112x to 75x
+behind GFS2 and shared-directory metadata from 8.4x to 4.6x, which are the
+figures in the table above.
+
+Two more went on 2026-08-25: the inode's lock key now rides the create
+transaction, and evicted keys are released a batch at a time. A created-and-
+written file costs two commits and a fraction where it cost six. **That round is
+not in the table, because the benchmark could not resolve it** — this scenario
+is no longer commit-bound, the remaining effect is worth at most ~8% of a file's
+cost, and the run-to-run spread is ±20%. The [small-file
+storm](smallfile-storm.md) report has the arithmetic, the two disagreeing A/B
+pairs, and a controlled reproduction where commits do dominate and the change is
+worth 1.84x.
 
 The create transaction itself is not on that list. It commits before it is
 acknowledged, and deferring it means answering `create()` before its exclusivity
