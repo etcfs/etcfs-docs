@@ -558,11 +558,25 @@ the throttle and let the queue run away.
 
 That prerequisite has since been met: the notify thread now enqueues the
 fire-and-forget messages and a second thread makes their kernel calls, so an
-acknowledged invalidation no longer queues behind them. The create-time lock is
-therefore no longer blocked by the channel — but it is not restored on that
-basis alone. What is written above is a measurement, and only a measurement
-showing the notify failures gone and the files-per-second above the 63.4 of the
-build without it should bring it back.
+acknowledged invalidation no longer queues behind them.
+
+**Measured, 2026-08-26.** The create-time lock and the batched releases were put
+back on a scratch branch and run against the full 80,000-file untar on
+`m7i.large`, the scale at which the original attempt died part way with
+`ENOENT`:
+
+| build | untar | files/s | locks not yielded for want of an invalidation |
+|---|---|---|---|
+| create-time lock, before the channel split | 2325 s | — | nearly every eviction |
+| without it, before the channel split | 1698 s | — | 0 |
+| create-time lock, after the channel split | 1152 s | 69.4 | 0 |
+
+The copy completed, and not one lock failed to yield. The failure the revert was
+about is gone. What is not yet established is the 1152 s: it is a cross-date
+comparison against numbers taken on a different day and AMI, with a harness that
+has since changed, so the speed-up needs a same-day run of the build without the
+create-time lock before it means anything. Restoring the lock is that run's
+decision to make, not this one's.
 
 ## close() still publishes, and that is close-to-open consistency rather than durability
 

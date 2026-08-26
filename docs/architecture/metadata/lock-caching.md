@@ -271,7 +271,11 @@ from before a recall cannot be mistaken for a current one even if it survived.
 knows exactly what its transaction did, so it replays that transaction's own
 operations over the list it was built from and publishes the result — there is
 only one statement of what the write changed, and the cache is derived from it
-rather than described a second time. Every other mutation runs under the same
+rather than described a second time. The transaction is decoded before the write
+is buffered or committed, since one the cache cannot account for has to take the
+committing path instead, and applied to the snapshot afterwards, in place: the
+list runs to tens of thousands of extents on a file under random overwrite, and
+rebuilding it per write cost more than everything else the write did. Every other mutation runs under the same
 exclusive lock and says nothing, and for those the default on release is to
 drop the snapshot. Being wrong in that direction costs one read; being wrong
 in the other serves a file's old extent list after it was rewritten.
