@@ -127,12 +127,24 @@ write after it is impossible while this node holds the lock.
   and xattr read etcd linearizably. On a partition they *fail* rather than
   answer stale. But the kernel above them may answer from its own caches, so
   another node's view lags independently of any of this:
-  - `stat()` for `attr_timeout`, which nothing invalidates — no watch covers
-    an inode's own attributes, so a peer's write or `chmod` becomes visible
-    only when that timeout expires.
+  - `stat()` for `attr_timeout`. A cluster-wide watch on inode records drops
+    the kernel's cached attributes when a peer changes one, so the usual bound
+    is that watch rather than the timeout; the timeout is what remains when the
+    watch has a gap.
+  - a file's timestamps for one metadata flush interval on top of that. The
+    times a `setattr` assigns are queued and written behind the call that made
+    them, the way a directory's clock and a file's size already are, so a peer
+    sees them up to an interval late. Only the timestamps: a change to mode or
+    ownership is committed before `setattr` returns, because a peer checks
+    access against what etcd holds and a deferred one would leave it granting
+    permission that had already been taken away.
   - a name's existence *or absence* for `entry_timeout`. A confirmed absence
     is cached exactly as long as a confirmed presence; both are evicted by the
-    cluster-wide dirent watch, typically within one etcd round trip.
+    cluster-wide dirent watch, typically within one etcd round trip. The
+    exception is a peer creating names faster than the local kernel accepts the
+    invalidations: those are queued in the FUSE client and the queue drops its
+    oldest when full, so a name invalidated during such a burst falls back to
+    `entry_timeout`. The client logs the first drop of each burst.
   - a whole directory listing, until that same watch invalidates it or the
     parent directory's mtime moves. A listing is not atomic against concurrent
     creates and unlinks, and nothing pins it to one etcd revision.
