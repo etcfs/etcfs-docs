@@ -79,7 +79,9 @@ The profiled run took 1245.4 s (64.2 files/s) against 1159.1 s unprofiled, which
 
 Commit 6 is worth noting for why it is there at all: the lock cache holds 4096 entries and this scenario creates 80,000 files, so every inode is evicted and every eviction pays a release.
 
-**Both were restored on 2026-08-26**, once the cache-invalidation client stopped serving acknowledged and unacknowledged traffic on one thread. Measured as a same-day pair on `m7i.large`, both builds carrying every other change: 1439.8 s (55.6 files/s) without them against **1159.1 s (69.0 files/s)** with them, and no lock left unyielded for want of a page invalidation in either. See [Design Decisions](../../design-decisions.md#the-create-time-lock-key-was-reverted-then-restored-once-its-channel-was-fixed).
+**Both were restored on 2026-08-26**, once the cache-invalidation client stopped serving acknowledged and unacknowledged traffic on one thread. Measured on `m7i.large`, both builds carrying every other change: 1439.8 s (55.6 files/s) without them against 1159.1 s (69.0 files/s) with them, and no lock left unyielded for want of a page invalidation in either.
+
+Read the second number with care rather than as a speed-up. Five storm runs that day spanned 1159–1440 s and four of them were the same build (1159, 1201, 1245, 1407 s), since each run provisions its own cluster and the spread carries host-to-host variance too. The gap above is inside that spread. What the change removes without ambiguity is a Raft commit per created-and-written file, which the commit counter measures directly and wall clock at n=1 does not. See [Design Decisions](../../design-decisions.md#the-create-time-lock-key-was-reverted-then-restored-once-its-channel-was-fixed).
 
 Those two runs are on a different instance class from the table below and cannot be read against it — the five-way comparison is `t3.medium` throughout, and the competitor rows have not been re-measured.
 

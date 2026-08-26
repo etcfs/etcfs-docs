@@ -572,10 +572,17 @@ which the original attempt died part way with `ENOENT`:
 | **without it, after the channel split** | **1439.8 s** | **55.6** | 0 |
 | **create-time lock, after the channel split** | **1159.1 s** | **69.0** | 0 |
 
-The last two rows are the pair that decides it: same day, same instance type,
-same harness, both carrying every other change. The copy completes, not one lock
-fails to yield, and the create-time lock is worth **1.24x** on the scenario etcfs
-loses worst. That is the evidence the revert asked for, and the lock is back.
+The copy completes and not one lock fails to yield, which is the evidence the
+revert asked for, and the lock is back on that basis.
+
+**The 1.24x is not claimed.** Five storm runs on `m7i.large` that day spanned
+1159 s to 1440 s, and four of them were the *same* build (1159, 1201, 1245,
+1407) — every run provisions its own three-node cluster, so the spread carries
+host-to-host variance as well as run-to-run. The difference between the last two
+rows sits inside it. What the change does with no such uncertainty is remove a
+Raft commit per created-and-written file and turn the release into one commit
+per sixty-four evictions; the commit counter is where that shows, and wall clock
+on this scenario is too noisy at n=1 to add anything.
 
 It is also less than the commit count predicts, and that is the more interesting
 half. The change takes a create-and-write from four Raft commits per file to
