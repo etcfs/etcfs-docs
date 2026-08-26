@@ -86,6 +86,20 @@ If either comparison fails (the name already exists, or the inode was concurrent
 
 Directory creation follows the same pattern but sets `Mode | S_IFDIR` and initialises `Nlink` to 2 (for `.` and `..`). A symlink adds a third operation to the same transaction — the `inode:<ino>/symlink` key holding its target — and a device node carries its `rdev` in the inode record it commits, rather than in a second write.
 
+### The file's lock rides the same transaction
+
+Anything a create can assert in its own transaction costs no second Raft commit, and anything that cannot ride it costs one per file. `create()` folds in one more thing, through `metadata.CreateExtra`: **this node's exclusive lock on the file it is making.**
+
+`Store.PrepareLock` mints a holder token and returns the comparison and the write an ordinary acquisition would have used — the blocking range `lock:<ino>/` must be empty, and the key is written under this node's lock session lease. Both join the create. Nothing about the lock is weakened by taking it this way; it asserts exactly what `AcquireLock` asserts, in a transaction that was already being committed.
+
+What it removes is the acquisition the *first write* to the file used to pay for. An unpacking archive writes every file it creates, so that acquisition was one Raft commit per file. `Service.seedCreatedLock` also seeds the lock cache with the record the create just published and an empty extent list, which is a valid snapshot under exactly the usual rule — this node has held the key continuously since it was read — so the first write finds both the lock and the metadata already in hand and reaches the device without touching etcd.
+
+Only `create()` does this. `mkdir`, `symlink` and `mknod` make inodes nothing is about to write, and a lock taken for them would only be a key to release later.
+
+**The failure that has to be handled** is a create whose transaction committed and whose reply was lost. It is reported as a failure, and it leaves a lock key standing under this node's session lease, held by a token no cache entry names — nothing would ever release it and every peer wanting that inode would block until this node exited. `Service.discardCreatedLock` deletes it rather than reasoning about it: the token names exactly one key and only that create ever had it, so the delete cannot touch a lock anyone else took, and a key that was never written costs one delete of nothing on a path that is already failing.
+
+That delete is load-bearing rather than tidy, and the model checker is what says so: the state it prevents breaks no safety property — a key nobody holds makes nobody a holder — but it leaves the inode unusable to every node in the cluster, because acquiring a lock needs the key free and every release starts from a node that believes it holds one. Taking the delete away is the `CachedLockNoOrphanDiscard` configuration in [TLA+](../../verification/tla-plus.md), and what it breaks is a liveness property. The lock session's lease is the only other thing that would ever clear such a key, which makes the delete the difference between a bounded window and one that lasts as long as the node does.
+
 ## Atomic Link
 
 `AtomicLink` adds a second name for an existing inode. The new dirent and the raised link count commit together: the transaction asserts that the new name is free and that the inode still stands at the revision its count was read at. A link that loses either race writes nothing, so a name refused with `EEXIST` cannot leave the count permanently inflated.

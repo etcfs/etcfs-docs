@@ -3,21 +3,6 @@
 **A cluster-aware filesystem for shared raw block devices — the piece AWS and
 Kubernetes tell you to bring yourself.**
 
-
-## Sections
-
-- **[Deployment](deployment/index.md)** — Terraform module, binaries/containers,
-  configuration, `etcfsctl`, Prometheus + Grafana.
-- **Architecture** — one page per subsystem: FUSE dispatch, metadata schema,
-  locking, block I/O, arenas, fencing, scrubbing, elasticity, crash recovery.
-- **[Verification](verification/index.md)** — pjdfstest, Porcupine, TLA+.
-- **Reports** — results from running the cluster tests, benchmarks and
-  fault-injection harness, all against real AWS infrastructure.
-- **Background** — research on etcd/Raft, VFS/FUSE internals and cluster
-  filesystem prior art that informed the design.
-
-
-## The Idea
 AWS EBS Multi-Attach will attach one io2 volume to sixteen instances at once.
 Kubernetes will hand it to you as a `ReadWriteMany`, `volumeMode: Block` volume.
 Both then stop, and
@@ -47,6 +32,7 @@ path (reads and writes to already-allocated extents) on direct block I/O with no
 etcd round trip at all.
 
 ## What that inversion buys
+
 Every figure below is measured, and each links to the report that carries the
 method and the caveats. Comparisons are against GFS2, GlusterFS, self-hosted NFS
 and JuiceFS, each on its own isolated AWS cluster, all measured in one session —
@@ -142,3 +128,14 @@ per-file path — the class comes down, and it does not come down to nothing. Th
 [overview](reports/benchmark-reports/overview.md) lists every one of them beside
 the wins.
 
+## Sections
+
+- **[Deployment](deployment/index.md)** — Terraform module, binaries/containers,
+  configuration, `etcfsctl`, Prometheus + Grafana.
+- **Architecture** — one page per subsystem: FUSE dispatch, metadata schema,
+  locking, block I/O, arenas, fencing, scrubbing, elasticity, crash recovery.
+- **[Verification](verification/index.md)** — pjdfstest, Porcupine, TLA+.
+- **Reports** — results from running the cluster tests, benchmarks and
+  fault-injection harness, all against real AWS infrastructure.
+- **Background** — research on etcd/Raft, VFS/FUSE internals and cluster
+  filesystem prior art that informed the design.

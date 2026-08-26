@@ -217,6 +217,15 @@ The properties:
 - `ViewMatchesTruth` — what a node believes the inode is equals what etcd
   records, plus whatever that same node has buffered. This is the property the
   metadata cache and both data caches all rest on, and no other spec names it.
+- `OrphanFreed` — a lock key that no node's cache names does not stay that way.
+  This is the one liveness property here, and it is liveness because the state
+  it forbids breaks no safety invariant: a key held by nobody makes at most one
+  node the holder, publishes nothing, and strands no pages. What it does is make
+  the inode unusable to the entire cluster, since acquiring needs the key free
+  and every release starts from a node that believes it holds one. The window
+  itself cannot be designed away — a create's transaction can commit with its
+  reply lost, and no protocol over a lossy reply can promise otherwise — so what
+  is checked is that it ends.
 
 Each broken variant takes exactly one guard away:
 
@@ -229,6 +238,24 @@ Each broken variant takes exactly one guard away:
 | `CachedLockNoInvalidate` | the kernel page invalidation before yielding | breaks `NoStalePages` |
 | `CachedLockStaleSnapshot` | dropping the metadata snapshot with the key | breaks `ViewMatchesTruth` |
 | `CachedLockKeepsCacheOnKeyLoss` | dropping every cache when the key is found gone | breaks `NoStalePages` |
+| `CachedLockOrphanedKey` | nothing; the create's lost-reply window with the discard in place | no counterexample, 9,000 states |
+| `CachedLockNoOrphanDiscard` | deleting a lock key the create minted and never cached | breaks `OrphanFreed` |
+
+The last two are the ones the create-time lock brought with it. A lock taken by
+the transaction that creates the inode is an ordinary `Acquire` in this model —
+it asserts the same empty blocking range, and the snapshot it seeds is the
+record that transaction just wrote — so it needed no new action. The lost reply
+did: it is the third way that transaction can end, and the only one that leaves
+a key behind with nothing naming it. Those two configurations check a temporal
+property rather than an invariant, so they run under `OrphanSpec`, which adds
+weak fairness on the discard, and without `SYMMETRY`, under which TLC's liveness
+checking is not sound.
+
+Batched key releases needed nothing at all. This is a one-inode model, and
+giving up several keys in one transaction is this model's `Recall` once per
+inode: what a shared delete adds is atomicity *between* inodes, which no
+property here constrains, and every step that has to happen before a key is
+yielded still happens per inode in the implementation.
 
 `NoStalePages` is stated against the node's own belief rather than against the
 holder test, and deliberately: between a session expiring in etcd and the node

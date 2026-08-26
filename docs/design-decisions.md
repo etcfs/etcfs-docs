@@ -493,19 +493,21 @@ produces, not an accident, so trading it for a create-batching optimisation is
 the wrong direction. The crash window would be the easy part; the exclusion is
 the whole cost.
 
-## The create-time lock key was reverted
+## The create-time lock key was reverted, then restored once its channel was fixed
 
 *Options:* (a) write the inode's exclusive lock key inside the create
 transaction, so the first write to a new file needs no acquisition of its own,
 and batch the eventual releases one transaction per eviction sweep; (b) leave
 both alone.
 
-*Chosen:* (b), after (a) was built, verified and measured. The reasoning behind
-(a) still looks right on paper: the inode number is known when the name is
-published, no peer can be contending for a number nobody has been told about,
-and the create transaction asserts exactly what `AcquireLock` asserts. It passed
-the chaos suite, the TLA+ models and the Porcupine checkers. It is the
-measurement that killed it.
+*Chosen:* (a) — but only after it was reverted, the failure it exposed was
+fixed, and it was measured again. The reasoning behind (a) always looked right:
+the inode number is known when the name is published, no peer can be contending
+for a number nobody has been told about, and the create transaction asserts
+exactly what `AcquireLock` asserts. It passed the chaos suite, the TLA+ models
+and the Porcupine checkers on the first attempt too. What killed it then was a
+measurement, and what brought it back is a different one — with a fix in
+between, in a component it had nothing to do with.
 
 **What it did.** Nearly every eviction's page invalidation began to fail:
 
@@ -560,23 +562,30 @@ That prerequisite has since been met: the notify thread now enqueues the
 fire-and-forget messages and a second thread makes their kernel calls, so an
 acknowledged invalidation no longer queues behind them.
 
-**Measured, 2026-08-26.** The create-time lock and the batched releases were put
-back on a scratch branch and run against the full 80,000-file untar on
-`m7i.large`, the scale at which the original attempt died part way with
-`ENOENT`:
+**Measured, 2026-08-26.** The full 80,000-file untar on `m7i.large`, the scale at
+which the original attempt died part way with `ENOENT`:
 
 | build | untar | files/s | locks not yielded for want of an invalidation |
 |---|---|---|---|
 | create-time lock, before the channel split | 2325 s | — | nearly every eviction |
 | without it, before the channel split | 1698 s | — | 0 |
-| create-time lock, after the channel split | 1152 s | 69.4 | 0 |
+| **without it, after the channel split** | **1439.8 s** | **55.6** | 0 |
+| **create-time lock, after the channel split** | **1159.1 s** | **69.0** | 0 |
 
-The copy completed, and not one lock failed to yield. The failure the revert was
-about is gone. What is not yet established is the 1152 s: it is a cross-date
-comparison against numbers taken on a different day and AMI, with a harness that
-has since changed, so the speed-up needs a same-day run of the build without the
-create-time lock before it means anything. Restoring the lock is that run's
-decision to make, not this one's.
+The last two rows are the pair that decides it: same day, same instance type,
+same harness, both carrying every other change. The copy completes, not one lock
+fails to yield, and the create-time lock is worth **1.24x** on the scenario etcfs
+loses worst. That is the evidence the revert asked for, and the lock is back.
+
+It is also less than the commit count predicts, and that is the more interesting
+half. The change takes a create-and-write from four Raft commits per file to
+just over two, which predicts nearly 2x; the measurement is 1.24x. The earlier
+six-to-four reduction predicted 1.50x and measured 1.48x, so the model held
+then and does not now. What it means is that the create path has stopped being
+commit-bound — with two commits left per file, most of an untar's time is
+somewhere else, and nothing measured so far says where. The
+[Small-File Metadata Storm](reports/benchmark-reports/smallfile-storm.md) report
+carries the arithmetic.
 
 ## close() still publishes, and that is close-to-open consistency rather than durability
 

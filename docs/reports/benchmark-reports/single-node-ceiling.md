@@ -12,7 +12,8 @@ Same five isolated 3-node clusters as the other reports; the raw-device number i
 
 | Backend | Raw seq write (MiB/s) | FS seq write (MiB/s) | % of raw bandwidth | % of raw IOPS |
 |---|---|---|---|---|
-| etcfs (2026-08-26) | 254.14 | 177.29 | 69.76% | 25.44% |
+| **etcfs (2026-08-26, after the write-path change)** | 254.14 | 173.12 | 68.12% | **36.00%** |
+| etcfs (2026-08-26, before it) | 254.14 | 177.29 | 69.76% | 25.44% |
 | etcfs (2026-08-24) | 254.14 | 166.71 | 65.60% | 21.70% |
 | etcfs (2026-08-16) | 254.15 | 151.76 | 59.71% | 22.39% |
 | gfs2 | 254.06 | 212.25 | 83.54% | 99.61% |
@@ -30,7 +31,9 @@ etcfs keeps 69.8% of raw bandwidth but only 25.4% of raw random-write IOPS — t
 
 The reason is not what this report said before, and the daemon's own counters over the 2026-08-26 run say so: across 7,746 random writes it committed **203** etcd transactions, one per 38 writes, because write delegation keeps the extent in the inode's buffer and publishes in batches. It answered every one of those writes from the snapshot cached under the inode's lock — 7,889 hits, **no misses** — so no write read metadata from etcd either. The retained-IOPS number does not track an etcd-commit-rate ceiling.
 
-What it tracked was work proportional to the file. The daemon spent 2.60 ms inside its own write handler per 4 KiB write, out of ~3.88 ms end to end, with no etcd in it: a file under random overwrite gains an extent per write, and folding each write's transaction back into the cached snapshot rebuilt, rehashed and re-sorted that whole list every time. Against a 10,000-extent file that fold cost 1.2 ms on its own. It is now applied to the snapshot in place, at a cost proportional to the transaction rather than the file (34 µs at the same 10,000 extents), which this table does not yet reflect — the 2026-08-26 run predates the change.
+What it tracked was work proportional to the file. The daemon spent 2.60 ms inside its own write handler per 4 KiB write, out of ~3.88 ms end to end, with no etcd in it: a file under random overwrite gains an extent per write, and folding each write's transaction back into the cached snapshot rebuilt, rehashed and re-sorted that whole list every time. Against a 10,000-extent file that fold cost 1.2 ms on its own. It is now applied to the snapshot in place, at a cost proportional to the transaction rather than the file — 34 µs at the same 10,000 extents.
+
+The second 2026-08-26 row is that change measured on the same hardware later the same day: **25.4% of the device's IOPS to 36.0%**, and 2.60 ms of handler time per write down to 1.27 ms. The two runs bracket the change and nothing else — same instance type, same volume, same fio job. What is left is 1.27 ms of daemon time against a device that serves the write in about 1 ms, so the remaining gap is no longer dominated by any one thing this report can name. Sequential bandwidth moved from 69.8% to 68.1% across the same pair, which is this scenario's run-to-run spread rather than a cost of the change.
 
 juicefs shows a similar shape (82.6% bandwidth, only 27.0% IOPS) but for a different reason: its small random writes go through its own metadata engine (Redis) and an object store round trip per operation, which is the per-write coordination cost etcfs turns out *not* to be paying here.
 
