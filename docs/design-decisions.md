@@ -536,7 +536,7 @@ At full scale it stopped being a slowdown and became a failure: an 80,000-file
 copy died part way with `ENOENT`, and on AWS `m7i.large` the same workload took
 2325 s against 1698 s without the change.
 
-**Why it is not simply a bug to fix.** The cache-invalidation socket carries two
+**Why it was not simply a bug to fix.** The cache-invalidation socket carried two
 kinds of traffic on one serial thread (`pkg/fuse/fuse.c`, `notify_thread`):
 `NOTIFY_INVAL_ENTRY`, fire-and-forget, one per create from the dirent watch; and
 `NOTIFY_INVAL_INODE`, which the backend **blocks on**, because it may not yield
@@ -546,9 +546,9 @@ An unpacking archive floods that thread with entry invalidations. An inode
 invalidation queues behind thousands of them, the backend's read deadline
 expires, and the connection is dropped as out of step — which disables page
 caching for the whole mount until the next open re-enables it, whereupon it
-happens again. It is head-of-line blocking between acknowledged and
+happens again. It was head-of-line blocking between acknowledged and
 unacknowledged traffic sharing one channel, not slowness, and no amount of
-making the daemon faster fixes it.
+making the daemon faster would have fixed it.
 
 Eviction holding the lock cache's own mutex across the invalidation is what
 masked it. That mutex is taken by every operation on the node, so holding it
@@ -556,11 +556,13 @@ throttled the create stream and kept the queue shallow. Releasing it — correct
 in isolation, and necessary before releases could be batched at all — removed
 the throttle and let the queue run away.
 
-So the prerequisite is separating the two: acknowledged invalidations need a
-path that cannot queue behind unacknowledged ones, either their own socket and
-thread or an entry-invalidation queue the notify thread drains without holding
-up acks. Until then the create-time lock is not available, and the commit it
-would save stays on the per-file path.
+That prerequisite has since been met: the notify thread now enqueues the
+fire-and-forget messages and a second thread makes their kernel calls, so an
+acknowledged invalidation no longer queues behind them. The create-time lock is
+therefore no longer blocked by the channel — but it is not restored on that
+basis alone. What is written above is a measurement, and only a measurement
+showing the notify failures gone and the files-per-second above the 63.4 of the
+build without it should bring it back.
 
 ## close() still publishes, and that is close-to-open consistency rather than durability
 

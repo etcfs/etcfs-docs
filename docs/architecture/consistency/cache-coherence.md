@@ -164,7 +164,9 @@ Next lookup on Node B: LOOKUP → IPC → etcd → fresh data
 
 The C daemon opens a second connection to the Go daemon on a dedicated Unix socket (`/run/etcfuse/etcfuse-notify.sock`, set with `--notify-socket` on the Go side and `ETCFS_NOTIFY_SOCKET` on the C side). Messages are pushed from Go; the only thing C writes back is the one-byte acknowledgement described under [Notification API](../fuse/fuse-cache-management.md#notification-api).
 
-A dedicated pthread in the C daemon (`notify_thread`) owns that connection. It calls `fuse_lowlevel_notify_inval_entry` or `fuse_lowlevel_notify_inval_inode` on the FUSE session handle for each message it reads.
+A dedicated pthread in the C daemon (`notify_thread`) owns that connection, and a second one makes the kernel calls that nobody is waiting on. The reader carries out an `INVAL_INODE` itself and acknowledges it; an `INVAL_ENTRY` or `INVAL_ATTR` it only parses and appends to a bounded queue, which the second thread drains by calling `fuse_lowlevel_notify_inval_entry` or `fuse_lowlevel_notify_inval_inode` on the FUSE session handle.
+
+The split is what keeps the acknowledged message off the back of the queue. A peer unpacking an archive produces one entry invalidation per created file, and if the reader made those kernel calls itself, the `INVAL_INODE` that a lock release is blocked on would arrive behind thousands of them — past the acknowledgement deadline, at which point the connection is dropped and the whole mount stops caching data pages until the next open. The queue holds 512 messages and drops its oldest when full, which bounds the memory a fast producer can cost; a dropped invalidation leaves a name or an attribute cached until its timeout, and the daemon logs the first drop of each burst.
 
 The Go daemon accepts notification connections on that listener. Each connection is stored as the active notification target. Every message has the same shape — a fixed header, then a name of the length the header declares:
 
