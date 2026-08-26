@@ -26,6 +26,19 @@ A 10,000-file run on the same code gave 331.5 s at 30.16 files/s, so the rate is
 roughly independent of tree size at this scale and the 80,000-file figure is not
 a large-tree effect.
 
+**The etcfs row was re-measured on the current build, 2026-08-26.** Same
+scenario, same instance class, 80,000 files: 2282.7 s at 35.05 files/s, against
+the table's 2243.7 s at 35.66 — a 1.7% difference, well inside this scenario's
+run-to-run spread, with no lock-yield failures (`notify_failures` 0). The
+commit reductions therefore do not show up in `t3.medium` wall clock, and the
+reason is visible in the run's own credit balance: CloudWatch reported
+`CPUCreditBalance` at 0 on all three instances for the run, so both builds were
+throttled to the instance's baseline rate and the untar was bounded by the host
+rather than by the filesystem. A burstable instance cannot resolve this change;
+what it does confirm is that nothing regressed. The commit counter for the same
+run is 4.34 per file (347,303 transactions over 80,000 files, plus 3,005
+rejected and retried).
+
 **The etcfs row is not the build in the tree.** It is the only etcfs run
 measured against these competitors, and a create-and-write has since gone from
 about 6.2 Raft commits to 4.18. On `m7i.large` the current build untars the same

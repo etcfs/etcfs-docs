@@ -14,6 +14,12 @@ Five test areas run on AWS today with no prior chaos report: a new no-fault-inje
 | `chaos-arena-reclaim.sh` | AWS | 5 | 0 |
 | `chaos-nvme-fencing.sh` | AWS | 17 | 0 |
 
+`chaos-nvme-fencing.sh` was re-run on real AWS infrastructure on 2026-08-26
+against the current tree — 17 of 17 again, no failures. The scenario is the
+one part of the fencing story Docker cannot exercise at all (a loopback device
+supports no NVMe reservation commands), so it is repeated on provisioned
+hardware whenever the fencing or commit path changes.
+
 ## Test areas
 
 ### integrity-fuzz.sh — randomized ops, no fault injection

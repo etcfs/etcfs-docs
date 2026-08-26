@@ -62,6 +62,7 @@ own latency.
 | `etcfuse_fuse_errors_total` | Counter | `op` | Operations that returned an errno |
 | `etcfuse_fuse_op_duration_seconds` | Histogram | `op` | End-to-end handler latency |
 | `etcfuse_etcd_txn_total` | Counter | `outcome` | etcd transactions, by outcome (`committed`, `rejected`, `error`) |
+| `etcfuse_etcd_txn_origin_total` | Counter | `origin` | Committed transactions by the operation that asked for them (`create`, `setattr`, `extent_flush`, `lock_acquire`, `lock_release`, `write_commit`, `times_batch`, `times_single`, `reclaim`). A commit is the unit of cost in this filesystem, so this is what a per-operation cost model is built from; `other` is a path that has not been labelled |
 | `etcfuse_metadata_cache_total` | Counter | `result` | Data-path metadata lookups, by whether the lock-held snapshot answered them (`hit`, `miss`) |
 | `etcfuse_lock_handover_hold_seconds` | Histogram | — | How long a cached inode lock is held before a peer's recall is honoured. Pinned at the ceiling means an inode is fought over continuously and the waiters pay for it; pinned at the floor means recalls arrive after the holder had finished |
 | `etcfuse_dirent_cache_total` | Counter | `result` | Lookups of a name that is not there, by whether this node's cached set of the directory's names answered it (`hit`) or it had to read etcd (`miss`). Sustained misses mean the directories are past the per-directory cap, or the dirent watch is not delivering and the cache is disarmed |
@@ -69,6 +70,8 @@ own latency.
 | `etcfuse_pending_extents` | Gauge | — | Metadata keys written by acknowledged writes and not yet published to etcd |
 | `etcfuse_pending_bytes` | Gauge | — | Acknowledged write payload those keys stand for, summed across every inode |
 | `etcfuse_metadata_flush_total` | Counter | `trigger` | Publications of deferred metadata (`interval`, `buffer_full`, `memory_pressure`, `sync_write`, `operation`, `recall`, `eviction`, `shutdown`) |
+| `etcfuse_metadata_flush_batch_total` | Counter | — | Transactions that published one or more inodes' deferred metadata together |
+| `etcfuse_metadata_flush_batch_inodes_total` | Counter | — | Inodes those transactions carried. Divided by the batch count it is what batching the sweep is worth: one inode per transaction means the batch is a single flush under another name |
 | `etcfuse_metadata_flush_failures_total` | Counter | `reason` | Flushes that did not publish (`error`, `rejected`, `fenced`, `device`) |
 | `etcfuse_block_io_total` | Counter | `op` | Block device operations (`read`, `write`) |
 | `etcfuse_block_io_bytes_total` | Counter | `op` | Bytes transferred to and from the device |
