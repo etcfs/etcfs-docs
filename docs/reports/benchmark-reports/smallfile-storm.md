@@ -48,7 +48,34 @@ gfs2's 2689 files/sec is the outlier in the other direction: a local journal abs
 
 Commits 1 and 3 were removed — inode numbers are reserved a block of 1024 at a time and handed out from memory, and directory timestamps are queued and written once per flush interval per directory. Six to four predicts 1.50x. The measurement is 1.48x, so the model is not missing anything: the create path is commit-bound, and the count is what moved.
 
-**The model has since stopped predicting, and that is a result in itself.** Commits 4 and 6 are now gone too — the lock key rides the create transaction, and the release is one commit per 64 evicted inodes rather than one per file — which leaves just over two per file and predicts nearly another 2x. The same-day pair above measured 1.24x. Four commits to two is the largest proportional cut of the three, and it bought the least, so what remains of an untar's cost is no longer the commits: two per file is apparently cheap enough that something else now dominates. Which thing is not yet measured. The per-file FUSE round trips, the dirent-watch invalidation each create fans out to every node, and the page invalidation each eviction blocks on are the candidates, and naming one needs a profile rather than another count.
+**The model stopped predicting, and the reason is that it was counting the wrong commits.** Commits 4 and 6 are now gone too — the lock key rides the create transaction, and the release is one commit per 64 evicted inodes rather than one per file — which leaves just over two *of the filesystem's own* per file and predicts nearly another 2x. The same-day pair above measured 1.24x.
+
+**Where the time actually goes, measured 2026-08-26.** The daemon's per-operation histograms across an 80,000-file untar on `m7i.large`, with a CPU profile taken from inside the run (`--pprof`):
+
+| operation | calls/file | ms/file | ms/call |
+|---|---|---|---|
+| `setattr` | 3.03 | **7.419** | 2.448 |
+| `create` | 1.00 | 1.969 | 1.969 |
+| `fsync` (the `close()` flush) | 1.00 | 1.958 | 1.958 |
+| `getxattr` | 2.15 | 1.548 | 0.720 |
+| `getattr` | 2.04 | 1.457 | 0.715 |
+| `write` | 1.15 | 0.444 | 0.386 |
+| `lookup` | 1.02 | 0.033 | 0.032 |
+| `release` | 1.00 | 0.005 | 0.005 |
+| **daemon total** | | **14.86** | |
+| wall clock | | 15.57 | |
+
+Three things fall out at once.
+
+*It is not the transport.* 95.5% of each file's 15.57 ms is inside the Go handlers. Whatever the per-file FUSE round trips cost, it is within the 0.71 ms that is left, so the round-trip count is not what to attack.
+
+*It is not two commits per file, it is 5.2.* The counter says 417,461 etcd transactions committed across 80,000 files. The table accounts for two — the create and the `close()` flush — and the other three are `setattr`: `tar` restores each file's mode, owner and timestamps after writing it, three separate calls, each its own Raft commit at 2.4 ms. That is 48% of the untar. The commit model counted what the *filesystem* commits per file and missed what the *archiver* asks it to.
+
+*The daemon is idle while it happens.* The CPU profile over a 60-second window inside the run samples 7.09 s of CPU on a 2-vCPU instance — 11.8% busy — and its largest single entry is the interval flush sweeping the lock cache. The handler time is spent waiting on consensus, not computing.
+
+The lever this names is deferral, and it is the one the write path already pulls: a `setattr` on an inode whose exclusive lock this node holds need not reach etcd before it is acknowledged, for the same reason an extent need not. The create-time lock means the node holds that lock for every file it creates, so those three commits could ride the flush `close()` already pays for. `getxattr` and `getattr` are the next two levers — 3.0 ms per file between them, answering questions about an inode whose record is already cached under that same lock.
+
+The profiled run took 1245.4 s (64.2 files/s) against 1159.1 s unprofiled, which is this scenario's run-to-run spread plus whatever the sampling costs. The per-operation shares are what it was run for, and those are ratios within one run.
 
 Commit 6 is worth noting for why it is there at all: the lock cache holds 4096 entries and this scenario creates 80,000 files, so every inode is evicted and every eviction pays a release.
 

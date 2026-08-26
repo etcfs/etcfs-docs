@@ -21,6 +21,7 @@ device) and `etcfuse` (C, mounts the filesystem, forwards VFS ops to
 | `--block-device` | unset | Raw device path, e.g. `/dev/nvme1n1`. Prefer `--volume-id` — a literal device path doesn't survive a detach/reattach cycle. |
 | `--volume-id` | unset | Cloud volume ID (e.g. `vol-0abc...`); resolved to a device path on every start. Takes precedence over `--block-device`. |
 | `--metrics-addr` | unset | HTTP listen address for `/metrics`, `/healthz` and `/readyz`, e.g. `:9090`. Unset disables all three. |
+| `--pprof` | `false` | Serve Go's profiling endpoints under `/debug/pprof` on the metrics listener. Off by default because that listener is reachable by anything that can route to the node, and a profile is both expensive to produce and a description of what the process is doing. Turn it on to answer "where is the time going", and turn it off again. |
 | `--fsck` | `false` | Run the offline checker and exit — prefer `etcfsctl fsck`, which needs no daemon. |
 | `--info` | `false` | Print filesystem stats and exit — prefer `etcfsctl status`. |
 | `--ebs-volume-id` | unset | Enables dual-confirmed external fencing (detach + poll) via the AWS API. Needs the `etcfs-nodes` IAM instance profile — see [Terraform: Prerequisite](terraform.md#prerequisite-the-fencing-instance-profile). |
