@@ -459,7 +459,7 @@ means: the inode number, reserved a block at a time
 (`pkg/metadata/dirtouch.go`).
 
 Two more were attempted on 2026-08-25 and **reverted** — see
-[the create-time lock](#the-create-time-lock-key-was-reverted) below.
+[the create-time lock](#the-create-time-lock-key-was-reverted-then-restored-once-its-channel-was-fixed) below.
 
 That last one cannot be deferred, and the reason is not the crash window.
 Deferring an extent is safe because a node holding an inode's exclusive lock

@@ -16,11 +16,6 @@ Single isolated 3-node etcfs cluster, same shape as the other reports.
 | One member down | 1006 | 14.9 ms | 1008 |
 | One down + 50ms peer latency | 13 | 566.2 ms | 1012 |
 
-The 2026-08-16 run of the same three phases gave 1001 / 870 / 14 write IOPS at
-14.9 / 19.3 / 583.0 ms p99, with reads flat at 1016 throughout — the same shape.
-The one difference worth noting is that losing a member cost nothing measurable
-this time (1006 against a 1010 healthy baseline) where it cost 13% before.
-
 ## Bug found and fixed during this run
 
 The first attempt got through the first two phases and failed injecting the latency:

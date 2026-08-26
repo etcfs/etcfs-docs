@@ -10,16 +10,13 @@ Same five isolated 3-node clusters as the other reports.
 
 ## Results
 
-The top etcfs row is from 2026-08-25, after inode numbers moved to per-node
-block reservation and directory timestamp commits were coalesced. The four
-competitor rows were not re-measured — they are unaffected by an etcfs-side
-change, but they are a different day's clusters.
+The competitor rows were measured on `t3.medium`; the etcfs row is the same
+scenario on the same hardware, and it is not the build in the tree — see the
+note below the table.
 
 | Backend | Untar time | Creates/sec |
 |---|---|---|
-| **etcfs (2026-08-25)** | **2243.7 s (37.4 min)** | **35.66** |
-| etcfs (2026-08-24) | 3327.1 s (55.5 min) | 24.05 |
-| etcfs (2026-08-16) | 4153.5 s (69.2 min) | 19.26 |
+| **etcfs** | **2243.7 s (37.4 min)** | **35.66** |
 | gfs2 | 29.8 s | 2688.89 |
 | nfs | 1054.0 s (17.6 min) | 75.90 |
 | juicefs | 864.0 s (14.4 min) | 92.60 |
@@ -29,26 +26,42 @@ A 10,000-file run on the same code gave 331.5 s at 30.16 files/s, so the rate is
 roughly independent of tree size at this scale and the 80,000-file figure is not
 a large-tree effect.
 
+**The etcfs row is not the build in the tree.** It is the only etcfs run
+measured against these competitors, and a create-and-write has since gone from
+about 6.2 Raft commits to 4.18. On `m7i.large` the current build untars the same
+tree in 1047.6 s (76.4 files/s), but no `m7i.large` number exists for the other
+four backends, so the two cannot be read against each other. Re-measuring the
+five-way comparison on current code is owed.
+
 ## Reading these numbers
 
-etcfs is still worst by a wide margin — 75x slower than gfs2 (a local-journal filesystem with no per-create network round trip), and 2-4x slower than the network filesystems. It was 112x and 4-8x. The gap tracks directly to what the scenario's header names: a `create()` here is a synchronous Raft commit through etcd, one network round trip plus consensus per file, issued serially by a single untar process with no batching.
+etcfs is still worst by a wide margin — 75x slower than gfs2 (a local-journal filesystem with no per-create network round trip), and 2-4x slower than the network filesystems. The gap tracks directly to what the scenario's header names: a `create()` here is a synchronous Raft commit through etcd, one network round trip plus consensus per file, issued serially by a single untar process with no batching.
 
 gfs2's 2689 files/sec is the outlier in the other direction: a local journal absorbs metadata writes without a network round trip per operation at all, which is exactly the local-filesystem advantage this scenario exists to quantify.
 
-**1.48x is what the commit count predicts, once the count is right.** `tar` issues `create`, `write`, `close` per file, and that costs six Raft commits, not three:
+**A create-and-write costs 4.18 Raft commits, and the counter says where they
+go.** `tar` issues `create`, `write`, `close` and then restores the file's owner,
+mode and timestamps, and `etcfuse_etcd_txn_origin_total` attributes every commit
+that results:
 
-| # | Commit | When |
-|---|---|---|
-| 1 | reserve the inode number (`inode_alloc_counter`) | `create` |
-| 2 | publish the name and the inode (`dirent:` + `inode:`, one transaction) | `create` |
-| 3 | move the parent directory's `mtime` | after `create` |
-| 4 | acquire the inode's lock key (`lock:<ino>/…`) | first `write` |
-| 5 | publish the buffered extent (`extent:<ino>/0`) | `close` |
-| 6 | release the lock key | on lock-cache eviction |
+| origin of a committed transaction | per file |
+|---|---|
+| `setattr` — mode and owner, which cannot be deferred | 2.020 |
+| extent publication at `close()` | 1.026 |
+| create — the name, the inode and this node's lock on it, in one transaction | 1.000 |
+| queued timestamps, swept in batches | 0.125 |
+| queued timestamps, per-inode fallback | 0.010 |
+| **total** | **4.180** |
 
-Commits 1 and 3 were removed — inode numbers are reserved a block of 1024 at a time and handed out from memory, and directory timestamps are queued and written once per flush interval per directory. Six to four predicts 1.50x. The measurement is 1.48x, so the model is not missing anything: the create path is commit-bound, and the count is what moved.
+Three of those are irreducible without changing what the filesystem promises.
+The create publishes a name that must exist before `tar` writes to it. The
+extent publishes bytes a peer must see after `close()`. The two `setattr`
+commits change what a peer enforces access against, so deferring them would
+leave that peer granting permission that had already been taken away — the one
+place in this filesystem where lateness is not an acceptable trade.
 
-**The model stopped predicting, and the reason is that it was counting the wrong commits.** Commits 4 and 6 are now gone too — the lock key rides the create transaction, and the release is one commit per 64 evicted inodes rather than one per file — which leaves just over two *of the filesystem's own* per file and predicts nearly another 2x. The same-day pair above measured 1.24x.
+The timestamps are the exception, and they are deferred: they carry no
+enforcement meaning, so a peer seeing them up to one sweep late costs nothing.
 
 **Where the time actually goes, measured 2026-08-26.** The daemon's per-operation histograms across an 80,000-file untar on `m7i.large`, with a CPU profile taken from inside the run (`--pprof`):
 
@@ -79,21 +92,18 @@ The profiled run took 1245.4 s (64.2 files/s) against 1159.1 s unprofiled, which
 
 Commit 6 is worth noting for why it is there at all: the lock cache holds 4096 entries and this scenario creates 80,000 files, so every inode is evicted and every eviction pays a release.
 
-**Both were restored on 2026-08-26**, once the cache-invalidation client stopped serving acknowledged and unacknowledged traffic on one thread. Measured on `m7i.large`, both builds carrying every other change: 1439.8 s (55.6 files/s) without them against 1159.1 s (69.0 files/s) with them, and no lock left unyielded for want of a page invalidation in either.
+**One of the four is still removable, and it is not a design change.** The
+extent published at `close()` costs a transaction per file because each file's
+write buffer lives on its own lock-cache entry — but every one of those buffers
+is held by this node under its own lock key, so their comparison sets
+concatenate into a single transaction the way the timestamp sweep's already do.
+`Service.flushEntries` implements it and has never been measured where it
+applies.
 
-Read the second number with care rather than as a speed-up. Five storm runs that day spanned 1159–1440 s and four of them were the same build (1159, 1201, 1245, 1407 s), since each run provisions its own cluster and the spread carries host-to-host variance too. The gap above is inside that spread. What the change removes without ambiguity is a Raft commit per created-and-written file, which the commit counter measures directly and wall clock at n=1 does not. See [Design Decisions](../../design-decisions.md#the-create-time-lock-key-was-reverted-then-restored-once-its-channel-was-fixed).
-
-Those two runs are on a different instance class from the table below and cannot be read against it — the five-way comparison is `t3.medium` throughout, and the competitor rows have not been re-measured.
-
-**Two of the four remaining commits were attempted on 2026-08-25 and reverted.** Commits 4 and 6 below were both implemented — the lock key written by the create transaction, and the releases batched one transaction per eviction sweep — and both were taken back out: they made nearly every eviction's kernel page invalidation time out, which at 80,000 files turned into an `ENOENT` part way through the copy and, on AWS `m7i.large`, 2325 s against 1698 s without them. The mechanism and the numbers are in [Design Decisions](../../design-decisions.md#the-create-time-lock-key-was-reverted). What follows is the original analysis, which still describes what *would* be removable if the invalidation path could answer under load.
-
-**Three of the four remaining commits are still removable in principle, and none of the three is a design change.** They are separate transactions because they happen at separate *times* — `create` must return before `tar` issues the `write`, so the create transaction cannot carry an extent whose bytes do not exist yet — but that only rules out merging them with each other:
-
-- **Commit 4 can join commit 2.** The inode number is known when the name is published, and no peer can be contending for a number nobody has been told about, so the lock key can be written by the create transaction and the lock cache seeded from it.
-- **Commit 6 can be batched.** Eviction deletes one key per transaction; a sweep of evictions is one transaction of many deletes, exactly as directory timestamps are now coalesced.
-- **Commit 5 can be batched across inodes.** Each file gets its own flush transaction because the write buffer lives on its lock-cache entry, but every one of those buffers is held by this node under its own lock key, so their comparison sets concatenate into one transaction.
-
-That leaves commit 2 — the transaction that makes the file exist — which is the one that genuinely cannot be deferred, because deferring it means answering `create()` before its exclusivity comparison has been evaluated. See [Design Decisions](../../design-decisions.md#creates-are-not-deferred-into-a-batch).
+The create cannot be deferred at all: answering `create()` before its
+exclusivity comparison has been evaluated is answering before knowing whether
+the name is free. See
+[Design Decisions](../../design-decisions.md#creates-are-not-deferred-into-a-batch).
 
 ## A methodology note on burstable instances
 

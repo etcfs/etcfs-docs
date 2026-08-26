@@ -18,7 +18,7 @@ Same five isolated 3-node clusters as the earlier comparison report, each with i
 | juicefs | 116 | 101 | 80 | 90 | 333.33 | 412.90 | 427.74 | 195.57 |
 | gluster | 89 | 66 | 66 | 67 | 250.00 | 463.77 | 308.16 | 244.16 |
 
-### etcfs re-run on a volume that does not cap it (2026-08-24)
+### etcfs re-run on a volume that does not cap it
 
 The table above was taken on a 1000-IOPS / 20 GB volume, which capped every
 backend at roughly the same ceiling. etcfs was re-run alone on a

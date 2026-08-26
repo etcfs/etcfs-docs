@@ -15,9 +15,8 @@ it fails to join at all.
 The departing node now leaves *cleanly* — SIGTERM plus unmount — and a clean
 leave no longer causes a fencing detach, since a node that shuts down gracefully
 gives back its locks and arenas and announces the departure in the same
-transaction that removes it from membership. The published 4.49 s from
-2026-08-17 included an EBS reattach that this path no longer triggers, which is
-what this re-run was for.
+transaction that removes it from membership. An earlier figure for this scenario included an EBS reattach
+that this path no longer triggers, which is what the re-run was for.
 
 Single isolated 3-node etcfs cluster.
 

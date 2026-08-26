@@ -23,10 +23,8 @@ stopped a point short. They now get a 4-node cluster
 
 ## Results
 
-The etcfs row is from 2026-08-25, after inode numbers moved to per-node block
-reservation and directory timestamp commits were coalesced. The four competitor
-rows are the 2026-08-24 run of the same script and were not re-measured — they
-are unaffected by an etcfs-side change, but they are a different day's clusters.
+The competitor rows come from a separate session of the same script — they are
+unaffected by an etcfs-side change, but they are a different day's clusters.
 
 | Backend | 1 node (ops/s) | 2 nodes (ops/s) | 3 nodes (ops/s) | 1n → 3n |
 |---|---|---|---|---|
@@ -34,13 +32,12 @@ are unaffected by an etcfs-side change, but they are a different day's clusters.
 | nfs | 492.93 | 700.38 | 1204.43 | 2.44x |
 | juicefs | 376.51 | 994.23 | 1147.23 | 3.05x |
 | gluster | 304.38 | 514.98 | 776.85 | 2.55x |
-| **etcfs (2026-08-25)** | **187.88** | **313.55** | **327.34** | **1.74x** |
-| etcfs (2026-08-24) | 93.78 | 163.35 | 179.58 | 1.91x |
+| **etcfs** | **187.88** | **313.55** | **327.34** | **1.74x** |
 
 ## Reading these numbers
 
 **etcfs is still last in absolute throughput at every node count, by 3.7x
-against nfs and 4.6x against gfs2 at three nodes.** It was 6.5x and 8.4x. The
+against nfs and 4.6x against gfs2 at three nodes.** The
 ordering has not changed and neither has the conclusion; the gap halved.
 
 **The gain is 1.82x at three nodes, and it came from removing commits rather

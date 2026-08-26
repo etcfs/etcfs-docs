@@ -12,10 +12,7 @@ Same five isolated 3-node clusters as the other reports; the raw-device number i
 
 | Backend | Raw seq write (MiB/s) | FS seq write (MiB/s) | % of raw bandwidth | % of raw IOPS |
 |---|---|---|---|---|
-| **etcfs (2026-08-26, after the write-path change)** | 254.14 | 173.12 | 68.12% | **36.00%** |
-| etcfs (2026-08-26, before it) | 254.14 | 177.29 | 69.76% | 25.44% |
-| etcfs (2026-08-24) | 254.14 | 166.71 | 65.60% | 21.70% |
-| etcfs (2026-08-16) | 254.15 | 151.76 | 59.71% | 22.39% |
+| **etcfs** | 254.14 | 173.12 | 68.12% | **36.00%** |
 | gfs2 | 254.06 | 212.25 | 83.54% | 99.61% |
 | nfs | 254.14 | 167.98 | 66.10% | 79.98% |
 | juicefs | 254.14 | 209.93 | 82.60% | 27.02% |

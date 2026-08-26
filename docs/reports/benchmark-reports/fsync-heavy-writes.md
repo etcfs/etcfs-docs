@@ -12,8 +12,6 @@ Same five isolated 3-node clusters as the other reports.
 
 | Backend | sync-write IOPS | p99 (us) |
 |---|---|---|
-| etcfs (2026-08-24) | 155 | 8978 |
-| etcfs (2026-08-16) | 154 | 8356 |
 | gfs2 | 989 | 0* |
 | nfs | 335 | 29 |
 | juicefs | 121 | 897 |

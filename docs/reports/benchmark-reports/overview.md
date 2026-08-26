@@ -22,7 +22,7 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 | [Node-kill recovery](node-kill-recovery.md) | survivor still serving I/O after the kill | **yes, uninterrupted** (0.11 s worst gap) | gluster yes (78 s worst gap) | gfs2/nfs/juicefs survivors went silent for the rest of the run |
 | [4 KiB random write tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 write latency at comparable IOPS | **17.96 ms** | juicefs 61.08 ms | **3.4x better than the next best**, 24x better than gfs2 (432 ms) at 96% of its throughput |
 | [4 KiB random read tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 read latency, device-bound path | **11.08 ms** | gfs2 242.69 ms | **21.9x better** |
-| [Node-count scaling](node-count-scaling.md) | shared-directory metadata, 4 → 6 nodes | **+5%** (179 → 188 ops/s) | gfs2 **−47%** (1419 → 756 ops/s) | etcfs's curve keeps climbing where gfs2's collapses. The etcfs absolutes predate the 2026-08-25 metadata changes and were not re-measured — the same workload at 3 nodes went 180 → 327 ops/s |
+| [Node-count scaling](node-count-scaling.md) | shared-directory metadata, 4 → 6 nodes | **+5%** (179 → 188 ops/s) | gfs2 **−47%** (1419 → 756 ops/s) | etcfs's curve keeps climbing where gfs2's collapses. The etcfs absolutes are owed a re-measure |
 | [Negative lookup](negative-lookup.md) | warm µs per missing-name lookup | **2.21 µs** | nfs 3.68 µs | **1.7x faster than the next best**, 130–230x faster than gluster/juicefs, which do not cache absences at all |
 | [Warm page cache](warm-page-cache.md) | daemon reads during a warm pass | **0** | n/a | a coherent, lock-scoped page cache that costs nothing to read through — 600k IOPS served entirely by the kernel |
 | [Online volume growth](online-volume-growth.md) | new space usable after growing the device | **3.90 s**, no restart anywhere | gfs2 needs `gfs2_grow`; nfs grows server-side | not measured for the others — the shared raw-device path has no equivalent |
@@ -34,7 +34,7 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 | [Elasticity](elasticity.md) | survivor stall when a node leaves/joins cleanly | 0.11 s / 0.09 s | 0.06–3.2 s | nobody stops the world for a *planned* membership change, etcfs included |
 | [Elasticity](elasticity.md) | survivor bandwidth lost across the event | 7.2% / 11.3% | gluster 2.6%, gfs2 22.7% | mid-field; single 30 s samples, treat as a band |
 | [Warm page cache](warm-page-cache.md) | warm read speed-up | 611x | gfs2 619x, gluster 612x | a three-way tie at RAM speed; the ratio does not differentiate anything |
-| [Negative lookup](negative-lookup.md) | cold µs per missing-name lookup | 110 µs | gfs2 10.5 µs, nfs 231 µs | second of five, ahead of nfs/juicefs/gluster; was 1474 µs and last |
+| [Negative lookup](negative-lookup.md) | cold µs per missing-name lookup | 110 µs | gfs2 10.5 µs, nfs 231 µs | second of five, ahead of nfs/juicefs/gluster |
 | [Deep directory walks](deep-directory-walks.md) | cold `find` over 80k files | 8.24 s | gfs2 9.03 s, gluster 7.64 s | between the two shared-device backends, inside this scenario's run-to-run spread; nfs (0.91 s) is in another class |
 | [Single-node ceiling](single-node-ceiling.md) | sequential write as % of raw device | 68.1% | gfs2 83.5%, gluster 46.1% | mid-field |
 | [Cross-node handoff](cross-node-handoff.md) | 8 GiB read after another node wrote it | 255.95 MiB/s | field 195–244 MiB/s | at the raw-device ceiling measured on the same instance (254 MiB/s) — the hardware, not the protocol, is the limit |
@@ -43,13 +43,13 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 
 | Scenario | Metric | etcfs | Best competitor | Deficit |
 |---|---|---|---|---|
-| [Small-file storm](smallfile-storm.md) | 80k-file untar | 2244 s (35.7 files/s) | gfs2 29.8 s (2689 files/s) | **75x slower** — a create is still a Raft commit; was 112x |
-| [Metadata under concurrency](metadata-concurrency.md) | shared-directory ops/s at 3 nodes | 327 ops/s | gfs2 1515 ops/s | **4.6x slower** — was 8.4x |
+| [Small-file storm](smallfile-storm.md) | 80k-file untar | 2244 s (35.7 files/s) | gfs2 29.8 s (2689 files/s) | **75x slower** — a create is still a Raft commit. The etcfs figure is owed a re-measure: it is not the build in the tree, which costs 4.18 commits per file |
+| [Metadata under concurrency](metadata-concurrency.md) | shared-directory ops/s at 3 nodes | 327 ops/s | gfs2 1515 ops/s | **4.6x slower** |
 | [fsync-heavy writes](fsync-heavy-writes.md) | sustained O_DSYNC 4 KiB IOPS | 155 | gfs2 989 | **6.4x slower** — every write is a device write plus a Raft commit |
 | [Deep directory walks](deep-directory-walks.md) | `du -s` over 80k files | 128 s | nfs 0.41 s | **312x slower**; 1.56x slower than gfs2 (82 s). Was 480x and 2.4x |
 | [Deep directory walks](deep-directory-walks.md) | warm `find` | 7.22 s (1.14x warm benefit at 80k) | gfs2 0.125 s | **58x slower** — a warm benefit exists now, but the per-entry FUSE upcall dominates |
 | [Node-count scaling](node-count-scaling.md) | shared-file write bandwidth at 6 nodes | 61.7 MiB/s | gfs2 452.9 MiB/s | **7.3x slower** — every writer on one inode means a lock handover per turn |
-| [Single-node ceiling](single-node-ceiling.md) | random-write IOPS as % of raw device | 36.0% | gfs2 99.6% | **2.8x** less of the device's IOPS retained — was 3.9x before the per-write cost stopped scaling with the file's extent list |
+| [Single-node ceiling](single-node-ceiling.md) | random-write IOPS as % of raw device | 36.0% | gfs2 99.6% | **2.8x** less of the device's IOPS retained |
 
 ## The shape of it
 

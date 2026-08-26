@@ -17,20 +17,17 @@ exactly the claim another node invalidates by creating the file.
 
 ## Results
 
-The etcfs row is from 2026-08-25, after the directory name-set prefetch landed
-and the entry timeout was raised from one second to a minute. The four
-competitor rows are the 2026-08-24 run of the same script at the same set size
-and were not re-measured — they are unaffected by an etcfs-side change, but they
-are a different day's clusters.
+The competitor rows come from a separate session of the same script at the same
+set size — they are unaffected by an etcfs-side change, but they are a different
+day's clusters.
 
 | Backend | cold (µs/lookup) | warm (µs/lookup) | warm speed-up |
 |---|---|---|---|
 | gfs2 | 10.50 | 5.40 | 1.9x |
-| **etcfs (2026-08-25)** | **110.00** | **2.21** | **49.8x** |
+| **etcfs** | **110.00** | **2.21** | **49.8x** |
 | nfs | 231.50 | 3.68 | 62.9x |
 | juicefs | 273.00 | 274.80 | 0.99x |
 | gluster | 507.50 | 501.62 | 1.01x |
-| etcfs (2026-08-24) | 1474.50 | 8.81 | 167.4x |
 
 ## Reading these numbers
 
@@ -46,7 +43,7 @@ were re-misses paying the cold price. At a minute, none of them expire and the
 number is what a cached negative dentry actually costs.
 
 **Cold, etcfs is now second of the five** — 110 µs against GFS2's 10.5 µs, ahead
-of NFS (231 µs), juicefs (273 µs) and gluster (508 µs). It was 1474 µs, worst by
+of NFS (231 µs), juicefs (273 µs) and gluster (508 µs). Worst by
 two orders of magnitude, and the 13.4x is the directory name-set prefetch: the
 first miss in a directory reads the whole `dirent:` prefix in one range request,
 and the other 199 names in the sweep are then answered on the node without

@@ -19,7 +19,7 @@ Single isolated 3-node etcfs cluster, same shape as the other reports. This scen
 | Arenas owned before | 3 | 4 |
 | Arenas owned after 3 cycles | 4 | 4 |
 
-The 2026-08-17 run's per-cycle rejoin times were 4.467s, 4.677s and 4.523s, each one reattaching the volume it had lost to fencing on the way out. A clean leave no longer gets fenced — a departing node announces itself in the same transaction that removes it from membership — so the 2026-08-24 cycles reattach nothing, which is where the half-second went.
+A clean leave is not fenced — a departing node announces itself in the same transaction that removes it from membership — so a rejoin reattaches nothing, which is what keeps these cycles under four seconds.
 
 One number moved in a direction worth watching: the cluster owned 3 arenas before the cycles and 4 after. The leaver's arena is released on departure and a fresh one is claimed on rejoin, and the count is read immediately after the last rejoin, so a reclaim still in flight explains it — but three cycles ending one arena up is exactly the shape a slow leak would have, and this scenario exists to catch that. The soak (see [Arena Fragmentation Soak](arena-fragmentation-soak.md)) is the run that would separate the two.
 
@@ -27,4 +27,4 @@ One number moved in a direction worth watching: the cluster owned 3 arenas befor
 
 Both of the scenario's own questions come back close to clean. Survivor impact is small (3.02% worst-case dip in the 2026-08-24 run, 253.29 → 245.63 MiB/s; 1.37% in the earlier one) — a rejoining node claiming its own arena really does cost the rest of the cluster close to nothing, unlike this report's sibling (join-latency, which measured a 30.93% dip under a very similar setup and flagged it as needing a follow-up to separate "joining costs something" from "this specific recovery path costs something"). The gap between the two reports' impact numbers is itself informative: rejoin-load's baseline throughput here (246.87 MiB/s, sequential 1M writes) is far higher than join-latency's (13.74 MiB/s, random 4K writes) — a workload with more slack to absorb a brief reattach-and-restart window shows a much smaller dip, which is consistent with the reattach cost being close to fixed while the room to hide it in scales with the survivors' own workload.
 
-Arena count held exactly steady in the 2026-08-17 run (4 before, 4 after three full cycles) and ended one higher in the 2026-08-24 one (3 → 4); see the note under the table. Neither run establishes a leak, and neither rules one out at this length. The arena-fragmentation soak is the sensitive test of the same question over a much longer churn window.
+Arena count ended one higher than it started (3 → 4) across three full cycles; see the note under the table. That neither establishes a leak nor rules one out at this length. The arena-fragmentation soak is the sensitive test of the same question over a much longer churn window.

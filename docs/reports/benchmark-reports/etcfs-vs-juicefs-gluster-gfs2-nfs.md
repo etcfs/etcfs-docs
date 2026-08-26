@@ -17,7 +17,7 @@ Single fio client (`psync` for the FUSE-based backends — EtcFS and JuiceFS —
 
 ## Results
 
-All five backends re-measured in one session on 2026-08-25:
+All five backends measured in one session:
 
 | Backend | randwrite IOPS | randwrite p99 (us) | randread IOPS | randread p99 (us) |
 |---|---|---|---|---|
@@ -26,10 +26,6 @@ All five backends re-measured in one session on 2026-08-25:
 | etcfs | 934 | **17,957** | 1016 | 11,076 |
 | nfs | 675 | 244,318 | 44,504 | 8585 |
 | juicefs | 389 | 61,080 | 69,243 | 87 |
-
-The 2026-08-15 run of the same table, for reference: etcfs 681/39,059/1016/11,207,
-juicefs 393/67,633/66,937/100, gluster 1041/0\*/8030/0\*, nfs
-681/238,027/48,434/8847, gfs2 972/0\*/1010/0\*.
 
 \* Those zeros were a reporting bug, now fixed, and they were hiding the most
 interesting column on this page. gfs2 and gluster need the AL2 AMI, which ships

@@ -15,18 +15,13 @@ to move.
 
 ## Results
 
-The top etcfs row is from 2026-08-25, after the entry and attribute timeouts
-were raised from one second to a minute and a cluster-wide watch on the `inode:`
-prefix was added to invalidate attributes. The other four rows are the
-2026-08-16 run of the same script at the same tree size and were not
-re-measured — they are unaffected by an etcfs-side change, but they are a
+The competitor rows come from a separate session of the same script at the same
+tree size — they are unaffected by an etcfs-side change, but they are a
 different day's clusters.
 
 | Backend | find cold (s) | find warm (s) | du (s) | lookups/sec (cold) |
 |---|---|---|---|---|
-| **etcfs (2026-08-25)** | **8.244** | **7.220** | **128.223** | **9704.03** |
-| etcfs (2026-08-24) | 10.640 | 10.990 | 197.332 | 7518.80 |
-| etcfs (2026-08-16) | 9.044 | 8.800 | 160.380 | 8845.64 |
+| **etcfs** | **8.244** | **7.220** | **128.223** | **9704.03** |
 | gfs2 | 9.029 | 0.125 | 82.025 | 8860.34 |
 | nfs | 0.905 | 0.482 | 0.411 | 88397.79 |
 | juicefs | 1.560 | 1.510 | 20.875 | 51282.05 |
@@ -36,12 +31,12 @@ different day's clusters.
 
 **Cold `find` is not where etcfs loses**: 8.24 s on 80,000 files, between
 gluster's 7.6 s and gfs2's 9.0 s, with only NFS and JuiceFS in a different
-class. It was 10.64 s, but that is within this scenario's run-to-run spread
+class.
 (9.0 s and 10.6 s on two earlier runs of the same configuration) and is not a
 result on its own.
 
 **`du` is still where the gap is real, and it halved** — 128 s for etcfs against
-82 s for gfs2, 21 s for juicefs and under a second for nfs. It was 197 s, so the
+82 s for gfs2, 21 s for juicefs and under a second for nfs. The
 deficit against gfs2 fell from 2.4x to 1.56x and against nfs from 480x to 312x.
 `du` stats every entry for its size on top of walking the tree, and that is what
 the raised attribute timeout addresses: `readdirplus` already returned every
@@ -72,6 +67,6 @@ timeout in the way.
   (9.0 s, 10.6 s and 8.2 s cold), which is the run-to-run spread on this
   hardware — the cold `find` improvement is inside it and should not be read as
   a result on its own. `du` and the warm/cold ratio are outside it.
-- The four competitor rows are from 2026-08-16 clusters, not this session's.
+- The four competitor rows are from another session's clusters, not this one's.
 - 80,000 files, two directory levels, 2 KiB each, untarred from a locally
   staged tarball so the walk measures the filesystem and not the generator.
