@@ -28,3 +28,28 @@ One number moved in a direction worth watching: the cluster owned 3 arenas befor
 Both of the scenario's own questions come back close to clean. Survivor impact is small (3.02% worst-case dip in the 2026-08-24 run, 253.29 → 245.63 MiB/s; 1.37% in the earlier one) — a rejoining node claiming its own arena really does cost the rest of the cluster close to nothing, unlike this report's sibling (join-latency, which measured a 30.93% dip under a very similar setup and flagged it as needing a follow-up to separate "joining costs something" from "this specific recovery path costs something"). The gap between the two reports' impact numbers is itself informative: rejoin-load's baseline throughput here (246.87 MiB/s, sequential 1M writes) is far higher than join-latency's (13.74 MiB/s, random 4K writes) — a workload with more slack to absorb a brief reattach-and-restart window shows a much smaller dip, which is consistent with the reattach cost being close to fixed while the room to hide it in scales with the survivors' own workload.
 
 Arena count ended one higher than it started (3 → 4) across three full cycles; see the note under the table. That neither establishes a leak nor rules one out at this length. The arena-fragmentation soak is the sensitive test of the same question over a much longer churn window.
+
+### Six cycles with a settle window (2026-08-27, `m5.large`)
+
+The run was repeated with six cycles instead of three and the arena count
+sampled twice: once immediately after the last rejoin, as before, and once
+after a 300-second settle, to test the "a reclaim was still in flight"
+explanation directly.
+
+| Sample | Arenas owned |
+|---|---|
+| before the cycles | 4 |
+| immediately after the last rejoin | 4 |
+| after a 300 s settle | 5 |
+
+The explanation does not survive the test. If an unfinished reclaim were what
+the earlier run saw, the count would fall over the settle window; it rose. Six
+cycles cost nothing at the moment they ended and one arena five minutes later,
+which is the opposite ordering. Survivor impact stayed at zero across all six
+cycles (260.66 MiB/s baseline, 0.00% worst dip, 5.04 s mean rejoin), so
+whatever this is, it is not costing throughput.
+
+What it means is still open: an arena claimed lazily by the rejoined node after
+it settles would look exactly like this and would be correct, and so would a
+reclaim that never runs. Distinguishing them needs the count broken down per
+node rather than summed, which this scenario does not currently record.

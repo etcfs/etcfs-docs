@@ -50,6 +50,30 @@ Separating etcfs from the network-relaying backends needs an instance class with
 more EBS bandwidth than any of these numbers, not a bigger volume. Until then
 this scenario measures the hardware.
 
+### etcfs on an instance class with EBS headroom
+
+*2026-08-27.* The same sweep on `m7i.large` with an 8000-IOPS / 40 GB volume,
+which is the instance-class change the paragraph above asks for.
+
+| Size | TTFB (ms) | Read (MiB/s) |
+|---|---|---|
+| 1 MiB | 40 | 166.67 |
+| 64 MiB | 36 | 367.82 |
+| 1 GiB | 38 | 412.24 |
+| 8 GiB | 55 | 415.65 |
+
+The 8 GiB handoff moves from 255.95 to **415.65 MiB/s** — 1.62x — purely by
+leaving the `t3.medium`'s EBS allowance behind, which confirms that the earlier
+figure was the instance's ceiling and not etcfs's. Time-to-first-byte is
+roughly half what it was (55 ms against 112 at 8 GiB) and again nearly flat
+across the sweep, so the size-independence of a handoff holds on faster
+hardware.
+
+What this run does not establish is where the new ceiling is: no raw-device
+number was taken on `m7i.large` in the same session, so 415.65 MiB/s may again
+be the hardware rather than the protocol. The competitor rows are still
+`t3.medium` and must not be read against this table.
+
 All five backends land in the same 60-330 MiB/s band and single-digit-to-low-hundreds-of-ms TTFB — the shared 1000-IOPS/20 GB io2 Multi-Attach volume caps every backend at roughly the same device ceiling here, so this run does not show the widening gap the scenario was designed to expose. That gap is expected to show up on a volume sized so the network-relaying backends (NFS, JuiceFS through object storage) are bandwidth-bound while etcfs/GFS2 stay device-bound — worth a follow-up sweep with a higher-IOPS volume or larger N before drawing conclusions about the win margin.
 
 ## Bug found and fixed during this run

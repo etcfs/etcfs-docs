@@ -104,6 +104,7 @@ nav:
           - Elasticity — Membership Change Cost: reports/benchmark-reports/elasticity.md
           - Metadata Under Concurrency: reports/benchmark-reports/metadata-concurrency.md
           - Small-File Metadata Storm: reports/benchmark-reports/smallfile-storm.md
+          - Batched Cross-Inode Flush: reports/benchmark-reports/batched-flush.md
           - Single-Node Ceiling: reports/benchmark-reports/single-node-ceiling.md
           - Deep Directory Walks: reports/benchmark-reports/deep-directory-walks.md
           - fsync-Heavy Small Writes: reports/benchmark-reports/fsync-heavy-writes.md

@@ -26,6 +26,7 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 | [Negative lookup](negative-lookup.md) | warm µs per missing-name lookup | **2.21 µs** | nfs 3.68 µs | **1.7x faster than the next best**, 130–230x faster than gluster/juicefs, which do not cache absences at all |
 | [Warm page cache](warm-page-cache.md) | daemon reads during a warm pass | **0** | n/a | a coherent, lock-scoped page cache that costs nothing to read through — 600k IOPS served entirely by the kernel |
 | [Online volume growth](online-volume-growth.md) | new space usable after growing the device | **3.90 s**, no restart anywhere | gfs2 needs `gfs2_grow`; nfs grows server-side | not measured for the others — the shared raw-device path has no equivalent |
+| [Batched cross-inode flush](batched-flush.md) | inodes published per etcd transaction, 256 files open per node | **40.5** (2428 inodes in 60 commits) | n/a | no competitor has an equivalent — this is the interval sweep's own batching, measured where it applies |
 
 ## Where etcfs is competitive
 
@@ -37,7 +38,7 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 | [Negative lookup](negative-lookup.md) | cold µs per missing-name lookup | 110 µs | gfs2 10.5 µs, nfs 231 µs | second of five, ahead of nfs/juicefs/gluster |
 | [Deep directory walks](deep-directory-walks.md) | cold `find` over 80k files | 8.24 s | gfs2 9.03 s, gluster 7.64 s | between the two shared-device backends, inside this scenario's run-to-run spread; nfs (0.91 s) is in another class |
 | [Single-node ceiling](single-node-ceiling.md) | sequential write as % of raw device | 68.1% | gfs2 83.5%, gluster 46.1% | mid-field |
-| [Cross-node handoff](cross-node-handoff.md) | 8 GiB read after another node wrote it | 255.95 MiB/s | field 195–244 MiB/s | at the raw-device ceiling measured on the same instance (254 MiB/s) — the hardware, not the protocol, is the limit |
+| [Cross-node handoff](cross-node-handoff.md) | 8 GiB read after another node wrote it | 255.95 MiB/s on `t3.medium`, **415.65 MiB/s** on `m7i.large` | field 195–244 MiB/s (`t3.medium`) | the `t3.medium` figure was that instance's EBS ceiling (254 MiB/s); with EBS headroom the handoff is 1.62x faster, and the competitor rows are not comparable to it |
 
 ## Where etcfs loses
 
