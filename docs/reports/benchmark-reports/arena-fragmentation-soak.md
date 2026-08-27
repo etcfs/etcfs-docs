@@ -30,6 +30,39 @@ Single isolated 3-node etcfs cluster.
 Baseline for both "start" figures is the first sample *after* the churn was
 running, not the script's own first sample.
 
+## One-hour re-run on the re-baselined metric (2026-08-27)
+
+The script now baselines on the first sample after live bytes plateau — 33 s
+into this run — and publishes the spread and least-squares trend of allocatable
+space alongside the ratio, because endpoints alone misread a filesystem whose
+free space swings by tens of gigabytes within a run.
+
+| Metric | Value |
+|---|---|
+| Soak duration | 3,600 s, 107 samples after the plateau |
+| Live data | 3.36 GiB at the plateau, 1.68 GiB at the end |
+| Allocatable space | 94.75 GiB at the plateau, min 0.00, max 94.75, 0.00 at the end |
+| Trend in allocatable space | **−6.94 GiB per hour** |
+| Arenas owned across the cluster | 20, unchanged from early in the run |
+| `avail_lost_per_live_byte` | 0 — the denominator went negative, so the ratio says nothing |
+
+The re-baselining fixes what it was meant to fix and exposes something the
+six-hour run did not show: over an hour of churn that ended with *less* live
+data than it started with, allocatable space trended down by 6.94 GiB per hour
+and the last samples report zero space available on a 160 GiB volume holding
+1.68 GiB of live data. Arena count was pinned at 20 for almost the whole run
+rather than moving with the working set.
+
+That is the signature the scenario exists to look for, and it disagrees with the
+six-hour run, which showed allocatable space rising. The two runs differ in
+instance class, volume size and duration, so this is not yet a contradiction to
+resolve in favour of either — but "free space reaches zero while live data
+halves" is not a reading that can be left as a footnote. What it needs next is a
+run that records per-node arena ownership and free-block counts from the
+allocator rather than `df`, and that checks whether writes actually begin
+failing when the reported figure reaches zero; the churn loop swallows `dd`
+errors today, so this run cannot say whether they did.
+
 ## Reading these numbers
 
 **No fragmentation appeared over six hours.** Live data was flat within ±5% for
