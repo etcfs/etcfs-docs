@@ -92,6 +92,38 @@ confirming a kill, and until that happens every surviving node stops. etcfs's
 recovery is gated on a lease expiring, which requires no device, no operator, and
 no journal replay — and while it happens, the survivors keep working.
 
+### With real fencing configured (2026-08-27)
+
+The objection above is answered by configuring the fence device the harness had
+been missing, rather than by reasoning about it. `COMPARE_BACKEND=gfs2-fenced`
+brings GFS2 up under pacemaker with a `fence_aws` STONITH device that stops the
+dead instance through the EC2 API, DLM and the mount as ordered clones, and
+`stonith-action=off` so a fenced node cannot return before its journal is
+replayed. The scenario itself is unchanged — same sysrq power-off, same probes.
+
+| | unfenced | fenced |
+|---|---|---|
+| fence confirmed | no device configured | **yes**, ~10 s after the kill |
+| survivor's own I/O | stopped for the rest of the run | **never stopped** (0.266 s worst stall, 0 failed ops) |
+| takeover of the dead node's file | never, in 203 s | **never, in 180 s** |
+
+Fencing fixes the part of the failure that made the unfenced run hard to read.
+The survivors keep their own filesystem: they resume in 0.042 s and lose no
+operations, where before one node's death stopped every surviving node
+outright. That is the difference a fence device makes, and it is large.
+
+What it does not do, in this configuration, is hand the dead node's inode to a
+survivor inside the window. With the fence confirmed at about ten seconds, the
+file that node had been writing stayed inaccessible for the remaining 180 s —
+any access to it blocked indefinitely, to the point that an unguarded `ls` on it
+hung the harness itself. Whether a further recovery step is missing from this
+setup or GFS2 genuinely takes longer than three minutes to release that
+lockspace is not established here; what is established is that the take-over did
+not happen inside the window, with fencing working. Against EtcFS's 2.19 s, the
+honest statement is that GFS2 with real STONITH keeps its survivors alive — the
+unfenced cluster does not — and still did not recover the dead node's file in
+three minutes.
+
 **gluster recovers, slowly.** The replica set drops to two copies and the client
 takes 22.6 s to write the dead node's file, with a 78 s worst gap on the shared
 one. It is the only competitor here that recovers at all inside the window, and

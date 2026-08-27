@@ -18,7 +18,7 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 
 | Scenario | Metric | etcfs | Best competitor | Advantage |
 |---|---|---|---|---|
-| [Node-kill recovery](node-kill-recovery.md) | takeover of a dead node's file | **2.19 s** | gluster 22.64 s | **10.3x faster** — and gfs2, nfs and juicefs never recovered it inside 180 s |
+| [Node-kill recovery](node-kill-recovery.md) | takeover of a dead node's file | **2.19 s** | gluster 22.64 s | **10.3x faster** — and gfs2, nfs and juicefs never recovered it inside 180 s. GFS2 was re-run with real `fence_aws` STONITH: the fence completes in ~10 s and its survivors then keep serving, but the dead node's file was still not recovered in 180 s |
 | [Node-kill recovery](node-kill-recovery.md) | survivor still serving I/O after the kill | **yes, uninterrupted** (0.11 s worst gap) | gluster yes (78 s worst gap) | gfs2/nfs/juicefs survivors went silent for the rest of the run |
 | [4 KiB random write tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 write latency at comparable IOPS | **17.96 ms** | juicefs 61.08 ms | **3.4x better than the next best**, 24x better than gfs2 (432 ms) at 96% of its throughput |
 | [4 KiB random read tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 read latency, device-bound path | **11.08 ms** | gfs2 242.69 ms | **21.9x better** |
