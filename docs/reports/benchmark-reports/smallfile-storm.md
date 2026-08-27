@@ -10,13 +10,12 @@ Same five isolated 3-node clusters as the other reports.
 
 ## Results
 
-The competitor rows were measured on `t3.medium`; the etcfs row is the same
-scenario on the same hardware, and it is not the build in the tree — see the
-note below the table.
+Every row is `t3.medium`. The etcfs row is the current build, re-measured
+2026-08-26; the competitor rows are the original 2026-08-25 measurements.
 
 | Backend | Untar time | Creates/sec |
 |---|---|---|
-| **etcfs** | **2243.7 s (37.4 min)** | **35.66** |
+| **etcfs** | **2282.7 s (38.0 min)** | **35.05** |
 | gfs2 | 29.8 s | 2688.89 |
 | nfs | 1054.0 s (17.6 min) | 75.90 |
 | juicefs | 864.0 s (14.4 min) | 92.60 |
@@ -26,9 +25,9 @@ A 10,000-file run on the same code gave 331.5 s at 30.16 files/s, so the rate is
 roughly independent of tree size at this scale and the 80,000-file figure is not
 a large-tree effect.
 
-**The etcfs row was re-measured on the current build, 2026-08-26.** Same
-scenario, same instance class, 80,000 files: 2282.7 s at 35.05 files/s, against
-the table's 2243.7 s at 35.66 — a 1.7% difference, well inside this scenario's
+**What the re-measure changed.** The row above was 2243.7 s at 35.66 files/s
+on the build of 2026-08-25; the current build gives 2282.7 s at 35.05 — a 1.7%
+difference, well inside this scenario's
 run-to-run spread, with no lock-yield failures (`notify_failures` 0). The
 commit reductions therefore do not show up in `t3.medium` wall clock, and the
 reason is visible in the run's own credit balance: CloudWatch reported

@@ -43,7 +43,7 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 
 | Scenario | Metric | etcfs | Best competitor | Deficit |
 |---|---|---|---|---|
-| [Small-file storm](smallfile-storm.md) | 80k-file untar | 2244 s (35.7 files/s) | gfs2 29.8 s (2689 files/s) | **75x slower** — a create is still a Raft commit. The etcfs figure is owed a re-measure: it is not the build in the tree, which costs 4.18 commits per file |
+| [Small-file storm](smallfile-storm.md) | 80k-file untar | 2283 s (35.1 files/s) | gfs2 29.8 s (2689 files/s) | **77x slower** — a create is still a Raft commit. Re-measured on the current build 2026-08-26, on the same instance class as the competitor rows; it costs 4.34 commits per file, and both builds ran with the instance's CPU credits exhausted |
 | [Metadata under concurrency](metadata-concurrency.md) | shared-directory ops/s at 3 nodes | 327 ops/s | gfs2 1515 ops/s | **4.6x slower** |
 | [fsync-heavy writes](fsync-heavy-writes.md) | sustained O_DSYNC 4 KiB IOPS | 155 | gfs2 989 | **6.4x slower** — every write is a device write plus a Raft commit |
 | [Deep directory walks](deep-directory-walks.md) | `du -s` over 80k files | 128 s | nfs 0.41 s | **312x slower**; 1.56x slower than gfs2 (82 s). Was 480x and 2.4x |
