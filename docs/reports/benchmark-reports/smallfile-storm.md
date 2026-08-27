@@ -13,13 +13,21 @@ Same five isolated 3-node clusters as the other reports.
 Every row is `t3.medium`. The etcfs row is the current build, re-measured
 2026-08-26; the competitor rows are the original 2026-08-25 measurements.
 
-| Backend | Untar time | Creates/sec |
-|---|---|---|
-| **etcfs** | **2282.7 s (38.0 min)** | **35.05** |
-| gfs2 | 29.8 s | 2688.89 |
-| nfs | 1054.0 s (17.6 min) | 75.90 |
-| juicefs | 864.0 s (14.4 min) | 92.60 |
-| gluster | 540.3 s (9.0 min) | 148.07 |
+| Backend | Untar time | Creates/sec | etcfs is slower by |
+|---|---|---|---|
+| **etcfs** | **2282.7 s (38.0 min)** | **35.05** | — |
+| gfs2 | 29.8 s | 2688.89 | **76.6x** |
+| nfs | 1054.0 s (17.6 min) | 75.90 | **2.17x** |
+| juicefs | 864.0 s (14.4 min) | 92.60 | **2.64x** |
+| gluster | 540.3 s (9.0 min) | 148.07 | **4.23x** |
+
+The multiples are the ratio of creates per second, so they say how many files a
+competitor finishes in the time etcfs finishes one. GFS2 writes its metadata to a
+local journal with no network round trip per create and is in a different class
+outright; the three network filesystems are between 2 and 5 times faster,
+which is the range a Raft commit per create costs against a protocol that
+batches or defers. Only the etcfs row is the current build — re-measuring the
+competitors was not asked for and the multiples inherit that.
 
 A 10,000-file run on the same code gave 331.5 s at 30.16 files/s, so the rate is
 roughly independent of tree size at this scale and the 80,000-file figure is not
@@ -37,6 +45,25 @@ rather than by the filesystem. A burstable instance cannot resolve this change;
 what it does confirm is that nothing regressed. The commit counter for the same
 run is 4.34 per file (347,303 transactions over 80,000 files, plus 3,005
 rejected and retried).
+
+**Paired A/B: the commit reductions are worth 1.164x, measured on one cluster.**
+Wall clock across separately provisioned clusters cannot resolve anything below
+about 20% — five runs in one day spanned 1159–1440 s with four of them the same
+build — so the comparison was run instead as alternating untars on a single
+cluster, `bench-storm-ab.sh`, at 20,000 files per round with only the metadata
+daemon swapped between them.
+
+| Round | Current build (`79b3ff9`) | Before the commit reductions (`4d30d1e`) |
+|---|---|---|
+| 1 | 363.4 s | 433.6 s |
+| 2 | 388.7 s | 442.2 s |
+| **mean** | **376.1 s** | **437.9 s** |
+
+**1.164x**, and every round of the newer build beat every round of the older one
+on the same three instances and the same volume. The commit counter said the
+same thing first — 6.2 Raft commits per file down to 4.3 — which is what makes
+this a confirmation rather than a discovery; the point of the paired run is that
+the wall-clock claim now rests on a comparison that can carry it.
 
 **The etcfs row is not the build in the tree.** It is the only etcfs run
 measured against these competitors, and a create-and-write has since gone from

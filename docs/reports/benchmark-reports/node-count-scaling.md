@@ -62,6 +62,40 @@ Metadata operations/second in one shared directory:
 > change touches how the curve responds to node count, but that is a
 > prediction, not a result.
 
+### etcfs at 8 and 16 nodes (2026-08-27)
+
+The sweep above stops at six nodes, which is not far enough to say anything
+about the claim the scenario exists to test. etcfs was swept alone to sixteen,
+on `m5.large` with a 200 GB / 5000-IOPS volume — no competitor row exists at
+these widths, and none of these numbers may be read against the tables above,
+whose volume provisioned a fifth of the IOPS.
+
+| Nodes | Disjoint write (MiB/s) | Shared-file write (MiB/s) | Shared-directory metadata (ops/s) |
+|---|---|---|---|
+| 8 | 1593.27 | 334.00 | 562.61 |
+| 16 | 1800.45 | 289.66 | 575.35 |
+
+Aggregate bandwidth on disjoint working sets still climbs at sixteen nodes
+(+13% over eight), which is the property the per-node arena is for: nothing in
+that path is shared, so nothing in it contends. Shared-directory metadata
+throughput flattens rather than falling — 562.6 to 575.4, +2.3% — so the
+directory that costs GFS2 47% of its throughput over 2 → 6 nodes costs etcfs
+nothing measurable over 8 → 16, and the ceiling that binds it is etcd's own
+commit rate rather than a lock passing between nodes. Writing to one *file* from
+sixteen nodes is the case that gets worse (334 → 290 MiB/s, −13%): every writer
+in turn takes the inode's lock, and that handover is serial by construction.
+
+GFS2 cannot be swept to these widths for a structural reason rather than a
+performance one — `mkfs.gfs2` fixes the journal count at format time and a node
+beyond it cannot mount — so "etcfs scales further" is, at sixteen nodes, a
+statement about what the other filesystem can be asked to do at all.
+
+**A first attempt at this sweep failed at sixteen nodes with `No space left on
+device` on the suite's default 20 GB volume**, which is what led to the arena
+soak's reclaim finding — see
+[Arena Fragmentation Soak](arena-fragmentation-soak.md). The run above provisions
+enough space that arena claims are not the binding constraint.
+
 \* juicefs's 4- and 6-node bandwidth jobs returned empty fio result files on
 every node, the same failure this scenario recorded at 4 nodes in its previous
 run and that [Elasticity](elasticity.md) hit during its join phase. Its metadata

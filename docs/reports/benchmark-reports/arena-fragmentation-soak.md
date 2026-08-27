@@ -57,11 +57,32 @@ That is the signature the scenario exists to look for, and it disagrees with the
 six-hour run, which showed allocatable space rising. The two runs differ in
 instance class, volume size and duration, so this is not yet a contradiction to
 resolve in favour of either — but "free space reaches zero while live data
-halves" is not a reading that can be left as a footnote. What it needs next is a
-run that records per-node arena ownership and free-block counts from the
-allocator rather than `df`, and that checks whether writes actually begin
-failing when the reported figure reaches zero; the churn loop swallows `dd`
-errors today, so this run cannot say whether they did.
+halves" is not a reading that can be left as a footnote. The cause was found by reading the reclaim path against the daemon's own logs,
+and it is not fragmentation.
+
+An unlinked file's extents are left behind on purpose: they become orphans, and
+the scrubber reclaims them on the node that owns their arena, because only that
+node's free list can take the blocks back. Before reclaiming one, the scrubber
+skips any finding whose inode is "locked here" — and that test asks whether
+*anything is cached* for the inode's lock, not whether an operation is using it.
+This node's lock cache keeps an entry after the file is closed, and after it is
+unlinked, until the entry is evicted; the cache holds 4096 of them. So on the
+node doing the deleting, the orphan is skipped every pass, which is what the
+daemon's repeated `scrub auto-fix: inode is locked here, extent left for a later
+pass` lines for the same inodes are recording.
+
+Under churn that deletes as fast as it writes, blocks are therefore never
+returned, and the filesystem walks to ENOSPC with almost nothing live in it. The
+16-node scaling sweep hit the same wall independently on the same day —
+`No space left on device` on a 20 GB volume — which is the second symptom of one
+cause.
+
+Two fixes are on the table, both in the block-reuse path and so neither taken
+lightly: drop this node's cached lock entry when an unlink removes the inode
+outright, which leaves the scrubber's race guard exactly as it is; or narrow the
+guard itself to "cached *and* the inode still exists", which is a smaller change
+that weakens a protection against a read in flight. The first is the safer
+shape.
 
 ## Reading these numbers
 

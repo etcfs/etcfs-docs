@@ -23,6 +23,7 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 | [4 KiB random write tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 write latency at comparable IOPS | **17.96 ms** | juicefs 61.08 ms | **3.4x better than the next best**, 24x better than gfs2 (432 ms) at 96% of its throughput |
 | [4 KiB random read tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 read latency, device-bound path | **11.08 ms** | gfs2 242.69 ms | **21.9x better** |
 | [Node-count scaling](node-count-scaling.md) | shared-directory metadata, 4 → 6 nodes | **+5%** (179 → 188 ops/s) | gfs2 **−47%** (1419 → 756 ops/s) | etcfs's curve keeps climbing where gfs2's collapses. The etcfs absolutes are owed a re-measure |
+| [Node-count scaling](node-count-scaling.md) | disjoint write bandwidth at 8 → 16 nodes | **1593 → 1800 MiB/s** (+13%), metadata flat at +2.3% | not measurable — gfs2's journal count is fixed at mkfs and it cannot mount past it | etcfs was swept alone to sixteen nodes; no competitor row exists at that width |
 | [Negative lookup](negative-lookup.md) | warm µs per missing-name lookup | **2.21 µs** | nfs 3.68 µs | **1.7x faster than the next best**, 130–230x faster than gluster/juicefs, which do not cache absences at all |
 | [Warm page cache](warm-page-cache.md) | daemon reads during a warm pass | **0** | n/a | a coherent, lock-scoped page cache that costs nothing to read through — 600k IOPS served entirely by the kernel |
 | [Online volume growth](online-volume-growth.md) | new space usable after growing the device | **3.90 s**, no restart anywhere | gfs2 needs `gfs2_grow`; nfs grows server-side | not measured for the others — the shared raw-device path has no equivalent |
@@ -44,7 +45,7 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 
 | Scenario | Metric | etcfs | Best competitor | Deficit |
 |---|---|---|---|---|
-| [Small-file storm](smallfile-storm.md) | 80k-file untar | 2283 s (35.1 files/s) | gfs2 29.8 s (2689 files/s) | **77x slower** — a create is still a Raft commit. Re-measured on the current build 2026-08-26, on the same instance class as the competitor rows; it costs 4.34 commits per file, and both builds ran with the instance's CPU credits exhausted |
+| [Small-file storm](smallfile-storm.md) | 80k-file untar | 2283 s (35.1 files/s) | gfs2 29.8 s (2689 files/s) | **76.6x slower than gfs2**, 4.2x gluster, 2.6x juicefs, 2.2x nfs — a create is still a Raft commit. etcfs re-measured on the current build 2026-08-26 on the competitors' instance class, at 4.34 commits per file; both builds ran with the instance's CPU credits exhausted |
 | [Metadata under concurrency](metadata-concurrency.md) | shared-directory ops/s at 3 nodes | 327 ops/s | gfs2 1515 ops/s | **4.6x slower** |
 | [fsync-heavy writes](fsync-heavy-writes.md) | sustained O_DSYNC 4 KiB IOPS | 155 | gfs2 989 | **6.4x slower** — every write is a device write plus a Raft commit |
 | [Deep directory walks](deep-directory-walks.md) | `du -s` over 80k files | 128 s | nfs 0.41 s | **312x slower**; 1.56x slower than gfs2 (82 s). Was 480x and 2.4x |

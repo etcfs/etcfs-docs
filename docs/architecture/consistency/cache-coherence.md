@@ -228,6 +228,18 @@ The watch-driven invalidation covers **all directory entry mutations** across al
 - `AtomicUnlink` / `AtomicRmdir` — directory entry deleted
 - `AtomicRename` — old entry deleted, new entry created
 
+A namespace mutation also invalidates the **parent directory's own attributes**
+on the node that made it, through an `INVAL_ATTR` for the parent inode. The
+mtime and ctime a create or an unlink owes its parent are deferred to the
+timestamp sweep, so nothing is written to etcd at the moment of the change and
+the inode watch below never fires for it — and the watch skips inodes this node
+holds in any case. Without this local invalidation the kernel answers the
+directory's timestamps from the copy it took before the change for as long as
+`attr_timeout`, and a `stat` following an `unlink` on the same node reports the
+state from before it. The suite's directory-timestamp assertions caught this
+intermittently, which is what an invalidation that only happens when the entry
+happens to have been evicted looks like.
+
 It does **not** cover:
 - **Inode attribute changes** (size, mode, timestamps) — these are handled by the cluster-wide inode watch, which pushes an `INVAL_ATTR` for every inode a peer writes, with `attr_timeout` and the per-inode lock behind it
 - **Data writes** — handled by O_DIRECT + locking (the extent is in etcd, the data is on the block device)
