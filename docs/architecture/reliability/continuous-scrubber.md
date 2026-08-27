@@ -253,6 +253,21 @@ What closes it is a question the scrubber can answer locally, with no round trip
 
 Asking once, before the delete, leaves a window the width of the delete transaction: a read can begin inside it. So the question is asked again on the far side of the delete, where the record is already gone and leaving the blocks alone would leak them instead. Those ranges go on a held list, retried at the start of every later pass, and are given back as soon as the inode is quiet. Nothing can reach them in the meantime — no extent record names them — and a restart returns them anyway, because the allocator's bitmap is rebuilt from the records that remain.
 
+A deferral that never ends is a different failure, and it happened. Entries
+leave the lock cache on eviction, which is driven by pressure rather than by
+liveness, so an inode that was unlinked kept its entry — and with it the
+scrubber's refusal to reclaim what it had orphaned — until 4,096 other inodes
+had pushed it out. Under churn that deletes files as fast as it writes them,
+allocatable space fell run-long and reached zero with almost nothing live in the
+filesystem, and a 16-node sweep hit `No space left on device` on a volume that
+was nearly empty. The two paths where an inode becomes permanently unreachable —
+an unlink with nothing holding the file open, and the release of the last
+descriptor on a file whose names are gone — now give up the inode's cached lock
+and drop the entry outright. Neither can have a read of this node's in flight,
+which is what the over-approximation exists to protect: in both, the descriptor
+count is already zero. An inode with writes still buffered is left alone, since
+publishing them is a transaction that would put the deleted record back.
+
 Step 2 is the ownership rule, and it is what keeps reclamation from leaking across nodes:
 
 > **Only the arena's owner may delete or shorten an extent record.**
