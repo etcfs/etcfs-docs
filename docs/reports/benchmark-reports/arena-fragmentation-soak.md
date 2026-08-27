@@ -84,6 +84,30 @@ guard itself to "cached *and* the inode still exists", which is a smaller change
 that weakens a protection against a read in flight. The first is the safer
 shape.
 
+### The same soak after the fix (2026-08-27, `m5.large`)
+
+Half an hour of the same churn, on the build that gives up a deleted inode's
+cached lock.
+
+| Metric | Before | After |
+|---|---|---|
+| Allocatable space, low point | **0 bytes** | **72.60 GiB** |
+| Allocatable space, trend | −25.55 GiB/h | **−1.50 GiB/h** |
+| Arenas owned at the end | 20 (pinned there all run) | 12 |
+| Live data, plateau → end | 3.36 → 1.68 GiB | 3.4 GiB, flat |
+
+The filesystem no longer runs itself out of space. Free space now oscillates in
+a band (72.6–94.7 GiB) as the churn allocates and gives back, which is the
+signature the six-hour run showed and the broken build never could.
+
+The trend is not zero, and it is reported rather than rounded away: −1.50 GiB/h
+over half an hour, a seventeenth of what it was. Whether that is a smaller leak
+of the same kind, the scrubber's 30-second cadence running slightly behind a
+churn that deletes continuously, or the measurement's own noise on a `df` figure
+that swings by 20 GiB within a run, this length of run cannot say. What it does
+establish is that the ENOSPC failure is gone: the low point moved from nothing
+left to three quarters of the volume free.
+
 ## Reading these numbers
 
 **No fragmentation appeared over six hours.** Live data was flat within ±5% for
