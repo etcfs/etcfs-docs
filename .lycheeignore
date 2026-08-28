@@ -9,3 +9,7 @@ https://medium\.com/?$
 https://ceph\.io/?$
 # Serves a certificate for one.com after a redirect; the PDF itself is fine:
 https://kernel\.dk/.*
+# The site this same workflow's own build/deploy jobs publish: on the very
+# first run there is nothing there yet, and this check runs in parallel
+# with (not after) the deploy, so it can never safely depend on it.
+https://etcfs\.github\.io/etcfs-docs/?$
