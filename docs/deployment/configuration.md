@@ -19,6 +19,12 @@ Anything none of them sets keeps the default in the table below. There is
 one vocabulary throughout: the flag's name is also the environment
 variable's name and the file's key, so nothing needs a translation table.
 
+The `.deb`/`.rpm` install a commented reference copy of every key at
+`/etc/etcfs/etcfuse-meta.yaml.example` and create `/etc/etcfs/` — copy the
+example to `etcfuse-meta.yaml` and delete what you do not need. The package
+deliberately does not own the live path: a package that did would overwrite
+a real configuration on upgrade.
+
 The file is `/etc/etcfs/etcfuse-meta.yaml` unless `--config` (or
 `ETCFS_CONFIG`) names another. That default path is optional — a cluster
 that passes everything on the command line, as this repo's own scripts do,

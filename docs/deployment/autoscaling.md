@@ -217,6 +217,17 @@ Teardown:
 terraform -chdir=infra/terraform-asg destroy
 ```
 
+## CloudFormation
+
+`cloudformation/etcfs-asg.yaml` in the same repository builds this cluster
+from a CloudFormation stack. It does not reimplement any of the above: its
+user-data downloads `templates/user-data.sh.tftpl` from GitHub, renders the
+`templatefile()` syntax against the stack's parameters, and runs it — so the
+seed election, the `member add` and the stale-member cleanup have one
+implementation shared by both paths. It omits the graceful-leave Lambda,
+whose source is too long to inline; see that directory's `README.md` for what
+that costs.
+
 ## What this does not cover
 
 - **Cross-AZ resilience.** One AZ, by the Multi-Attach constraint above — a
