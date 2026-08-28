@@ -118,8 +118,28 @@ etcfsctl quota clear <inode>
 
 `deploy/systemd/etcfuse-meta.service` and `deploy/systemd/etcfuse.service`
 — installed by the `.deb`/`.rpm` packages to `/usr/lib/systemd/system/`
-(see [Binaries](binaries.md)), not enabled automatically. Edit the
-`ExecStart` line for your cluster's flags, then:
+(see [Binaries](binaries.md)), not enabled automatically.
+
+`etcfuse-meta.service` runs the binary with **no flags at all**, so
+everything it uses comes from `/etc/etcfs/etcfuse-meta.yaml` (or the
+environment). Put your cluster's settings there rather than editing the
+unit: a flag beats the file, so any flag added back to `ExecStart` silently
+overrides the file's value for that setting, and an edit to a packaged unit
+is lost on the next upgrade. For what differs per node — `node-id`,
+`ec2-instance-id` — use a drop-in, which survives upgrades:
+
+```ini
+# /etc/systemd/system/etcfuse-meta.service.d/override.conf
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/etcfuse-meta --node-id=node-3 --ec2-instance-id=i-0abc123
+```
+
+`etcfuse` (the C daemon) has no config file — it takes its socket paths and
+its mountpoint on the command line, so edit its unit or drop in an override
+as usual.
+
+Then:
 
 ```bash
 sudo systemctl daemon-reload

@@ -109,12 +109,16 @@ whole join protocol, run on the new instance itself:
    `--initial-cluster-state existing`. Same retry-and-recover logic as
    `add-compute-node.sh`'s `member add` step for a member that landed but
    couldn't be read back.
-7. Start `etcd`, then `etcfuse-meta` as a systemd drop-in override on top
-   of its package unit (`/etc/systemd/system/etcfuse-meta.service.d/override.conf`
-   — an override, not an edit to the package's `ExecStart`, so a package
-   upgrade doesn't silently drop the cluster-specific flags), and
-   `etcfuse` as a full unit (no package unit to override, since it's built
-   from source — see above).
+7. Start `etcd`, then `etcfuse-meta`, whose settings are written to
+   `/etc/etcfs/etcfuse-meta.yaml` — endpoints, cluster name, lease TTL,
+   device and fencing volume, everything the cluster shares — leaving the
+   package's own flagless `ExecStart` untouched, so an upgrade cannot drop
+   them. Only this instance's identity (`--node-id`, `--ec2-instance-id`)
+   goes in a drop-in override, because no file shared by every node can
+   carry it. The split is forced rather than stylistic: a flag beats the
+   file, so anything left on the command line would override the same key
+   in the file without saying so. `etcfuse` is written as a full unit (no
+   package unit to override, since it's built from source — see above).
 8. Wait for the FUSE mount to come up; a failure dumps the last 60 lines of
    both daemons' journals before exiting non-zero, so a stuck instance fails
    its EC2 status check instead of silently sitting unmounted.
