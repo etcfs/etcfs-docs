@@ -72,6 +72,23 @@ whole join protocol, run on the new instance itself:
    previously-read item, so concurrent reclaimers still converge on exactly
    one winner. Verified clean over a real concurrent 3- and 5-node boot
    after the fix.
+
+   **The row is a bootstrap hint, never a liveness oracle.** Nothing
+   refreshes it after cluster formation — not the seed, not the
+   graceful-leave Lambda — so a long-lived cluster whose original seed has
+   since been scaled in or replaced still carries a row naming a dead IP
+   with a `created_at` far past the staleness bar. Reclaiming on that alone
+   would clear the age check on the first attempt and form a second,
+   single-node etcd cluster beside a perfectly healthy quorum, both
+   attached to the same block device. The staleness bar only ever protected
+   the concurrent-boot window it was written for. So before any reclaim, a
+   joiner tag-discovers every other node and probes its `:2379/health`
+   directly: if any peer answers, the cluster is alive and the row is
+   merely out of date — join through that peer instead, and conditionally
+   repoint the row at it so the next joiner gets a live hint. Only when the
+   recorded seed is unreachable, past the staleness bar, *and* no peer is
+   serving does the reclaim run. The repoint is best-effort; losing its CAS
+   to another node doing the same thing is a correct outcome.
 5. **Won the election** → form a new etcd cluster
    (`--initial-cluster-state new`) with itself as the only member.
 6. **Lost the election** → before calling `etcdctl member add` against the
