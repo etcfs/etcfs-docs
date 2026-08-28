@@ -116,7 +116,18 @@ required and stop the node if missing. The steps:
    `--initial-cluster-state existing`. Same retry-and-recover logic as
    `add-compute-node.sh`'s `member add` step for a member that landed but
    couldn't be read back.
-7. Start `etcd`, then `etcfuse-meta`, whose settings are written to
+7. Start `etcd`, then `etcfuse-meta`. Where its settings go depends on the
+   binary that was installed: the script asks `etcfuse-meta --help` whether
+   it supports `--config` and passes everything as flags in the drop-in when
+   it does not. That check is not defensive dressing — `--config` landed
+   after the last release, and an older binary does not reject a config file
+   it cannot read, it never looks for one. A node that wrote the file anyway
+   came up *looking* healthy and was not: endpoints fell back to
+   `localhost:2379`, no block device was opened, and fencing dropped to
+   single-signal, so the FUSE mount succeeded and every write to it returned
+   EIO. Found by booting this exact path on AWS. Once a release carries the
+   flag, the same script starts using the file with no change. With
+   `--config` support present, settings are written to
    `/etc/etcfs/etcfuse-meta.yaml` — endpoints, cluster name, lease TTL,
    device and fencing volume, everything the cluster shares — leaving the
    package's own flagless `ExecStart` untouched, so an upgrade cannot drop
