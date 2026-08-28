@@ -5,10 +5,55 @@ device) and `etcfuse` (C, mounts the filesystem, forwards VFS ops to
 `etcfuse-meta` over a Unix socket). `etcfuse-meta` must be up first —
 `etcfuse.service` depends on it.
 
+## Where settings come from
+
+Each setting can be given in three places. In decreasing precedence:
+
+1. A command-line flag.
+2. An environment variable, `ETCFS_` plus the flag's name uppercased with
+   dashes as underscores — `--metrics-addr` is `ETCFS_METRICS_ADDR`.
+3. A YAML file, keyed by the flag's own name without the dashes that
+   introduce it — `metrics-addr: :9090`.
+
+Anything none of them sets keeps the default in the table below. There is
+one vocabulary throughout: the flag's name is also the environment
+variable's name and the file's key, so nothing needs a translation table.
+
+The file is `/etc/etcfs/etcfuse-meta.yaml` unless `--config` (or
+`ETCFS_CONFIG`) names another. That default path is optional — a cluster
+that passes everything on the command line, as this repo's own scripts do,
+never creates one — but a file named explicitly and then missing is an
+error. So is a key that matches no flag, which would otherwise read as a
+setting that silently does nothing.
+
+`--config`, `--version`, `--fsck` and `--info` select what the process does
+rather than how it is configured, and are accepted only on the command
+line. A file that could turn on `--fsck` would leave a node that never
+starts its daemon, with nothing on the command line to explain why.
+
+```yaml
+# /etc/etcfs/etcfuse-meta.yaml
+etcd-endpoints:            # a list, or the comma-separated string the flag takes
+  - http://10.0.1.10:2379
+  - http://10.0.1.11:2379
+etcd-local-endpoint: http://10.0.1.10:2379
+cluster-name: prod
+lease-ttl: 10s
+volume-id: vol-0abcdef1234567890
+ebs-volume-id: vol-0abcdef1234567890
+metrics-addr: :9090
+metadata-flush-interval: 100ms
+```
+
+Leaving `node-id` and `ec2-instance-id` out of the file is deliberate in
+that example: they differ per node, so they belong on the command line or
+in the environment, which lets one identical file be shipped to every node.
+
 ## etcfuse-meta flags
 
 | Flag | Default | Notes |
 |---|---|---|
+| `--config` | `/etc/etcfs/etcfuse-meta.yaml` | YAML file holding any of the flags below. Command line only. Missing is an error only when named explicitly. |
 | `--listen` | `/run/etcfuse/etcfuse.sock` | IPC socket the C daemon connects to. |
 | `--notify-socket` | `/run/etcfuse/etcfuse-notify.sock` | Cache-invalidation notifications to the C daemon. |
 | `--etcd-endpoints` | `http://localhost:2379` | Comma-separated. |
