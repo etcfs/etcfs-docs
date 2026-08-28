@@ -237,7 +237,7 @@ terraform -chdir=infra/terraform-asg destroy
 
 ## CloudFormation
 
-[etcfs-cloudformation](https://github.com/etcfs/etcfs-cloudformation) builds
+[etcfs-cloudformation-template](https://github.com/etcfs/etcfs-cloudformation-template) builds
 this cluster from a CloudFormation stack. It reimplements none of the above:
 its user-data exports the stack's parameters as `ETCFS_*` variables,
 downloads `scripts/node-bootstrap.sh` from the Terraform module, and runs it

@@ -8,7 +8,7 @@ Everything needed to run an EtcFS cluster outside `docker compose`, in order:
    alternative Terraform module that runs nodes in an Auto Scaling Group
    instead, with self-joining nodes and graceful `etcd member remove` on
    scale-in. For a CloudFormation stack rather than Terraform,
-   [etcfs-cloudformation](https://github.com/etcfs/etcfs-cloudformation)
+   [etcfs-cloudformation-template](https://github.com/etcfs/etcfs-cloudformation-template)
    builds the same cluster by running that module's node-bootstrap script, so
    the join protocol is not implemented twice.
 2. **[Binaries and containers](binaries.md)** — install `etcfuse`,
