@@ -29,7 +29,7 @@ etcd membership before an instance is terminated.
   `amazonlinux:2023` container, matching `deploy/docker/Dockerfile.etcfuse`),
   but until a release is cut *after* that fix, user-data still builds
   `etcfuse` from the release tag's source instead of installing its RPM —
-  see the `ponytail:` comment in `templates/user-data.sh.tftpl` for the
+  see the `ponytail:` comment in `scripts/node-bootstrap.sh` for the
   exact revert condition. `etcfuse-meta`/`etcfsctl` are Go,
   `CGO_ENABLED=0`, unaffected either way.
 - The shared io2 Multi-Attach volume is attached by each node to *itself* in
@@ -42,9 +42,16 @@ etcd membership before an instance is terminated.
 
 ## Scale-out: how a new node joins
 
-The launch template's user-data
-(`infra/terraform/modules/etcfs-asg/templates/user-data.sh.tftpl`) is the
-whole join protocol, run on the new instance itself:
+The launch template's user-data is the whole join protocol, run on the new
+instance itself. It is two pieces: a short preamble Terraform generates,
+exporting the cluster's settings as `ETCFS_*` environment variables, followed
+by `infra/terraform/modules/etcfs-asg/scripts/node-bootstrap.sh` included
+verbatim. The script is plain bash rather than a Terraform template so that
+`shellcheck` covers it in CI, `bash -n` parses it, it can be run directly
+against a test instance, and a launcher that is not Terraform can reuse it
+unchanged — at the cost of an unset value failing at boot rather than at
+`terraform plan`, which is why the four settings with no safe default are
+required and stop the node if missing. The steps:
 
 1. Read its own instance ID and private IP from IMDSv2.
 2. Install etcd and `etcfuse-meta`/`etcfsctl`; build `etcfuse` (see above).
@@ -219,14 +226,14 @@ terraform -chdir=infra/terraform-asg destroy
 
 ## CloudFormation
 
-`cloudformation/etcfs-asg.yaml` in the same repository builds this cluster
-from a CloudFormation stack. It does not reimplement any of the above: its
-user-data downloads `templates/user-data.sh.tftpl` from GitHub, renders the
-`templatefile()` syntax against the stack's parameters, and runs it — so the
-seed election, the `member add` and the stale-member cleanup have one
-implementation shared by both paths. It omits the graceful-leave Lambda,
-whose source is too long to inline; see that directory's `README.md` for what
-that costs.
+[etcfs-cloudformation](https://github.com/etcfs/etcfs-cloudformation) builds
+this cluster from a CloudFormation stack. It reimplements none of the above:
+its user-data exports the stack's parameters as `ETCFS_*` variables,
+downloads `scripts/node-bootstrap.sh` from the Terraform module, and runs it
+— so the seed election, the `member add` and the stale-member cleanup have
+one implementation shared by both paths. It omits the graceful-leave Lambda,
+whose source is too long to inline; see that repository's `README.md` for
+what that costs.
 
 ## What this does not cover
 
