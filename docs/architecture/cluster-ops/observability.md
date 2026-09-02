@@ -75,6 +75,7 @@ own latency.
 | `etcfuse_metadata_flush_failures_total` | Counter | `reason` | Flushes that did not publish (`error`, `rejected`, `fenced`, `device`) |
 | `etcfuse_block_io_total` | Counter | `op` | Block device operations (`read`, `write`) |
 | `etcfuse_block_io_bytes_total` | Counter | `op` | Bytes transferred to and from the device |
+| `etcfuse_block_io_duration_seconds` | Histogram | `op` | Device read and write latency. Shares its buckets with `etcfuse_fuse_op_duration_seconds`, so the two can be read against each other to say how much of an operation's latency was the device rather than the daemon |
 | `etcfuse_scrub_anomalies_total` | Counter | `type` | Anomalies found by the scrubber |
 | `etcfuse_scrub_passes_total` | Counter | — | Completed scrub passes |
 | `etcfuse_scrub_last_run_seconds` | Gauge | — | Unix timestamp of the last completed pass |
