@@ -120,5 +120,6 @@ nav:
   - Background:
       - etcd/Raft Internals: background/etcd_raft_research.md
       - Cluster Filesystem Survey: background/cluster-fs-survey.md
+      - Why Invert Rather Than Rebuild: background/why-invert-rather-than-rebuild.md
       - VFS/FUSE/Block Research: background/vfs_fuse_block_research.md
       - Userspace Filesystem Research: background/userspace_filesystem_research.md
