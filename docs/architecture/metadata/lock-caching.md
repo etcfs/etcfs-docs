@@ -11,7 +11,7 @@ which entry to evict), `internal/ipc/retry.go` (`lockInode`),
 ## Table of Contents
 
 - [Why](#why)
-- [What Changed and What Did Not](#what-changed-and-what-did-not)
+- [What Caching Does Not Touch](#what-caching-does-not-touch)
 - [Node-Local Exclusion](#node-local-exclusion)
 - [Recall Protocol](#recall-protocol)
 - [Hold Time](#hold-time)
@@ -24,11 +24,10 @@ which entry to evict), `internal/ipc/retry.go` (`lockInode`),
 
 ## Why
 
-An inode lock used to be acquired and released in etcd around every single
-operation: a Raft commit for the acquire and, before the write path folded it
-into the publishing transaction, another for the release. At etcd's measured
-~2.2 ms per commit that was the dominant cost of both a read and a write, and
-it did not respond to storage provisioning — the chain is latency-bound, and
+Acquiring and releasing an inode lock in etcd around every single operation
+would put a Raft commit on every operation for the acquire. At etcd's measured
+~2.2 ms per commit that would be the dominant cost of both a read and a write,
+and it would not respond to storage provisioning — the chain is latency-bound, and
 provisioned IOPS buys parallelism, not latency (see
 [Performance Benchmarks](../reliability/performance-benchmarks.md)).
 
@@ -49,31 +48,30 @@ seeded with the record the create published. A file an archive creates and
 immediately writes therefore reaches etcd once, for the create, and not again
 until the extent is published.
 
-## What Changed and What Did Not
+## What Caching Does Not Touch
 
 Caching touches only *how often the daemon asks etcd who holds a lock*. It
 does not touch anything the lock's safety argument depends on:
 
-- The **fencing generation guard** still wraps every metadata mutation,
+- The **fencing generation guard** wraps every metadata mutation,
   cached lock or not — a fenced node's commits are rejected regardless of
   whether it believes it holds the lock (see
   [Concurrency Control](concurrency-control.md#fencing-generations)).
-- The **extent CAS** in the write transaction is unchanged: each new chunk
+- The **extent CAS** in the write transaction is the same: each new chunk
   key is compared against `CreateRevision == 0`, and each rewritten extent
   against the revision it was read at.
-- **Lease expiry** is unchanged: a node that stops renewing its session loses
+- **Lease expiry** still applies: a node that stops renewing its session loses
   every lock key it holds, cached or not, within the lock's 2-second TTL.
-- **Publication order** is unchanged: bytes go to the block device before the
+- **Publication order** is the same: bytes go to the block device before the
   metadata transaction that makes them referenced.
 
-Only the mechanism that decides *when* the etcd key is taken and released is
-new.
+Caching decides only *when* the etcd key is taken and released.
 
 ## Node-Local Exclusion
 
-Because the etcd key is reused, it no longer excludes this node's own
+Because the etcd key is reused, it does not exclude this node's own
 threads — every thread asking for the same inode finds the same cached key.
-What now provides that exclusion is a per-inode `sync.RWMutex` (`lockEntry.rw`
+What provides that exclusion is a per-inode `sync.RWMutex` (`lockEntry.rw`
 in `lockcache.go`): a read lock for a shared request, a write lock for an
 exclusive one.
 
@@ -81,8 +79,7 @@ The wait for it is bounded, not blocking — `lockLocal` in `retry.go` spends
 the same retry budget every other contended operation on the data path uses
 (`lockAttempts` attempts, `TryLock`/`TryRLock` each time), and gives up with
 `ErrConflict` rather than waiting forever. A thread that cannot get the local
-lock in budget produces the same `EAGAIN` the etcd-side conflict used to
-produce before caching existed.
+lock in budget produces the same `EAGAIN` an etcd-side conflict produces.
 
 The mutex and the etcd key have to name the same inode for the same reason a
 DLM lock resource is a singleton per resource: every caller of that inode
@@ -245,9 +242,9 @@ A batch rather than one victim because a release is a Raft commit and one
 transaction of 64 deletes costs what one delete costs. It matters for a workload
 whose working set is far larger than the cache: an unpacking archive touches
 80,000 inodes against 4,096 entries, so it evicts one inode for every new one
-and used to pay that commit per file. Between sweeps the cache sits under its
-bound by up to a batch, which is 1.6% of it — the bound was already a target
-rather than an invariant in the other direction.
+and would otherwise pay that commit per file. Between sweeps the cache sits
+under its bound by up to a batch, which is 1.6% of it; the bound is a target
+rather than an invariant in both directions.
 
 One rule makes the batch safe to hold at all: an entry's `keyMu` is only ever
 taken by a caller that already holds that entry's `rw`, and every path that
@@ -255,8 +252,8 @@ wants a *second* entry takes its `rw` with `TryLock` — the eviction sweep when
 it claims its victims, and `drainBuffers` when it publishes another inode's
 buffer under memory pressure. Two such callers therefore cannot each end up
 waiting on what the other holds: whichever claimed an entry first, the other
-skips it. Batching is what made this load-bearing, since a single release never
-held more than one entry at a time.
+skips it. The rule matters because of batching: a single release holds one
+entry at a time, a batch holds up to 64.
 
 Batching changes nothing about what a key stands for. Each key is still deleted
 individually, still by exact holder token, and everything owed before a key may
@@ -322,7 +319,10 @@ as the lease it was written under. If that lease is gone — expired during a
 partition, or revoked — etcd deleted the key with it and a peer may already
 hold the inode, so `ensureLockKey` compares the lease this entry's key was
 written under against the session's current lease on every operation, and
-drops both the key and the snapshot when they differ. That check is a mutex
+drops both the key and the snapshot when they differ (`keyLostLocked`). The
+entry itself stays in the cache, demoted exactly as a recall leaves it; its
+buffered writes are discarded and their blocks returned to the arena, and the
+operation that noticed goes on to acquire a fresh key. That check is a mutex
 and a channel poll, no round trip, and it is what bounds how long a
 partitioned node can answer from its own caches: the lock session's 2-second
 TTL, not the self-fencing watchdog's much longer window.
@@ -338,7 +338,7 @@ the lock cannot have changed what the snapshot describes — which is why a
 stale read needs the session to be gone, and the session being gone is what
 clears the cache.
 
-The kernel's own caching of file data is now governed by the same lock. An open
+The kernel's own caching of file data is governed by the same lock. An open
 — or a create, which hands back an open descriptor — is answered with `keep_cache = 1` and `direct_io = 0` when this node can
 guarantee it will be able to take those pages back — which means page caching is
 enabled and a client is connected to carry the invalidation — and the daemon
@@ -382,9 +382,8 @@ anyway but only after the process had already stopped answering.
 
 ## Correctness Invariants
 
-Two bugs were found and fixed while building this (not left as known
-limitations — both are closed in the current code, kept here as the
-properties a future change to this file must not reintroduce):
+These are the properties the cache depends on, and a change to this code must
+keep each of them:
 
 1. **An entry must never be removed while an operation is using it.**
    Removing a busy entry lets a second caller build a fresh entry for the
@@ -510,9 +509,6 @@ that buries an extent, and a write that splits one in two;
 `TestIntegration_MutationsThatDoNotPublishDropTheCache` checks that a mutation
 which does not publish leaves nothing cached behind.
 
-Both were caught by review before being benchmarked or shipped, not by a
-failure in the field — there was no failure in the field, since the code had
-not run outside tests. `internal/ipc/lockcache_test.go` has one test per
-invariant (`TestRecallKeepsTheEntryInTheCache`,
-`TestEvictedEntryIsNotCurrent`), so a regression fails fast rather than
-waiting for a multi-node race to surface it.
+`internal/ipc/lockcache_test.go` pins the first two invariants with one test
+each (`TestRecallKeepsTheEntryInTheCache`, `TestEvictedEntryIsNotCurrent`), so a
+regression fails fast rather than waiting for a multi-node race to surface it.
