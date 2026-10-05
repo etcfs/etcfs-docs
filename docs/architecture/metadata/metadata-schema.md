@@ -99,7 +99,7 @@ The `Nlink` field tracks the number of directory entries pointing to this inode.
 
 Every inode is created with the count its first entry implies: 1 for a regular file, symlink, device node or FIFO, and 2 for a directory, which is reached both through its parent's entry and through its own `.`. `metadata.InitialNlink` is the single definition of that rule.
 
-Directories keep 2 for their whole life. EtcFS does not model the `..` link a subdirectory contributes to its parent, so a directory's count does not vary with its contents. The fsck and scrubber checks assert that fixed value for directories and compare against the real dirent count for everything else.
+The fsck and scrubber checks expect 2 plus the number of subdirectories for a directory and compare against the real dirent count for everything else. A filesystem written before directory counts were maintained still holds directories at 2; both checks report that drift and neither repairs it. The mount's root is answered locally by the C daemon with a fixed nlink of 2, whatever it holds.
 
 ### Extent
 

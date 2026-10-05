@@ -111,9 +111,9 @@ If the inode's extent list is non-empty at nlink zero (meaning there are allocat
 
 RMDIR removes a directory through `AtomicRmdir`, a single transaction. It reads the dirent and the inode to confirm the target is a directory — returning `ENOTDIR` if it is not — and then commits with three comparisons: the dirent and the inode still at the revisions they were read at, and a range comparison asserting that `dirent:<ino>/` holds no keys. An entry created under the directory between the read and the commit therefore aborts the removal (`ENOTEMPTY`) instead of stranding the subtree.
 
-The directory's inode is deleted outright rather than decremented: its link count is fixed at 2 for its whole life, so it never reaches zero on its own.
+The directory's inode is deleted outright rather than decremented: a directory has exactly one name, and its count is its own `.` plus the `..` of its subdirectories, so it never reaches zero on its own.
 
-RMDIR does **not** adjust the parent directory's nlink. EtcFS does not model the `..` link a subdirectory contributes to its parent, so a directory's count stays 2 regardless of how many subdirectories it holds.
+RMDIR lowers the parent directory's nlink by one in the same transaction, for the removed directory's `..`, pinned to the revision the parent was read at.
 
 ## Rename (RENAME)
 

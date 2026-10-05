@@ -26,7 +26,7 @@ The checkers run in two contexts:
 
 The nlink field on an inode record tracks the number of directory entries that point to that inode. The checker verifies that `InodeRecord.Nlink` equals the count of dirent keys whose value is that inode number.
 
-Directories are the exception, and their count is asserted rather than counted. A directory carries 2 — one for the entry in its parent, one for its own `.` — and EtcFS does not model the `..` link each subdirectory would contribute, so a directory's count never varies with its contents. Counting dirents for a directory would report every directory in the filesystem as inconsistent. `metadata.InitialNlink` is the single definition of that rule, used both when an inode is created and when it is checked.
+Directories are the exception. A directory carries 2 — one for the entry in its parent, one for its own `.` — plus one for the `..` of each subdirectory it holds, so the checker expects `metadata.InitialNlink` plus the number of dirents under it that name a directory. Counting the dirents naming a directory would report every directory in the filesystem as inconsistent. A directory left at 2 by a version that did not maintain the count is reported, not repaired.
 
 ### Algorithm
 

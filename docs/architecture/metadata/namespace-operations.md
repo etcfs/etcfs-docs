@@ -140,7 +140,7 @@ Removing a directory has to prove it is empty *inside* the transaction that remo
 
 Listing the directory first and deleting afterwards would leave a window in which another node creates an entry: the parent's name disappears and the children become unreachable from the root, indistinguishable afterwards from ordinary data. The same range comparison guards the rename that replaces an empty directory.
 
-A directory is deleted outright rather than decremented. Its link count is fixed at 2 for its whole life — EtcFS does not model the `..` link a subdirectory contributes — so the count says nothing about whether anything still refers to it.
+A directory is deleted outright rather than decremented. Its link count is its own `.` plus the `..` of each subdirectory, not a count of the names referring to it, so the count says nothing about whether anything still refers to it.
 
 ## Atomic Rename
 
