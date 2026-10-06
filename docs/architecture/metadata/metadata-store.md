@@ -49,7 +49,7 @@ Key characteristics of the Store implementation:
 
 - **Reads pinned to the colocated member.** The etcd client round-robins over every endpoint, so a serializable read can still leave the machine — which defeats the point of asking for one. When `--etcd-local-endpoint` names the member colocated with this node, `Store.SetLocalClient` installs a second client dialed only at it, and every read is attempted there first. Linearizable reads are unchanged in meaning: the local member still confirms its read index with the leader. Writes keep using the cluster-wide client, and a read the local member cannot serve is retried on it, so losing the colocated member costs latency rather than availability.
 
-- **Revision-based pagination.** Directory listings that exceed a single response are paginated using etcd's revision-based cursor. The first page establishes a consistent revision snapshot; subsequent pages iterate from that revision. This guarantees that a directory seen mid-mutation does not produce duplicate or missing entries (no phantom reads).
+- **Name-based pagination, no revision pinning.** A directory listing that spans several pages resumes each page from the last name returned, as a fresh linearizable range read. Pages are not pinned to one etcd revision, so a listing is not a snapshot: a name created or removed during it may or may not appear. See [Namespace Operations](namespace-operations.md#directory-listing).
 
 ## Transaction Model
 

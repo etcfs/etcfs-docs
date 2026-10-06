@@ -56,7 +56,7 @@ The IPC protocol is request-response. The C side sends a request and blocks its 
 
 ### Crash Recovery
 
-If the C daemon crashes (SIGKILL), the kernel unmounts the filesystem automatically when it detects the `/dev/fuse` FD is closed. Any application with open file descriptors on the mount receives EIO on subsequent operations. The Go daemon detects the closed IPC connection and can clean up its resources — though in practice, the Go daemon typically restarts alongside the C daemon in a systemd-managed deployment.
+If the C daemon crashes (SIGKILL), the kernel's FUSE connection ends when the `/dev/fuse` FD is closed. The mount is not removed: every subsequent operation on it, including those on descriptors that were already open, fails with `ENOTCONN` ("Transport endpoint is not connected") until the filesystem is unmounted and mounted again (`fs/fuse/dev.c`, `fuse_get_req`). The Go daemon detects the closed IPC connection and can clean up its resources — though in practice, the Go daemon typically restarts alongside the C daemon in a systemd-managed deployment.
 
 ## Session Configuration
 

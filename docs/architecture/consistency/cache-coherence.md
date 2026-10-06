@@ -35,16 +35,19 @@ The last two are the `--write-barriers` flag, and they are off by default. O_DIR
 A write operation follows this sequence to guarantee cross-node visibility:
 
 ```
-1. Acquire exclusive lock on the inode (lease-backed, 2s TTL)
+1. Take the inode's exclusive lock: a map lookup when this node already
+   holds the key, otherwise an etcd acquisition under the lock session's lease
 2. Allocate disk blocks from the arena allocator
 3. Copy data to an O_DIRECT-aligned mmap buffer
 4. Write data to the block device via O_DIRECT pwrite
 5. With --write-barriers: BLKFLSBUF ioctl to flush NVMe controller buffers
 6. With --write-barriers: sync_file_range to flush kernel page cache to EBS backend
 7. With --write-barriers: read one sector back to establish a device round trip
-8. Commit extent metadata to etcd (logical_off, disk_off, length, generation)
-10. Update inode size in etcd
-11. Release exclusive lock
+8. Publish the new extents and the inode size to etcd in one transaction, or,
+   with write delegation on, buffer them in the lock entry for a later flush
+9. Release the node-local lock; the etcd key stays cached until a peer
+   recalls it or the entry is evicted, and both publish anything buffered
+   before the key goes (see Lock Caching and Recall)
 ```
 
 ### Step 5: BLKFLSBUF
@@ -64,9 +67,11 @@ After the flush and sync, the writer reads back from the disk offset it just wro
 A read operation follows this sequence:
 
 ```
-1. Acquire shared lock on the inode (lease-backed, 2s TTL)
+1. Take the inode's shared lock (a map lookup when this node already holds a
+   covering key)
 2. With --write-barriers: BLKFLSBUF ioctl to invalidate the reader's page cache
-3. Look up the inode's extent map in etcd
+3. Look up the inode's extent map: from the lock entry's snapshot when one is
+   cached under the current key, otherwise from etcd
 4. For each covering extent:
    a. If there is a gap between this extent and the previous one,
       fill it with zero bytes
@@ -75,7 +80,7 @@ A read operation follows this sequence:
    d. Read from the block device via O_DIRECT pread
    e. Copy the actual data bytes to the output buffer
    f. Free the aligned buffer
-5. Release shared lock
+5. Release the node-local lock; the etcd key stays cached
 ```
 
 ### Step 2: Reader-Side BLKFLSBUF
@@ -255,7 +260,7 @@ It does **not** cover:
 
 The connection is retried rather than attempted once. The two daemons start independently, so the C side can reach the socket before the Go side has bound it; and any error on an established connection — a write that fails, an acknowledgement that times out, a stream found to be out of step — closes it at both ends. `notify_thread` reconnects in either case, backing off from 100 ms to a ceiling of 5 s, and logs both the loss and the recovery.
 
-That retry is not only about dentries. The Go daemon answers an OPEN as cacheable *only while a notification client is connected* to take the pages back again, so a connection that is not up means the kernel caches none of the mount's file data and every read reaches the daemon. A single silent connect failure at startup used to leave a mount in that state permanently, indistinguishable from a slow coordination layer; the daemon now says so in its log the first time an open has to be answered that way.
+That retry is not only about dentries. The Go daemon answers an OPEN as cacheable *only while a notification client is connected* to take the pages back again, so a connection that is not up means the kernel caches none of the mount's file data and every read reaches the daemon. A connect failure that was retried silently, or not at all, would leave a mount in that state permanently, indistinguishable from a slow coordination layer, so the connection is retried and the daemon says so in its log the first time an open has to be answered that way.
 
 While no client is connected the watch continues to fire and invalidation events are dropped. This is safe for names — the worst case is a dentry stale for up to `entry_timeout` — because a client that is gone took its FUSE session, and every page it had cached, with it.
 

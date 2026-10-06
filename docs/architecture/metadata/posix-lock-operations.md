@@ -1,90 +1,50 @@
 # POSIX Lock Operations
 
-How `fcntl()` and `flock()` locks behave in EtcFS today, why `fcntl()` locking is currently broken, and what building real cross-node locking would require.
+How `fcntl()` and `flock()` locks behave in EtcFS, why the daemon implements no FUSE locking operation, and what building cross-node locking would require.
 
 ## Table of Contents
 
-- [Current Behavior](#current-behavior)
-- [Two Unrelated Lock Interfaces](#two-unrelated-lock-interfaces)
-- [The Per-Operation Inode Lock](#the-per-operation-inode-lock)
-- [Wire Format](#wire-format)
+- [Behavior](#behavior)
+- [Why the Locking Operations Are Unimplemented](#why-the-locking-operations-are-unimplemented)
+- [The Inode Lock Is a Different Thing](#the-inode-lock-is-a-different-thing)
 - [Building Cross-Node Locking](#building-cross-node-locking)
 - [Fencing Integration](#fencing-integration)
 
-## Current Behavior
+## Behavior
 
-`handleGetlk` and `handleSetlk` in `internal/ipc/handlers.go` are no-ops. GETLK parses the requested range, discards it, and always answers `F_UNLCK` ("the range is free"). SETLK validates the payload length and always returns success. Neither touches etcd — both take `_ context.Context`. No lock state is recorded anywhere.
+Both kinds of POSIX advisory lock — `fcntl()` byte-range locks and `flock()` whole-file locks — are **enforced between processes on the same node and not enforced between nodes**. A process on node A and a process on node B can both hold an exclusive lock on the same file at once; two processes on node A cannot.
 
-The consequence is worse than "unenforced across nodes". Because the FUSE filesystem implements `getlk`/`setlk`, the kernel stops doing its own POSIX-lock bookkeeping for this mount and defers to the daemon — which grants everything. **`fcntl()` record locks therefore do not exclude even two processes on the same node.**
+The kernel does the enforcing. Neither daemon implements the FUSE `getlk`, `setlk` or `flock` operations (`pkg/fuse/ops.c` leaves them unset, and the IPC protocol has no lock opcodes — 27 and 28 are reserved and not reused, so a C daemon that still sends one fails loudly). libfuse's contract for that case is that "if the locking methods are not implemented, the kernel will still allow file locking to work locally", so the kernel keeps its own lock table for the mount. Nothing coordinates the tables of different nodes.
 
-This was measured directly, with two processes taking `F_SETLK`/`F_WRLCK` on one file:
+The daemon logs this at startup (`cmd/etcfuse-meta/main.go`), because a workload that relies on cross-node locking otherwise gets no signal: every lock call succeeds.
 
-| Lock interface | Local filesystem (control) | EtcFS mount |
+## Why the Locking Operations Are Unimplemented
+
+Implementing `getlk`/`setlk` takes lock bookkeeping away from the kernel: once a filesystem provides them, the kernel stops keeping its own table for the mount and asks the daemon instead. Handlers that do not track lock state therefore cannot be "permissive" safely. Handlers that answer every GETLK with `F_UNLCK` and every SETLK with success make `fcntl()` locks exclude nothing, not even two processes on one node. That configuration was measured with two processes taking `F_SETLK`/`F_WRLCK` on one file:
+
+| Lock interface | Local filesystem (control) | EtcFS with granting handlers |
 | --- | --- | --- |
 | `fcntl()` `F_SETLK` (via `lockf`) | refused (`EAGAIN`) | **second process acquires** |
 | `flock()` | refused (`EAGAIN`) | refused (`EAGAIN`) |
 
-The result is deterministic across repeated runs and applies to both newly created and pre-existing files.
+The result was deterministic across repeated runs, for newly created and pre-existing files. `flock()` was unaffected because it reaches FUSE through its own `flock` operation, which is not implemented. Leaving `getlk` and `setlk` unimplemented as well gives `fcntl()` the same node-local enforcement.
 
-An earlier version of this document claimed that leaving the handlers permissive "keeps the kernel's own per-node lock bookkeeping authoritative, which is correct within a single node". That claim is false, and the table above is the evidence. Wiring the no-op handlers is what broke single-node `fcntl()` locking; before they existed, the kernel handled it correctly.
+## The Inode Lock Is a Different Thing
 
-The daemon logs this limitation at startup (`cmd/etcfuse-meta/main.go`) so that a workload depending on file locking gets some signal rather than silent, always-successful lock calls.
-
-## Two Unrelated Lock Interfaces
-
-`fcntl()` record locks and `flock()` locks are separate kernel interfaces and reach a FUSE filesystem through separate operations.
-
-- **`fcntl()`** maps to the `getlk`/`setlk` operations. EtcFS wires both (`ops.getlk`, `ops.setlk` in `pkg/fuse/ops.c`), which is why they are broken as described above.
-- **`flock()`** maps to a distinct `flock` operation. EtcFS does **not** wire it, so the kernel handles `flock()` locally, per mount. It is correct within a single node and unenforced across nodes — which is the behavior the old document incorrectly attributed to `fcntl()` as well.
-
-## The Per-Operation Inode Lock
-
-The `lock:<ino>/` keys that the read and write paths take (via `lockInode`, `internal/ipc/retry.go`) are unrelated to POSIX locks. They are lease-backed whole-inode locks scoped to a single FUSE operation and released when it returns. They are not process-owned, are not consulted by GETLK or SETLK, and do not survive across requests.
-
-This distinction matters for any future implementation — see below.
-
-## Wire Format
-
-GETLK payload:
-
-```
-[u64:ino] [u64:start] [u64:len] [u32:type] [u32:pid]
-```
-
-`type` is `F_RDLCK`, `F_WRLCK`, or `F_UNLCK`. `start` and `len` define the byte range; `pid` identifies the owner.
-
-GETLK response — currently always reports `type = F_UNLCK`:
-
-```
-[i32:error] [u64:start] [u64:len] [u32:type] [u32:pid]
-```
-
-SETLK payload — as GETLK, plus a `sleep` flag marking `F_SETLKW`:
-
-```
-[u64:ino] [u64:start] [u64:len] [u32:type] [u32:pid] [u32:sleep]
-```
-
-SETLK response — currently always `0`:
-
-```
-[i32:error]
-```
+The `lock:<ino>/` keys taken by the read and write paths (`lockInode`, `internal/ipc/retry.go`) are unrelated to POSIX locks. They are whole-inode locks held by a node rather than a process, taken for reads and writes, cached between operations and given up when a peer asks (see [Lock Caching and Recall](lock-caching.md)). They are not consulted by any POSIX lock call.
 
 ## Building Cross-Node Locking
 
-No cross-node lock protocol is planned or scheduled. If one is built, three constraints apply that are easy to miss.
+No cross-node lock protocol is planned. Building one involves three constraints.
 
-**A separate keyspace is required.** POSIX locks live for the lifetime of a process's lock, across many FUSE requests. `lock:<ino>/` holders are taken and released *per operation* by every read and write. Reusing that prefix for POSIX locks means the next write's `AcquireLock` finds the range non-empty, retries, and returns `EAGAIN` — making a locked file unwritable by its own lock holder. A distinct prefix (for example `plock:<ino>`) avoids this.
+**A separate keyspace.** A POSIX lock belongs to a process and lasts across many FUSE requests. Storing it under `lock:<ino>/` would block its own holder: the holder's next write needs an exclusive inode lock, whose acquisition requires the whole `lock:<ino>/` range to be empty, so it would retry and return `EAGAIN`. A distinct prefix (for example `plock:<ino>`) avoids this.
 
-**Byte-range tracking has no natural etcd shape.** etcd keys are per-inode, so held ranges must be encoded as a list inside a single value and mutated by read-modify-CAS. Every lock operation on a hot inode then contends on one key, and the value grows with the number of held ranges. Whole-inode locking avoids this entirely and covers the common cases (lockfiles, advisory whole-file exclusion).
+**Byte-range tracking.** etcd keys are per inode, so the held ranges of one file have to be encoded as a list inside one value and changed by read-modify-write with a comparison. Every lock call on a busy file then contends on that one key, and the value grows with the number of held ranges. Whole-file locking avoids this and covers the common cases (lockfiles, advisory whole-file exclusion).
 
-**`F_SETLKW` requires asynchronous replies in the C daemon.** Blocking means retaining the `fuse_req_t`, returning without replying, and answering later from an etcd watch callback. Every handler in `pkg/fuse/ops.c` is synchronous request/reply today, so this is the largest piece of the work and it is on the C side, not in Go.
-
-The cheapest correct change is not additive: removing `ops.getlk`/`ops.setlk` and their handlers restores the kernel's local `fcntl()` enforcement, giving `fcntl()` the same node-local-correct behavior `flock()` already has.
+**Asynchronous `F_SETLKW` replies in the C daemon.** A blocking lock request means keeping the `fuse_req_t`, returning without replying, and answering later from an etcd watch callback. Every handler in `pkg/fuse/ops.c` is synchronous request/reply, so this is the largest piece of the work, and it is on the C side.
 
 ## Fencing Integration
 
 Whatever the lock layer does, it is not what protects data during a fence. Every metadata mutation carries this node's fencing generation as a transaction guard (`metadata.Store.SetGuard`, installed by `Service.InstallStoreGuard`), so a fenced node's commits are rejected regardless of which locks it believes it holds.
 
-This is why a lock protocol is a correctness feature for *applications*, not a safety mechanism for the filesystem: a stale lock cannot cause metadata corruption, because the generation guard rejects the commit behind it. See `docs/architecture/storage/kleppmann-stale-write-analysis.md`.
+A lock protocol is therefore a correctness feature for *applications*, not a safety mechanism for the filesystem: a stale lock cannot cause metadata corruption, because the generation guard rejects the commit behind it. See [Kleppmann stale-write analysis](../storage/kleppmann-stale-write-analysis.md).

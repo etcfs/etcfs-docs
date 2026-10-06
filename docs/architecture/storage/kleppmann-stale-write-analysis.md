@@ -46,7 +46,7 @@ The design does survive it, for the specific case of a fenced node writing file 
 
 **2. Publication is a linearizable, generation-guarded transaction.**
 
-The commit goes through `commitGuarded` (`internal/ipc/retry.go`), an etcd transaction carrying `WithGenerationGuard(nodeID, startGen)`. etcd — not the client — evaluates the comparison. A node whose generation has been bumped has its commit rejected atomically, and the rejection is authoritative in exactly the way an EBS write is not.
+The commit goes through `commitGuarded` (`internal/ipc/retry.go`), an etcd transaction carrying this node's fencing generation. The guard comparison itself is injected by the store (`metadata.Store.SetGuard`, installed with a `GuardFunc` that returns `WithGenerationGuard(nodeID, gen)`), so it covers every mutation path rather than only the ones that remember to ask. etcd — not the client — evaluates the comparison. A node whose generation has been bumped has its commit rejected atomically, and the rejection is authoritative in exactly the way an EBS write is not.
 
 This is the fencing token, relocated. It is not validated by the storage that holds the data; it is validated by the storage that holds the *reference* to the data. Since a reference is required to observe the data, guarding the reference is sufficient.
 
@@ -60,13 +60,13 @@ That last clause is the entire load-bearing assumption.
 
 ## Where the Hazard Actually Applies
 
-The overwrite scenario requires two nodes to target the same disk offset. In steady state they cannot, because arena ranges are disjoint: `allocateArenaID` draws from a strictly monotonic global counter (`NextCounter(PrefixArenaLog)`), giving each acquisition a unique 1 GiB range, and freed arenas are recorded under `free_arena:` but never returned to the allocator.
+The overwrite scenario requires two nodes to target the same disk offset. In steady state they cannot, because arena ranges are disjoint: `allocateArenaID` first tries `Store.ClaimFreeArena`, which hands back an arena released by a previous owner only once that severance is provable, and otherwise draws from a strictly monotonic global counter (`NextCounter(PrefixArenaLog)`), giving the acquisition a 1 GiB range no other node holds. Either way at most one node holds a given range at a time (see [§ Remaining Exposure](#remaining-exposure) on `free_arena:`).
 
 So the hazard in EtcFS is **not** the textbook one. It is this:
 
 > Any mechanism that causes two live nodes to believe they own the same arena reintroduces Kleppmann's scenario in full — and reintroduces it in a *worse* form, because neither node is fenced, so the generation guard has nothing to reject and both commits succeed.
 
-This is worth stating precisely. In the classic scenario the losing writer has at least lost its lease, so a token check can catch it. In the arena-collision scenario both writers hold valid leases and current generations. Every guard in the system passes. Two files end up sharing bytes, each silently corrupting the other, and the only thing that notices is the scrubber's `CheckExtentCollisions` — after the fact, offline, reporting damage rather than preventing it.
+This is worth stating precisely. In the classic scenario the losing writer has at least lost its lease, so a token check can catch it. In the arena-collision scenario both writers hold valid leases and current generations. Every guard in the system passes. Two files end up sharing bytes, each silently corrupting the other, and the only thing that notices is the scrubber's `CheckExtentCollisions`, which runs on the scrub loop's periodic pass (every 30s, `cmd/etcfuse-meta/main.go`) and reports damage after the fact rather than preventing it.
 
 The publish gate does not help here. It is designed to reject writes from *fenced* nodes; it has no opinion about two healthy nodes writing to the same offset.
 
@@ -103,7 +103,7 @@ Closing the allocator channel does not close the class. The following remain, or
 
 **`free_arena:` is now consumed — resolved.** `Store.ClaimFreeArena`/`Store.ReleaseArena` closed this: an arena is only released once the previous owner's severance is provable (graceful `Leave`, in program order after the IPC server stops; or a confirmed `Fencer` result), matching the treatment this section originally called for. See [Arena Allocator § Arena Release](arena-allocator.md#arena-release).
 
-**Reads do not validate the generation stamp.** Extents carry `Gen` (`writeGeneration`, stamped at commit time) and the scrubber cross-checks it offline in `CheckGenerationConsistency`, but `handleRead` ignores it. Inline validation would turn a class of "wrong bytes returned" into "read error", which is the correct direction for a filesystem. The stamping half of an epoch-validation scheme exists; the checking half does not.
+**Reads do not validate the generation stamp.** Extents carry `Gen` (`writeGeneration`, stamped at commit time) and the scrubber cross-checks it on its periodic pass in `CheckGenerationConsistency`, but `handleRead` ignores it. Inline validation would turn a class of "wrong bytes returned" into "read error", which is the correct direction for a filesystem. The stamping half of an epoch-validation scheme exists; the checking half does not.
 
 **Ownership records are not leased.** `arena:<node_id>/<arena_id>` (one record per arena, not per node — see [Arena Allocator](arena-allocator.md#arena-structure)) is a plain key, not bound to the node's membership lease. A dead node retains its recorded claims indefinitely. This is currently the *safe* direction — the range is never reissued — but it means ownership records accumulate and cannot be distinguished from live claims without consulting membership separately. `fsck.checkArenaOrphans` surfaces the accumulation (arenas owned by no live node, or listed both owned and free) without attempting to repair it.
 
