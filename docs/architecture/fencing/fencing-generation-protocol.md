@@ -199,12 +199,17 @@ One detail worth calling out because it is easy to get backwards: `startGen` is 
 
 `Service.IsFenced()` (backed by the self-fencing watchdog) is also checked at the top of `handleWriteBlock`, so a self-fenced node refuses to touch the block device at all rather than relying solely on the etcd-side rejection.
 
-Namespace mutations are guarded as well, as of the namespace-guard change. Rather than adding the guard at each call site, `metadata.Store` carries an optional guard (`Store.SetGuard`, installed by `Service.InstallStoreGuard` at startup) that `Txn`, `Put`, `Delete` and `DeletePrefix` apply to every mutation. Opt-out is explicit and limited to three control-plane paths, each of which would otherwise be unable to function:
+Namespace mutations are guarded too. Rather than adding the guard at each call site, `metadata.Store` carries an optional guard (`Store.SetGuard`, installed by `Service.InstallStoreGuard` at startup) that `Txn`, `Put`, `Delete` and `DeletePrefix` apply to every mutation. The guard is prepended to the caller's own comparisons, so etcd evaluates both in one transaction rather than in a round trip a fence could land inside.
 
-- `EnsureGenerationKey` — creates the key the guard compares against.
+Opting out means going through `txnRaw`/`putRaw`, and every such path exists because it must keep working on behalf of a node that is already fenced:
+
+- `EnsureGenerationKey` — creates the key the guard compares against; a guarded call could never succeed on a fresh node.
 - `BumpGeneration` / `PutGeneration` — the fence itself; guarding a generation bump by the generation it changes would make fencing impossible.
+- `RecordFenceIntent`, `ClaimFence`, `MarkFenceComplete` (`pkg/metadata/fence.go`) — the controller's own records about a node being fenced.
+- `ReleaseArenaID`, `ClaimFreeArena` (`pkg/metadata/arena.go`) — a fenced node must still be able to give its arenas back, and a survivor must still be able to reclaim them.
+- `AnnounceLockWant` (`pkg/metadata/lock.go`) — the want hint mutates no filesystem state, and the acquisition it leads to is guarded as usual.
 
-Guarding at the store rather than per call site is deliberate: the original gap was a guard helper that existed but had no caller in the request path, and an opt-in guard reproduces that failure mode the first time a new mutation path forgets to ask.
+Guarding at the store rather than per call site is deliberate: an opt-in guard fails the first time a new mutation path forgets to ask for it, and with the guard missing from the namespace operations a fenced node corrupts no file's bytes but can still create, delete and rename entries in the shared directory tree.
 
 `Put`, `Delete` and `DeletePrefix` are guarded because several handlers write inode records without going through `Txn` — `setattr` (truncate), `symlink` and `mknod` all did, and the truncate path deletes and rewrites extent keys the same way.
 
