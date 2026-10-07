@@ -170,7 +170,7 @@ symmetry reduction is unsound for some temporal properties.
 | Configuration | Result |
 |---|---|
 | `Fencing` | pass, 127,126 states |
-| `Fencing3Nodes` | pass, 11,664,975 states |
+| `Fencing3Nodes` | pass, 13,972,753 states |
 | `FencingNoFencer` | pass, 86,185 states |
 | `FencingUnreliableFencer` | pass, 1,206 states |
 | `FencingGuardIsBackstop` | pass, 1,328,303 states |
@@ -231,7 +231,7 @@ Each broken variant takes exactly one guard away:
 
 | Configuration | What it takes away | Expected |
 |---|---|---|
-| `CachedLock` | nothing | no counterexample, 3,900 states |
+| `CachedLock` | nothing | no counterexample, 4,548 states |
 | `CachedLockNoLeaseIdentity` | the cached key is trusted while *any* session is alive | breaks `NoTwoHolders` |
 | `CachedLockNoFlushKeyCheck` | the flush's comparison on this node's own lock key | breaks `NoPublishWithoutLock` |
 | `CachedLockNoRecallFlush` | the flush a recall does before yielding | breaks `NoLostAckedWrite` |
