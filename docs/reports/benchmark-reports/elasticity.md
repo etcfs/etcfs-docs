@@ -74,7 +74,7 @@ other client at all.
 **etcfs's join is the slowest at 5.1 s, and that is the expected shape.** A
 joining etcfs node starts two daemons, registers in etcd, claims an arena and
 waits for a mount that answers a write. A client mount for gluster/nfs/juicefs
-is a single mount syscall against a server that is already running (0.35–0.95 s),
+is a single mount syscall against a server that is already running (0.35–1.38 s),
 and GFS2's 3.8 s is a lockspace join plus mount. Nothing about a 5 s join is
 concerning — it is a process start, not a stall, and the survivors kept writing
 throughout — but it is not a number to claim a win on.
