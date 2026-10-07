@@ -12,6 +12,8 @@ Same five isolated 3-node clusters as the other reports.
 
 | Backend | sync-write IOPS | p99 (us) |
 |---|---|---|
+| etcfs (2026-08-24) | 155 | 8978 |
+| etcfs (2026-08-16) | 154 | 8356 |
 | gfs2 | 989 | 0* |
 | nfs | 335 | 29 |
 | juicefs | 121 | 897 |
@@ -32,6 +34,6 @@ Both run on this harness's older AL2 AMI (`gfs2`/`gluster` need packages only av
 
 ## Reading these numbers
 
-etcfs (154 IOPS) is the slowest of the five, with juicefs marginally lower (121). gfs2 is far ahead (989) — a local journal absorbing an `fdatasync` without a network round trip is the expected shape here. etcfs's own p99 (8.36ms) is also the highest of the backends with a usable reading, consistent with each write paying a Raft commit.
+etcfs (155 IOPS) is second slowest of the five, with juicefs lower (121). gfs2 is far ahead (989) — a local journal absorbing an `fdatasync` without a network round trip is the expected shape here. etcfs's own p99 (8.36ms) is also the highest of the backends with a usable reading, consistent with each write paying a Raft commit.
 
 One caveat on etcfs's own number specifically: the fix changed *how* durability is requested (`fdatasync=1`, an explicit syscall after each buffered write) rather than the original design (`sync=dsync`, opening the file with `O_DSYNC` so every write is synchronous by the open flag). `ec_write` (`pkg/fuse/ops.c`) reads the FUSE write's own flags to detect `O_SYNC`/`O_DSYNC` and decide per-write whether it may defer publishing the extent — an explicit `fdatasync()` call takes a different path (`FSYNC` op) rather than that per-write flag check. Both should force the same end durability (nothing is acknowledged before the extent is durable), but they may not cost the same internally; etcfs's 154 IOPS / 8.36ms p99 here should be read as "cost of buffered-write-then-fdatasync," not strictly "cost of O_DSYNC," and the two are not guaranteed to be the same code path. Confirming they cost the same (or documenting why they don't) is follow-up work, not done in this run.
