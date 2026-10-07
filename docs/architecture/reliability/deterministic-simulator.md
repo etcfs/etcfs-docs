@@ -18,7 +18,7 @@ The discrete-event simulator that drives the metadata layer through randomised o
 The simulator is a single-threaded, event-loop-style driver that executes a configurable number of operations. Each operation consists of:
 
 1. **Tick loop.** Advance the mock clock by `N` ticks. On each tick, evaluate any scheduled faults and process lease expirations.
-2. **Choose an operation.** Randomly select a metadata operation from a weighted distribution.
+2. **Choose an operation.** Pick one of ten metadata operations with equal probability.
 3. **Execute the operation.** Call the operation on the local state and the mock store.
 4. **Check invariants.** After the operation, run all invariant checkers. If any invariant is violated, increment the violation counter.
 5. **Loop.** Repeat until the operation budget is exhausted.
@@ -39,13 +39,11 @@ The simulator keeps in-memory maps that mirror what a real node would have cache
 
 ### Persistent Layer (MockStore)
 
-The `MockStore` is the simulated etcd cluster. It holds the durable truth. Every operation that mutates the local cache also writes through to the MockStore. Some operations (like invalidation or cache miss on another node) read directly from the MockStore, simulating the etcd round-trip.
-
-The separation of cache and store is what makes the simulator useful: the cache can get out of sync with the store (simulating a stale cache), and the invariant checkers compare the two to detect discrepancies.
+The `MockStore` is the simulated etcd cluster. Every operation that mutates the local cache also writes through to the MockStore with a plain `Put` or `Delete` (no transactions, so no compare-and-swap path is exercised). Reads (`getattr`, `lookup`, readdir) answer from the local maps, and the invariant checkers examine the local maps only. The store is read back only by `simulateCrash`.
 
 ## Random Operation Generation
 
-The `executeRandomOp` method selects an operation from a weighted distribution. The distribution is designed to exercise namespace mutations more heavily than reads, because mutations are where bugs are most likely to appear:
+The `executeRandomOp` method selects one of ten operations with equal probability (`rng.IntN(10)`):
 
 | Weight | Operation | What It Does |
 |---|---|---|
@@ -60,7 +58,7 @@ The `executeRandomOp` method selects an operation from a weighted distribution. 
 | 1/10 | Truncate | Sets inode size to zero |
 | 1/10 | Acquire lock | Sets a lock on an inode |
 
-The file names are chosen from a small pool (10000 possible names), producing name collisions that exercise the CAS-based error paths. The inode numbers are assigned sequentially from a counter.
+The file names are chosen from a pool of 10,000 possible names, so collisions are possible but uncommon. The inode numbers are assigned sequentially from a counter.
 
 ## Fault Injection
 
@@ -74,7 +72,7 @@ Faults are injected on a schedule: the caller specifies which tick a fault shoul
 | `FaultEtcdPartition` | Write to log, no state change | Network partition from etcd |
 | `FaultLeaderElection` | Write to log | etcd leader election during a transaction |
 | `FaultMajorityLoss` | Write to log | etcd quorum loss |
-| `FaultLeaseExpiry` | Delete all leases, triggering key expiration | Node's etcd lease expires while it holds locks |
+| `FaultLeaseExpiry` | Delete all lease entries (their keys are not deleted; the simulator writes no leased keys) | Node's etcd lease expires while it holds locks |
 | `FaultNodeCrash` | Full `simulateCrash` | Daemon crashes and restarts |
 
 ### FaultEtcdPartition
@@ -83,7 +81,7 @@ This fault represents a network partition between the node and the etcd cluster.
 
 ### FaultLeaseExpiry
 
-This fault simulates the node's etcd lease expiring while it holds locks. The mock store deletes all leases, which triggers the mockT TTL expiry — all keys bound to leases are deleted. The simulator's lock map is cleared. The next lock acquisition attempt will find the lock key gone and can proceed to reacquire. This exercises the lease-expiry code path without waiting for real time.
+This fault is meant to simulate the node's etcd lease expiring while it holds locks. `injectFault` deletes the mock store's lease entries but not the keys bound to them (a real expiry, in `MockStore.Tick`, deletes the keys too), and the simulator's lock map is left as it is. Because the simulator writes its lock keys with a plain `Put`, without a lease, the fault currently changes no state.
 
 ## Crash Simulation
 
