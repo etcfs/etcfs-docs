@@ -36,7 +36,7 @@ Both backends' p99 figures came out as 0 and were published as "missing data".
 
 ## Reading these numbers
 
-**Throughput is a four-way tie at the device ceiling, and the tail is not.**
+**Throughput is a three-way tie at the device ceiling, and the tail is not.**
 gluster, gfs2 and etcfs all land within 10% of each other on random writes
 (1041 / 973 / 934 IOPS) because a 1000-IOPS volume is what they are all writing
 to. What separates them is p99 latency, where etcfs is **24x better than gfs2**
@@ -56,6 +56,13 @@ in every job and etcfs honours it. The next section is the experiment that
 established that.
 
 ## Follow-up: does EtcFS's page cache do anything under `direct=1`?
+
+> **Update.** The root cause given at the end of this section no longer holds:
+> since commit 2e2b8bd (2026-08-15) `ec_create` answers with the same
+> page-cache decision as `ec_open` (`handleCreate` returns `cacheableOpen`).
+> The 2026-08-25 `direct=0` row was measured after that change and still
+> reads at the device ceiling, so the cause of the missing cache effect in
+> this job is currently not established.
 
 JuiceFS/GlusterFS/NFS's read-IOPS numbers above (67k/8k/48k, all far past the
 1000-IOPS device) are a client-cache artifact, not real device throughput —
