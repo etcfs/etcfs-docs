@@ -85,10 +85,10 @@ commit rate rather than a lock passing between nodes. Writing to one *file* from
 sixteen nodes is the case that gets worse (334 → 290 MiB/s, −13%): every writer
 in turn takes the inode's lock, and that handover is serial by construction.
 
-GFS2 cannot be swept to these widths for a structural reason rather than a
-performance one — `mkfs.gfs2` fixes the journal count at format time and a node
-beyond it cannot mount — so "etcfs scales further" is, at sixteen nodes, a
-statement about what the other filesystem can be asked to do at all.
+No GFS2 row exists at these widths because none was run. GFS2 mounts on as
+many nodes as it has journals; the count is set by `mkfs.gfs2 -j` (the harness
+passes its node count) and can be raised with `gfs2_jadd`, so a sixteen-node
+GFS2 cluster is possible but was not provisioned.
 
 **A first attempt at this sweep failed at sixteen nodes with `No space left on
 device` on the suite's default 20 GB volume**, which is what led to the arena
