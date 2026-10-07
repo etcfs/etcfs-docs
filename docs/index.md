@@ -104,7 +104,7 @@ that notices.
 
 **Correctness checked by tools EtcFS did not write.**
 
-- **POSIX conformance** — pjdfstest, upstream at `master`: **8,787 of 8,787
+- **POSIX conformance** — pjdfstest, upstream at `master`: **8,789 of 8,789
   runnable assertions pass**. [pjdfstest](verification/pjdfstest.md)
 - **Linearizability** — Porcupine checks recorded histories against four models
   (namespace, extent, lock, generation) over the full 13-scenario chaos suite:

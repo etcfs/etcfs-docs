@@ -1,10 +1,9 @@
 # pjdfstest: POSIX conformance
 
 [pjdfstest](https://github.com/pjd/pjdfstest) is the filesystem conformance
-suite written for FreeBSD's ZFS work and since used by Linux filesystems,
-FUSE implementations and distributed filesystems alike. It runs roughly 8,800
-assertions over `chmod`, `chown`, `link`, `mkdir`, `mkfifo`, `mknod`, `open`,
-`rename`, `rmdir`, `symlink`, `truncate`, `unlink` and `utimensat`, checking
+suite; its README lists FreeBSD, Linux and Solaris as supported. It runs
+roughly 8,800 assertions over the 17 syscall directories in the table below,
+checking
 return values, `errno` values, and the resulting metadata state.
 
 It is the highest credibility-per-hour verification available to this project:
@@ -39,10 +38,11 @@ networking.
 Upstream pjdfstest at `master`, single node, Linux 7.1 host, FUSE 3, run over
 a sparse 8 GiB file device.
 
-**8,787 of 8,787 runnable assertions pass.** 9 more are the suite's own `#
+**8,789 of 8,789 runnable assertions pass.** 9 more are the suite's own `#
 TODO` assertions — cases where the suite documents that Linux itself deviates
-from POSIX (it does not clear the SGID/SUID bits on a directory whose owner
-changes). Those are counted separately from EtcFS's own results; a filesystem
+from POSIX: 8 in `chown` (Linux does not clear the SGID/SUID bits on a
+directory whose owner changes) and 1 in `unlink` (Linux returns `EISDIR` for a
+directory, where POSIX allows `EPERM`). Those are counted separately from EtcFS's own results; a filesystem
 that "passed" them would be the odd one out on Linux.
 
 | Syscall | Passed | Failed | Expected fail |
@@ -64,7 +64,7 @@ that "passed" them would be the odd one out on Linux.
 | truncate | 84 | 0 | 0 |
 | unlink | 439 | 0 | 1 |
 | utimensat | 122 | 0 | 0 |
-| **Total** | **8787** | **0** | **9** |
+| **Total** | **8789** | **0** | **9** |
 
 `rename` is the number worth pausing on: 4,857 assertions, none of them
 failing, in the operation the fencing and namespace design worried most
@@ -77,7 +77,7 @@ about.
   [chaos suite and Porcupine](porcupine.md)'s job.
 - **Byte-range locking**, which the suite does not exercise and EtcFS
   deliberately does not coordinate across nodes.
-- **Extended attributes**, which pjdfstest checks only on FreeBSD.
+- **Extended attributes**, for which pjdfstest has no tests.
 - **Everything a suite of this kind cannot see**: a filesystem can pass every
   assertion here and still lose data under a fault. That is what the chaos
   suite, TLA+ and Porcupine are for.
