@@ -67,9 +67,10 @@ is the evidence. An untarred file cost six Raft commits; two were removed — th
 inode-number reservation, now a per-node block, and the parent directory's
 timestamp, now coalesced — and six to four predicts 1.50x against a measured
 1.48x. That took the untar from 112x to 75x behind GFS2 and shared-directory
-metadata from 8.4x to 4.6x. Three of the four that remain are removable the same
-way, without changing what a create means; the
-[small-file storm](smallfile-storm.md) report enumerates all six.
+metadata from 8.4x to 4.6x. The commits that remain are each needed before the
+call returns — the create, the extent published at `close()`, and the mode and
+owner changes a peer checks permission against; the
+[small-file storm](smallfile-storm.md) report enumerates them.
 
 The create transaction itself is not on that list. It commits before it is
 acknowledged, and deferring it means answering `create()` before its exclusivity
