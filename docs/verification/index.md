@@ -55,10 +55,11 @@ a chaos scenario produces one. `scripts/test/chaos-test-single-cluster.sh`
 now carries these as S8 (cross-node contention), S9 (crash with a full
 buffer), S10 (lease loss under sustained write load), S11 (flush failure
 injection), S12 (recall storm), and S13 (read-after-recall with the page
-cache on), runnable against both the docker and the AWS transport. What is
-still outstanding is feeding their histories into the models above — the
-scenarios exist and pass, but the fsync-barrier and page-cache checks in the
-table are not yet wired to a history one of them produced.
+cache on), runnable against both the docker and the AWS transport. On docker the suite
+records every node's history and runs all seven checks over it, so the
+fsync-barrier and page-cache checks in the table see histories these
+scenarios produced; on AWS histories are not recorded, and the scenarios are
+checked by their assertions alone.
 
 ## Consistency models, and why one checker is not enough
 

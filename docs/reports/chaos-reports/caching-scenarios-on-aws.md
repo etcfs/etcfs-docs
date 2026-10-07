@@ -11,7 +11,7 @@ previously ran against the docker transport only; the AWS branches logged
 "not implemented" and returned. This session ported them to AWS and ran the
 full S1-S13 suite end to end.
 
-**Result: 20/20 assertions, 7/7 Porcupine models consistent, `STATUS: ALL PASS`.**
+**Result: 20/20 assertions, `STATUS: ALL PASS`.** (History verification runs only on the docker transport, so no Porcupine models were checked on this AWS run; the 7/7 model result is from the docker suite, see `verification/porcupine.md`.)
 
 ## What changed to make this possible
 
