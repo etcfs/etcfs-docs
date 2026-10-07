@@ -11,6 +11,12 @@
 > corrections marked inline, because the order in which they were untangled is the
 > useful part: two of the four were not what they first appeared to be.
 
+> **Update, later.** Finding 5 is fixed: `dispatch` gives every FUSE request
+> a deadline (`config.RequestTimeout`, 10 s) and lock acquisition is bounded
+> the same way (commit 252fd4a). Finding 4 no longer holds: a graceful
+> departure now releases the node's arenas (`cmd/etcfuse-meta/main.go`,
+> "released arenas on shutdown"). The findings below are left as written.
+
 ## Summary
 
 Every prior chaos scenario injects faults on a stable cluster. The join/leave window — membership set, quorum size, and arena ownership all in flux — was untested. New tier (`scripts/test/chaos-elastic-fault-injection.sh`, FJ1–FJ4) covers it: kill a joining node mid-join before its FUSE mount comes up, partition a joining node from etcd right after it mounts, bump a leaving node's fencing generation mid-leave, and kill a surviving node while a different node is mid-join.
