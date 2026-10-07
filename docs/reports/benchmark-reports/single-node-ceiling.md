@@ -24,7 +24,7 @@ The 2026-08-26 run also measured the raw device at queue depth 1, with the same 
 
 gfs2 retains almost the entire raw device (83.5% bandwidth, 99.6% IOPS) — expected, since a local shared-disk filesystem with no per-write network round trip is close to the device ceiling by construction, and this is the case the scenario names as its "no sharing" baseline.
 
-etcfs keeps 69.8% of raw bandwidth but only 25.4% of raw random-write IOPS — the largest bandwidth-vs-IOPS split of the five.
+etcfs keeps 69.8% of raw bandwidth but only 25.4% of raw random-write IOPS — a large bandwidth-vs-IOPS split, second only to juicefs (82.6% vs 27.0%).
 
 The reason is not what this report said before, and the daemon's own counters over the 2026-08-26 run say so: across 7,746 random writes it committed **203** etcd transactions, one per 38 writes, because write delegation keeps the extent in the inode's buffer and publishes in batches. It answered every one of those writes from the snapshot cached under the inode's lock — 7,889 hits, **no misses** — so no write read metadata from etcd either. The retained-IOPS number does not track an etcd-commit-rate ceiling.
 
