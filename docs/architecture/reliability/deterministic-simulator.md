@@ -72,7 +72,7 @@ Faults are injected on a schedule: the caller specifies which tick a fault shoul
 | `FaultEtcdPartition` | Write to log, no state change | Network partition from etcd |
 | `FaultLeaderElection` | Write to log | etcd leader election during a transaction |
 | `FaultMajorityLoss` | Write to log | etcd quorum loss |
-| `FaultLeaseExpiry` | Delete all lease entries (their keys are not deleted; the simulator writes no leased keys) | Node's etcd lease expires while it holds locks |
+| `FaultLeaseExpiry` | Expire every lease, deleting the lock keys bound to it; clear the lock map and start a new session | Node's lock session expires while it holds locks |
 | `FaultNodeCrash` | Full `simulateCrash` | Daemon crashes and restarts |
 
 ### FaultEtcdPartition
@@ -81,7 +81,7 @@ This fault represents a network partition between the node and the etcd cluster.
 
 ### FaultLeaseExpiry
 
-This fault is meant to simulate the node's etcd lease expiring while it holds locks. `injectFault` deletes the mock store's lease entries but not the keys bound to them (a real expiry, in `MockStore.Tick`, deletes the keys too), and the simulator's lock map is left as it is. Because the simulator writes its lock keys with a plain `Put`, without a lease, the fault currently changes no state.
+This fault simulates the node's lock session expiring while it holds locks. The simulator writes every lock key with `MockStore.PutLeased` under its session lease (granted at construction with a one-hour TTL, so it never runs out within a test's tick budget). `injectFault` calls `MockStore.ExpireAllLeases`, which deletes every key bound to a lease, exactly as `MockStore.Tick` does when a TTL runs out; the simulator then clears its lock map and grants a new session. `TestLeaseExpiryDeletesLockKeys` checks that the key is gone, the lock map is empty, and a lock taken afterwards survives.
 
 ## Crash Simulation
 
@@ -116,11 +116,11 @@ The harness' `TestLinearizability_BasicCreateDelete` test goes further: it recor
 
 ## The Tick Model
 
-The tick model is a discrete time step that advances the MockStore's clock. Each tick:
+The tick model is a discrete time step. On each tick, `Run`:
 
-1. **Clock increment.** The internal clock advances by 1 unit.
-2. **Lease TTL decrement.** Each active lease has its TTL decremented. If a lease's TTL reaches zero, all keys bound to that lease are deleted, and a DELETE watch event is delivered.
-3. **Fault check.** If the current tick is in the fault schedule, the configured fault is injected.
+1. **Fault check.** If the current tick is in the fault schedule, the configured fault is injected; if it is a crash point, `simulateCrash` runs.
+2. **Store tick.** `MockStore.Tick` advances the store's clock by 1 and decrements each lease's TTL. A lease whose TTL reaches zero expires: every key bound to it is deleted, and a DELETE watch event is delivered.
+3. **Tick counter.** The simulator's own tick counter advances.
 
 The tick rate relative to operations is configurable. The `Run` method takes a `ticksPerOperation` parameter: for each operation, the simulator ticks the clock this many times before executing the operation. This allows fine-grained control over how quickly leases expire relative to operation throughput.
 
@@ -128,10 +128,10 @@ The tick rate relative to operations is configurable. The `Run` method takes a `
 
 The simulator and MockStore interact through these patterns:
 
-**Write-through.** Every mutation operation (createFile, createDir, unlinkFile, renameFile, writeInode, truncate) updates the simulator's local cache and writes through to the MockStore. The write is a simple `Put` on the appropriate key.
+**Write-through.** Every mutation operation (createFile, createDir, unlinkFile, renameFile, writeInode, truncate) updates the simulator's local cache and writes through to the MockStore with a plain `Put` or `Delete`. `acquireLock` writes its lock key with `PutLeased`, under the simulator's session lease.
 
 **Read from cache.** Read operations (getattr, lookup, listDir) read from the simulator's local cache, not from the store. This simulates the daemon's in-memory cache without the overhead of an etcd round-trip.
 
 **Crash recovery read from store.** After a simulated crash, the local cache is rebuilt by scanning the store. All current inodes and dirents are read from the store's KV map. This simulates the startup metadata scan.
 
-**Invariant check reads from both.** The invariant checkers read from both the local cache (to know the simulator's view) and the store (to know the true state). Discrepancies are flagged as violations.
+**Invariant check reads the cache.** The two invariant checkers (nlink consistency, dirent-to-inode existence) read only the local maps. After a crash those maps are rebuilt from the store, so a store state that breaks either invariant is caught at that point.
