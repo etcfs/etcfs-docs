@@ -59,10 +59,12 @@ gluster's, 20,406; gfs2's and nfs's completed none at all.
 **etcfs recovers a dead node's locks in 2.19 s, with no fencing device and no
 journal replay.** The survivor's own I/O never stopped (0.113 s worst gap, still
 writing at the end), and its first write to the file the dead node owned landed
-2.19 s after that node stopped answering. That is lease-expiry-bound behaviour
-under this harness's 10 s lock lease, and it matches the design: recovery is a
-lease that stops being renewed plus a generation guard that makes the dead
-node's writes unacceptable if it ever comes back.
+2.19 s after that node stopped answering. That is lease-expiry-bound behaviour:
+the dead node's lock keys are bound to its lock session, a lease with a 2 s TTL
+(`inodeLockTTL`), so the takeover is about one session TTL plus acquisition
+backoff. It does not wait for the fence (the 10 s `--lease-ttl` is the
+membership lease, which drives fencing). If the dead node ever comes back, the
+generation guard makes its writes unacceptable.
 
 **GFS2 does not recover here at all, and the reason is structural rather than
 slow.** The survivor's DLM lockspace was captured mid-run in exactly the state
