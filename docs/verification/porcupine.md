@@ -7,8 +7,9 @@ decides whether some total order of the operations exists that both respects
 the model and preserves real-time ordering between non-overlapping
 operations.
 
-Four models are built — namespace, extent, lock, generation — and checked
-against the full docker chaos suite. Run it with:
+Seven checks are built — namespace, extent, generation, lock, lockkey, block
+and pagecache — and run by `cmd/verify-history` against the full docker chaos
+suite. All but pagecache are Porcupine models. Run it with:
 
 ```bash
 VERIFY_HISTORY=1 scripts/test/chaos-test-single-cluster.sh docker all
@@ -60,10 +61,12 @@ code the two sides share. Verifying a system with something other than its own
 assertions only means something if the verifier does not reuse the system's
 own machinery to read its own output.
 
-Two events never cross the IPC socket at all — a lock changing hands, and a
-guarded commit's outcome — so they are recorded at their own source, using the
-same `Entry` shape and the same recorder, under synthetic opcodes (1000, 1001)
-chosen well clear of the real wire opcodes (1–35):
+Six kinds of event never cross the IPC socket, so they are recorded at their
+own source, using the same `Entry` shape and the same recorder, under synthetic
+opcodes chosen well clear of the real wire opcodes (1–35): 1000 lock hold,
+1001 guarded commit, 1002 lock key, 1003 page invalidation, 1004 block
+reservation/release (`internal/ipc/histevents.go`), and 1005 daemon start
+(`history.OpStart`). The first two are recorded by:
 
 - `internal/ipc/retry.go`'s `heldLock.recordLockEvent`, called from
   `lockInode` on a successful acquire and from `Release`/`Folded` on release —
@@ -240,7 +243,10 @@ unmodified checker.
   return to the end, erasing real-time order entirely; only the sequential
   model still constrains it.
 
-`ReadsAreCached` is the classifier for the FUSE layer's attribute/entry cache:
+`cmd/verify-history` checks histories recorded at the daemon's socket, below
+the kernel's caches, so it uses `AllLinearizable` and nothing is rewritten.
+`ReadsAreCached` is the classifier for a history recorded above the FUSE
+layer's attribute/entry cache:
 every read is `BoundedStale`, every mutation stays `Linearizable`. Moving an
 invocation earlier can only add valid orderings, never remove one —
 `TestRelaxationOnlyEverAccepts` checks that directly.
