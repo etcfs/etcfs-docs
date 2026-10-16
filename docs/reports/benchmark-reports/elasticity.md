@@ -102,9 +102,8 @@ it and points at where the other half lives:
   otherwise from these numbers.
 - For an **unplanned** one, the two designs diverge completely, and that
   divergence is measured in the node-kill report: etcfs takes over a dead node's
-  locks in 2.19 s while its survivors never stop, and GFS2's survivors stop
-  entirely until a fence agent that this harness does not provide confirms the
-  kill.
+  locks in 3.0–3.5 s while its survivors keep working, and GFS2's survivors
+  stopped in every run, with or without a confirmed fence.
 
 ## Caveats
 

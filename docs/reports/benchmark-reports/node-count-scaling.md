@@ -52,15 +52,34 @@ Metadata operations/second in one shared directory:
 | gluster | 665.57 | 1087.65 | 1470.20 | 2.21x |
 | etcfs | 140.92 | 178.77 | 188.44 | 1.34x |
 
-> **The etcfs row predates the 2026-08-25 metadata changes and was not
-> re-measured.** On the 3-node
-> [metadata-concurrency](metadata-concurrency.md) scenario the same workload
-> went from 179.58 to 327.34 ops/s once the inode-number reservation and the
-> parent directory's timestamp came off the per-file path, so the absolute
-> figures here are low by roughly that factor. Whether the *shape* — the part
-> this scenario exists for — moves with them is unmeasured: nothing in the
-> change touches how the curve responds to node count, but that is a
-> prediction, not a result.
+> **The etcfs rows above predate the 2026-08-25 metadata changes.** The
+> same-session re-measure below is the current build against GFS2 on one
+> instance class and one day, and it supersedes them.
+
+### Same-session re-measure, etcfs and GFS2 (2026-10-16)
+
+Both backends swept 2/4/6 on `m5.large` (no CPU credits to exhaust), back to
+back on the same evening, with the suite's default 20 GB / 1000-IOPS volume. The
+build is the current `etcfs` main.
+
+| Backend | Metric | 2n | 4n | 6n | 2n → 6n |
+|---|---|---|---|---|---|
+| etcfs | shared-directory metadata (ops/s) | 301.36 | 441.24 | 540.28 | **1.79x** |
+| gfs2 | shared-directory metadata (ops/s) | 1636.66 | 1437.13 | 915.56 | **0.56x** |
+| etcfs | shared-file write (MiB/s) | 244.44 | 242.24 | 234.16 | 0.96x |
+| gfs2 | shared-file write (MiB/s) | 223.56 | 444.87 | 443.41 | 1.98x |
+| etcfs | disjoint write (MiB/s) | 264.52 | 296.16 | 290.28 | 1.10x |
+| gfs2 | disjoint write (MiB/s) | 285.31 | 355.68 | 406.41 | 1.42x |
+
+The shape survives the newer build and the steadier instance class. GFS2's
+shared-directory metadata falls by 44% from two nodes to six, and etcfs's climbs
+by 79%, so the gap at six nodes is 1.7x (916 against 540 ops/s) rather than the
+4x the older rows showed. The crossing is still not reached at six nodes.
+
+etcfs's shared-file bandwidth no longer collapses with node count: it holds at
+234–244 MiB/s where the older build fell from 169 to 62. GFS2 still doubles
+from two nodes to four on that workload, so the handover cost described below is
+smaller than it was but has not disappeared.
 
 ### etcfs at 8 and 16 nodes (2026-08-27)
 
@@ -114,8 +133,8 @@ absolute terms at six nodes, so this is not yet a win — but the two curves are
 converging, GFS2's is falling, and etcfs's is not. A sweep to 8 and 16 nodes is
 where the lines would cross, and that run has not been made.
 
-**etcfs's shared-file bandwidth falls with node count (169 → 97 → 62 MiB/s) and
-that is expected.** Every node writing the *same* file means the inode's lock has
+**On the 2026-08-24 build, etcfs's shared-file bandwidth fell with node count
+(169 → 97 → 62 MiB/s); the current build holds it flat (244 → 242 → 234).** Every node writing the *same* file means the inode's lock has
 to move to each writer in turn; etcfs's lock is a lease-backed etcd key, so each
 handover is a round trip, and more writers means more handovers. GFS2 does better
 here (233 → 462 MiB/s) because its glock handover is a DLM message between
@@ -135,7 +154,7 @@ per-directory. Their curves keep climbing where GFS2's collapses.
 
 ## Caveats
 
-- One run per backend per point. The bandwidth figures sit close to the shared
+- One run per backend per point, including the 2026-10-16 re-measure. The bandwidth figures sit close to the shared
   1000-IOPS volume's ceiling for the three shared-device backends, so
   differences of 10–20% between them are inside run-to-run movement.
 - The sweep tops out at 6 nodes for capacity reasons, which is short of where

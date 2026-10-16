@@ -126,6 +126,35 @@ honest statement is that GFS2 with real STONITH keeps its survivors alive — th
 unfenced cluster does not — and still did not recover the dead node's file in
 three minutes.
 
+### Repeated runs on a non-burstable class (2026-10-16)
+
+The 2.19 s above is one run. etcfs was killed eight times and fenced GFS2 three
+times, each on a fresh `m5.large` cluster, same scenario and probes:
+
+| | etcfs (8 runs) | gfs2-fenced (3 runs) |
+|---|---|---|
+| takeover of the dead node's file | **3.00–3.47 s, median 3.11 s** | never, in all three |
+| fence confirmed by pacemaker | n/a | yes, all three |
+| survivor's worst stall after the death | 0.02–1.47 s | 0.12–0.22 s |
+| survivor's shared probe silent at end of run | 6–15 s (probe wind-down) | **~152 s, all three** |
+| failed operations after the death | 1 in one run, 0 otherwise | 0 |
+
+The etcfs takeover is narrow rather than spread across a lease period: the dead
+node's inode lock lives under a 2 s session lease (`inodeLockTTL`), and the
+measured 3.0–3.5 s is that lease plus detection and acquisition backoff. The
+2.19 s single run sits below this range and should not be quoted on its own.
+
+The fenced GFS2 result needs correcting, not just repeating. In all three runs
+pacemaker recorded the fence as complete, yet the survivor's DLM lockspace was
+still in `wait fencing` with `kern_stop` two minutes later, and the survivor's
+own probe, after briefly resuming, went silent for the last ~152 s of every run
+(a `dd` blocked in `path_openat`, in the captured `dmesg`). So the survivors did
+not keep their filesystem in this configuration either; the 2026-08-27 "never
+stopped" row came from a probe window too short to see it. The likely cause is
+that `dlm_controld` never learns of the fence pacemaker completed, which would be
+a harness integration fault rather than GFS2 behaviour. That has not been
+established, so GFS2's recovery time under working fencing remains unmeasured.
+
 **gluster recovers, slowly.** The replica set drops to two copies and the client
 takes 22.6 s to write the dead node's file, with a 78 s worst gap on the shared
 one. It is the only competitor here that recovers at all inside the window, and
@@ -169,12 +198,11 @@ one on this page that actually measures lock recovery.
 
 ## Caveats
 
-- One run per backend, not a distribution. The etcfs takeover figure is bounded
-  below by the lock lease TTL (10 s default here, 2.19 s observed because the
-  lease was already partly elapsed when the node died); a run that killed a node
-  immediately after a renewal would report closer to the full TTL. The tail is
-  the TTL, and it cannot be tuned below `RequestTimeout` — see `TODO.md`.
-- GFS2's "never" is a property of this harness's missing fence agent, not a
-  measured GFS2 recovery time.
+- The five-way table is one run per backend. The etcfs takeover is bounded by
+  the 2 s inode-lock session lease (`inodeLockTTL`), not by the 10 s membership
+  lease; eight repeated runs put it at 3.0–3.5 s.
+- GFS2's "never" is not a measured GFS2 recovery time. Unfenced, no fence agent
+  exists; fenced, DLM did not leave `wait fencing` after pacemaker's confirmed
+  fence, and why is not established.
 - The victim is never restarted, so nothing here measures rejoin; that is
   `bench-elasticity.sh` and `bench-join-latency.sh`.

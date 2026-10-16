@@ -1,6 +1,6 @@
 # Benchmark Overview — Where EtcFS Wins, Where It Loses, By How Much
 
-*2026-08-25*
+*2026-08-25, with the 2026-10-16 same-session re-measures folded in*
 
 Every scenario in this suite, reduced to one line: what was measured, how etcfs
 compares to the best and worst of the four competitors, and the multiple. Each
@@ -18,11 +18,9 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 
 | Scenario | Metric | etcfs | Best competitor | Advantage |
 |---|---|---|---|---|
-| [Node-kill recovery](node-kill-recovery.md) | takeover of a dead node's file | **2.19 s** | gluster 22.64 s | **10.3x faster** — and gfs2, nfs and juicefs never recovered it inside 180 s. GFS2 was re-run with real `fence_aws` STONITH: the fence completes in ~10 s and its survivors then keep serving, but the dead node's file was still not recovered in 180 s |
+| [Node-kill recovery](node-kill-recovery.md) | takeover of a dead node's file | **3.0–3.5 s** (median 3.11 s over 8 runs) | gluster 22.64 s | **about 7x faster** — and gfs2, nfs and juicefs never recovered it inside 180 s. GFS2 with real `fence_aws` STONITH confirmed the fence in all three runs, but DLM stayed in `wait fencing`; why is not established, so GFS2's fenced recovery time is still unmeasured |
 | [Node-kill recovery](node-kill-recovery.md) | survivor still serving I/O after the kill | **yes, uninterrupted** (0.11 s worst gap) | gluster yes (78 s worst gap) | gfs2/nfs/juicefs survivors went silent for the rest of the run |
-| [4 KiB random write tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 write latency at comparable IOPS | **17.96 ms** | juicefs 61.08 ms | **3.4x better than the next best**, 24x better than gfs2 (432 ms) at 96% of its throughput |
-| [4 KiB random read tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 read latency, device-bound path | **11.08 ms** | gfs2 242.69 ms | **21.9x better** |
-| [Node-count scaling](node-count-scaling.md) | shared-directory metadata, 4 → 6 nodes | **+5%** (179 → 188 ops/s) | gfs2 **−47%** (1419 → 756 ops/s) | etcfs's curve keeps climbing where gfs2's collapses. The etcfs absolutes are owed a re-measure |
+| [Node-count scaling](node-count-scaling.md) | shared-directory metadata, 2 → 6 nodes | **+79%** (301 → 540 ops/s) | gfs2 **−44%** (1637 → 916 ops/s) | etcfs's curve keeps climbing where gfs2's collapses; gfs2 is still 1.7x faster at 6 nodes. Same session, `m5.large`, 2026-10-16 |
 | [Node-count scaling](node-count-scaling.md) | disjoint write bandwidth at 8 → 16 nodes | **1593 → 1800 MiB/s** (+13%), metadata flat at +2.3% | not run — gfs2 needs one journal per node (`mkfs.gfs2 -j` or `gfs2_jadd`), and no 16-node gfs2 cluster was provisioned | etcfs was swept alone to sixteen nodes; no competitor row exists at that width |
 | [Negative lookup](negative-lookup.md) | warm µs per missing-name lookup | **2.21 µs** | nfs 3.68 µs | **1.7x faster than the next best**, 130–230x faster than gluster/juicefs, which do not cache absences at all |
 | [Warm page cache](warm-page-cache.md) | daemon reads during a warm pass | **0** | n/a | a coherent, lock-scoped page cache that costs nothing to read through — 600k IOPS served entirely by the kernel |
@@ -45,13 +43,14 @@ GFS2, GlusterFS, self-hosted NFS and JuiceFS.
 
 | Scenario | Metric | etcfs | Best competitor | Deficit |
 |---|---|---|---|---|
-| [Small-file storm](smallfile-storm.md) | 80k-file untar | 2283 s (35.1 files/s) | gfs2 29.8 s (2689 files/s) | **76.6x slower than gfs2**, 4.2x gluster, 2.6x juicefs, 2.2x nfs — a create is still a Raft commit. etcfs re-measured on the current build 2026-08-26 on the competitors' instance class, at 4.34 commits per file; both builds ran with the instance's CPU credits exhausted |
-| [Metadata under concurrency](metadata-concurrency.md) | shared-directory ops/s at 3 nodes | 327 ops/s | gfs2 1515 ops/s | **4.6x slower** |
+| [Small-file storm](smallfile-storm.md) | 80k-file untar | 1452.5 s (55.1 files/s) | gfs2 18.9 s (4231 files/s) | **76.8x slower than gfs2** — a create is still a Raft commit. Same session, `m5.large`, 2026-10-16; the earlier throttled `t3.medium` run gave 76.6x, so the gap is not a throttling artefact. Against the other backends (`t3.medium` only): 4.2x gluster, 2.6x juicefs, 2.2x nfs |
+| [Metadata under concurrency](metadata-concurrency.md) | shared-directory ops/s at 3 nodes | 405 ops/s | gfs2 2063 ops/s | **5.1x slower** (same session, `m5.large`, 2026-10-16; 4.6x across days) |
 | [fsync-heavy writes](fsync-heavy-writes.md) | sustained O_DSYNC 4 KiB IOPS | 155 | gfs2 989 | **6.4x slower** — every write is a device write plus a Raft commit |
 | [Deep directory walks](deep-directory-walks.md) | `du -s` over 80k files | 128 s | nfs 0.41 s | **312x slower**; 1.56x slower than gfs2 (82 s). Was 480x and 2.4x |
 | [Deep directory walks](deep-directory-walks.md) | warm `find` | 7.22 s (1.14x warm benefit at 80k) | gfs2 0.125 s | **58x slower** — a warm benefit exists now, but the per-entry FUSE upcall dominates |
-| [Node-count scaling](node-count-scaling.md) | shared-file write bandwidth at 6 nodes | 61.7 MiB/s | gfs2 452.9 MiB/s | **7.3x slower** — every writer on one inode means a lock handover per turn |
+| [Node-count scaling](node-count-scaling.md) | shared-file write bandwidth at 6 nodes | 234.2 MiB/s | gfs2 443.4 MiB/s | **1.9x slower** — every writer on one inode means a lock handover per turn (same session, 2026-10-16; the older build was 7.3x) |
 | [Single-node ceiling](single-node-ceiling.md) | random-write IOPS as % of raw device | 36.0% | gfs2 99.6% | **2.8x** less of the device's IOPS retained |
+| [4 KiB random tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 at matched load (psync, 4 × 1) | write 12.4 ms, read 9.9 ms | gfs2 8.1 ms / 8.1 ms | **1.5x / 1.2x worse**. The earlier "24x better" compared 4 requests in flight with 128. At depth 32 etcfs's FUSE daemon crashes — see the report |
 
 ## The shape of it
 
@@ -82,10 +81,11 @@ one inode, where a lease-backed etcd key has to move where GFS2 sends a DLM
 message between kernels.
 
 **Anything involving failure, etcfs wins decisively.** A dead node's locks come
-back in 2.19 s with no fence device, no operator and no journal replay, while the
-survivors never stop; GFS2's survivors stop entirely and stay stopped until a
-STONITH agent confirms the kill, and the two server-mediated backends simply
-end. This is the design's actual claim and it is the one the measurements
+back in 3.0–3.5 s across eight runs, with no fence device, no operator and no
+journal replay, while the survivors keep working. GFS2's survivors stopped in
+every run measured, unfenced and fenced alike; whether that is GFS2 or this
+harness's DLM–pacemaker integration is not established. The two
+server-mediated backends simply end. This is the design's actual claim and it is the one the measurements
 support.
 
 **Client-side caching is worth more than it was.** The entry and attribute
@@ -97,10 +97,9 @@ where it had none, and a cold missing-name lookup went from 1474 µs to 110 µs
 once the daemon started answering a miss from the directory's prefetched name
 set rather than from etcd.
 
-**And the tail is much better than the median suggests.** At the same random-write
-throughput as GFS2 and GlusterFS, etcfs's p99 is 16–24x tighter. A workload that
-cares about worst-case latency rather than peak metadata rate is the one this
-system is for.
+**The tail is not a win.** At equal load GFS2's 4 KiB p99 is 1.2–1.5x tighter
+than etcfs's. The 16–24x advantage published earlier compared four requests in
+flight against 128 on the same device, and the matched re-run withdrew it.
 
 ## Reproducing
 

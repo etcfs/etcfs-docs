@@ -72,6 +72,22 @@ tree in 1047.6 s (76.4 files/s), but no `m7i.large` number exists for the other
 four backends, so the two cannot be read against each other. Re-measuring the
 five-way comparison on current code is owed.
 
+### Same-session re-measure on a non-burstable class (2026-10-16)
+
+The table above mixes an etcfs run with exhausted CPU credits against competitor
+rows from the previous day. etcfs and GFS2 were re-run back to back on
+`m5.large`, which has no credits to exhaust, on the current build:
+
+| Backend | Untar time | Creates/sec |
+|---|---|---|
+| gfs2 | 18.9 s | 4230.57 |
+| etcfs | 1452.5 s (24.2 min) | 55.08 |
+
+**76.8x**, against the 76.6x published above. Both backends ran about 1.5x
+faster than on `t3.medium`, and the ratio did not move: the throttled run
+understated both absolute rates but not the gap between them, which is set by
+one Raft commit per create against a local journal write.
+
 ## Reading these numbers
 
 etcfs is still worst by a wide margin — 75x slower than gfs2 (a local-journal filesystem with no per-create network round trip), and 2-4x slower than the network filesystems. The gap tracks directly to what the scenario's header names: a `create()` here is a synchronous Raft commit through etcd, one network round trip plus consensus per file, issued serially by a single untar process with no batching.

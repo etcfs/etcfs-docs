@@ -41,11 +41,12 @@ ledger, including the scenarios where EtcFS loses.
 
 **Recovery without a fence device, without journal replay.**
 A node is powered off mid-write while holding locks. A survivor takes over the
-dead node's file in **2.19 s** and its own I/O never stops (0.11 s worst gap).
-That is **10.3x faster than GlusterFS**, the only competitor that recovered at
-all: GFS2, NFS and JuiceFS never recovered inside 180 s, and GFS2's survivors
-stopped serving I/O entirely — its DLM lockspace goes to `wait fencing` and
-stays there until an external STONITH device confirms the kill. EtcFS needs no
+dead node's file in **3.0–3.5 s** (median 3.11 s over eight runs) and keeps
+serving its own I/O. That is **about 7x faster than GlusterFS**, the only
+competitor that recovered at all: GFS2, NFS and JuiceFS never recovered inside
+180 s, and GFS2's survivors stopped serving I/O — its DLM lockspace went to
+`wait fencing` and stayed there, even in runs where a `fence_aws` STONITH
+device confirmed the kill. EtcFS needs no
 such device, no operator and no journal to replay: recovery is a lease that
 stopped being renewed, plus a generation guard that makes a returning zombie's
 writes unacceptable.
@@ -63,20 +64,13 @@ cross. Three back-to-back leave/rejoin cycles under load cost the survivors
 [Elasticity](reports/benchmark-reports/elasticity.md) ·
 [Leave and rejoin under load](reports/benchmark-reports/leave-and-rejoin-under-load.md)
 
-**A far tighter latency tail than the kernel filesystems.**
-At effectively the same 4 KiB random-write throughput (934 IOPS against GFS2's
-973 and GlusterFS's 1041), EtcFS's p99 is **24x better than GFS2** (17.96 ms vs
-432.13 ms), **16x better than GlusterFS** and **13.6x better than NFS**. Read p99
-is **21.9x better than GFS2**. Same hardware, same session.
-[Comparison report](reports/benchmark-reports/etcfs-vs-juicefs-gluster-gfs2-nfs.md)
-
 **Scales out where the shared-directory lock stops others.**
 Across a 2 → 6 node sweep, aggregate write bandwidth on disjoint working sets
-climbs 253 → 282 MiB/s and shared-directory metadata throughput climbs **+34%**,
-while GFS2 **loses 47%** of its metadata throughput over the same sweep as the
-directory's DLM lock bounces between more nodes. GFS2 is still faster in
-absolute terms at six nodes; the curves converge, and the crossing point is
-past the width this run could provision.
+climbs 265 → 290 MiB/s and shared-directory metadata throughput climbs **+79%**
+(301 → 540 ops/s), while GFS2 **loses 44%** (1637 → 916 ops/s) over the same
+sweep as the directory's DLM lock bounces between more nodes. GFS2 is still 1.7x
+faster at six nodes; the curves converge, and the crossing point is past the
+width this run could provision.
 [Node-count scaling](reports/benchmark-reports/node-count-scaling.md)
 
 **The device, not the coordination, is the limit on the data path.**

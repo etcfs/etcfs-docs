@@ -36,18 +36,41 @@ Both backends' p99 figures came out as 0 and were published as "missing data".
 
 ## Reading these numbers
 
-**Throughput is a three-way tie at the device ceiling, and the tail is not.**
-gluster, gfs2 and etcfs all land within 10% of each other on random writes
-(1041 / 973 / 934 IOPS) because a 1000-IOPS volume is what they are all writing
-to. What separates them is p99 latency, where etcfs is **24x better than gfs2**
-(17.96 ms against 432.13 ms), 16x better than gluster (288.77 ms) and 13.6x
-better than nfs (244.32 ms) — for the same throughput, on the same hardware, in
-the same session. The one backend with a better write tail is juicefs
-(61.08 ms), which achieves it by doing 2.4x less work.
+**The p99 column above does not compare like with like.** etcfs and juicefs ran
+`psync` with four jobs at depth 1 (`bench-etcfs.sh`, `bench-juicefs.sh`), four
+requests in flight; gfs2, gluster and nfs ran `libaio` with four jobs at depth 32
+(`bench-gfs2.sh` and siblings), 128 in flight, against the same 1000-IOPS
+ceiling. By Little's law that alone puts the deep-queue backends' mean latency
+near 128 / 1000 s = 128 ms against etcfs's 4 ms, which is the gap the table
+shows. The throughput tie stands; the tail comparison does not.
 
-That inversion — competitive median throughput, far tighter tail — is the
-clearest single-number case for the design in this whole suite, and it was
-invisible until the fio-2.14 parsing bug above was fixed.
+### Matched load, etcfs and GFS2 (2026-10-16)
+
+Both backends re-run back to back on `m5.large` with an identical job: four
+jobs, one 8 MiB file each, `direct=1`, 60 s per stanza, at both queue shapes.
+
+| Backend | Job | write IOPS | write p99 (us) | read IOPS | read p99 (us) |
+|---|---|---|---|---|---|
+| gfs2 | psync, 4 × 1 | 1001 | 8096 | 1003 | 8096 |
+| etcfs | psync, 4 × 1 | 1011 | 12386 | 1004 | 9895 |
+| gfs2 | libaio, 4 × 32 | 1004 | 585728 | 1003 | 246784 |
+| etcfs | libaio, 4 × 32 | — | — | — | — |
+
+At equal load both backends saturate the device and **GFS2 has the tighter
+tail**: 8.1 ms against 12.4 ms on writes, 8.1 ms against 9.9 ms on reads. At
+depth 32 GFS2's p99 reproduces the hundreds of milliseconds published above,
+which is queueing at the device rather than anything in GFS2.
+
+etcfs has no depth-32 row because the job killed its FUSE daemon within
+seconds, twice in two attempts: the mount answered `ECONNABORTED`, then
+`ENOTCONN`, and `etcfuse` logged `daemon exited with error -9` after `writing
+device: Bad file descriptor`. The metadata daemon stayed up. The thread-exit
+destructor for each worker's IPC connection (`ipc_fd_destroy`,
+`pkg/fuse/fuse.c`) closes the thread-local value as stored, which is the
+descriptor plus one, so a worker that exits closes an unrelated descriptor —
+another worker's IPC socket or its cloned `/dev/fuse` handle. Bursty async I/O
+is what makes libfuse spawn and retire extra workers, which is why only this job
+hits it.
 
 **The read column is not comparable across backends and should not be read as
 one.** nfs's 44.5k and juicefs's 69.2k read IOPS are client page-cache hits on a

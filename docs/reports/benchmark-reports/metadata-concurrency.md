@@ -34,6 +34,19 @@ unaffected by an etcfs-side change, but they are a different day's clusters.
 | gluster | 304.38 | 514.98 | 776.85 | 2.55x |
 | **etcfs** | **187.88** | **313.55** | **327.34** | **1.74x** |
 
+### Same-session re-measure (2026-10-16)
+
+etcfs and GFS2 back to back on `m5.large`, current build, same evening:
+
+| Backend | 1 node (ops/s) | 2 nodes (ops/s) | 3 nodes (ops/s) | 1n → 3n |
+|---|---|---|---|---|
+| gfs2 | 1630.43 | 2086.23 | 2063.27 | 1.27x |
+| **etcfs** | **212.40** | **331.67** | **405.19** | **1.91x** |
+
+GFS2 is **5.1x** faster at three nodes, against the 4.6x in the table above, so
+the cross-day comparison did not flatter either side. Both curves keep their
+shape: GFS2 flattens between two and three nodes, etcfs keeps climbing.
+
 ## Reading these numbers
 
 **etcfs is still last in absolute throughput at every node count, by 3.7x
