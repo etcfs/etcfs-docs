@@ -1,6 +1,6 @@
 # Arena Allocator
 
-The block allocation engine that divides the shared raw block device into arenas, manages local free-lists, and acquires new arenas via etcd transactions — converting a global hot-key problem into an infrequent CAS operation.
+How a node finds free blocks on the shared device for a write. The device is divided into 1 GiB arenas, each owned by one node; a node allocates blocks inside its own arenas from an in-memory bitmap, and contacts etcd only to claim or release a whole arena.
 
 ## Table of Contents
 
@@ -15,11 +15,11 @@ The block allocation engine that divides the shared raw block device into arenas
 
 ## Design Rationale
 
-A distributed block allocator has a fundamental tension: a single global counter or free-space bitmap becomes a hot key under concurrent write load, because every allocation must atomically reserve a range. Traditional filesystems solve this with per-node extents and lock-based journaling.
+If every allocation reserved space in one shared etcd record, such as a global free-space bitmap, that record would be changed on every write by every node, and all writes would contend on it.
 
-EtcFS solves it with arenas. The block device is divided into 1 GiB contiguous ranges (arenas), each owned by exactly one node. Within its arena, a node allocates blocks from a local bitmap without any etcd communication. Nodes acquire new arenas only when their current arena nears exhaustion — a CAS transaction on a global counter — which happens at most once per GiB of data written.
+EtcFS avoids this with arenas. The device is divided into contiguous 1 GiB ranges, and each arena is owned by exactly one node. Inside its own arenas, a node allocates blocks from a bitmap in its memory, without contacting etcd. It claims another arena only when the ones it owns are full, with one compare-and-swap in etcd, so at most once per GiB written.
 
-This converts the allocation problem from "CAS every 4 KiB write" to "CAS every 1,048,576 writes". The hot key (the arena counter) is touched only once per GiB per node, which is well within etcd's capacity for read-heavy workloads.
+For 4 KiB writes, that is one etcd transaction per 262,144 writes instead of one per write.
 
 ## Arena Structure
 
@@ -76,13 +76,13 @@ bitmap: [uint64 × 4096]
 
 `findRun` returns the next free run of at most the requested length, or a zero length when the arena has none. Fully-allocated 64-bit words are skipped whole; within a word the scan is bit by bit.
 
-The search starts from a rotating hint left where the previous one finished, and wraps to the beginning exactly once before giving up. Scanning from block 0 every time made a nearly-full arena cost a sweep of the whole bitmap per allocation, and a fragmented one cost several. Freeing a range moves the hint back to it, so blocks just returned are reused before the search moves on.
+The search starts where the previous search ended (a stored hint) and wraps to the beginning at most once. Starting from block 0 every time would scan the whole bitmap for each allocation once an arena is nearly full. Freeing a range moves the hint back to it, so freed blocks are reused first.
 
 The hint is only a hint: because the search wraps, nothing is missed if it points past space that has since been freed.
 
 ### Double Frees
 
-`Free` refuses to clear a bit that is already clear, and counts the attempt. Freeing an already-free block means two callers believe they own it, and the next allocation would hand a live range to a second writer — the write path, the scrubber's reclamation and the failed-allocation undo all call `Free`, so the count (`DoubleFrees`) names the bug where it happens rather than at the corruption it would cause later.
+`Free` refuses to clear a bit that is already clear, and counts the attempt in `DoubleFrees`. Freeing a free block means two callers each believe they own it, and the next allocation would give a range that is in use to a second writer. The write path, the scrubber and the undo of a failed allocation all call `Free`, so the counter shows the bug when it happens, before it corrupts data.
 
 ## Arena Acquisition
 
@@ -106,9 +106,9 @@ The delete is conditioned on the key still existing, so when several nodes reach
 
 A freed arena is not necessarily an empty one. An arena released because its owner emptied it holds nothing, but one released by a departing or fenced node still holds whatever extents its files have, and the claimer cannot tell the two apart. A node that claims a recycled arena therefore rebuilds the arena's bitmap from the live extents in etcd (the same scan `Reconstruct` performs at startup) before allocating from it; a brand-new arena, which no node has ever owned, starts from an all-zero bitmap.
 
-A new arena is refused when it would not fit on the device: an arena's offset is its ID multiplied by the arena size, and nothing else stops that running past the end. The allocator is told the device's size when the block device is attached, and answers `ENOSPC` rather than letting the write fail at the `pwrite` with a short write or `EINVAL`, which would surface as `EIO` — a disk error rather than a full filesystem. A refused ID is not returned to the pool: a device with no room left is stuck for the whole cluster until it grows, and `fsck` reports the unowned ID as an orphaned arena.
+**A new arena that would not fit on the device is refused.** An arena's offset is its ID times the arena size, and nothing else stops it from running past the end of the device. The allocator knows the device size, and returns `ENOSPC`. Otherwise the `pwrite` would fail with a short write or `EINVAL`, which the application would see as `EIO`, a disk error, instead of a full filesystem. The refused ID is not returned to the pool. The device has no room left for anyone until it is grown, and `fsck` reports the unowned ID as an orphaned arena.
 
-A failed claim of a *recycled* arena is not fatal — the allocator falls through to a new arena, which costs device space but always works. Surfacing an etcd hiccup here as an I/O error on the write that triggered the acquisition would be a worse trade.
+**If claiming a recycled arena fails**, for example because etcd did not answer, the allocator takes a new arena instead. That uses more of the device but always works, and is better than failing the write with an I/O error.
 
 ### Allocating a New Arena
 
@@ -143,32 +143,34 @@ recordOwnership(nodeID, arenaID):
       return error("already owned")   // the ID came back already claimed
 ```
 
-The CAS on the counter ensures at-most-once allocation per arena ID. If two nodes attempt to acquire an arena simultaneously, exactly one succeeds for each unique counter value. The failing node retries with the next counter value.
+The compare-and-swap on the counter gives each arena ID to one node only. If two nodes advance it at once, one succeeds, and the other retries with the next value.
 
-Recording ownership is a second, separate CAS, conditioned on the per-arena key not already existing. It cannot be folded into the counter's transaction: the ownership key is per-arena (`arena:<nodeID>/<arenaID>`), unlike the counter, and a lost race here means the arena ID somehow came back already claimed — a bug elsewhere, not contention to retry through.
+Recording ownership is a second compare-and-swap, requiring that `arena:<nodeID>/<arenaID>` does not exist yet. If it already exists, the ID was handed out twice, which is a bug elsewhere rather than contention, so the error is returned instead of retried.
 
-The maximum total device capacity is `2^64 * 1 GiB` (if arena IDs are 64-bit unsigned), but in practice is limited by EBS volume size (64 TiB for io2 Multi-Attach). With 1 GiB arenas, the global counter supports up to 64 TiB / 1 GiB = 65,536 arenas, which is well within the counter's range.
+An io2 Multi-Attach volume can be up to 64 TiB, which is 65,536 arenas of 1 GiB; the 64-bit counter is far from its limit.
 
 ### Retry Behaviour
 
-If the CAS fails due to concurrent contention (another node acquired an arena between the read and the CAS), the operation retries with exponential backoff for a maximum of 5 attempts. After 5 consecutive failures, the allocator returns `ENOSPC` — even though disk space may still be available, the contention is considered pathological.
+If the compare-and-swap fails because another node claimed an arena in between, it is retried with growing delays, up to 5 attempts. After 5 failures the allocator returns `ENOSPC`, even if space remains, because contention that persistent means something is wrong.
 
-In practice, arena acquisition contention is extremely rare because it happens only once per GiB of writes per node. With a 3-node cluster writing at full speed, arena acquisitions occur every ~10 seconds (at 300 MiB/s aggregate throughput), with a very low probability of collision.
+Contention is rare, because each node claims an arena only once per GiB it writes. In a 3-node cluster writing 300 MiB/s in total, each node claims one about every 10 seconds, and two claims rarely coincide.
 
 ### Device Size
 
 The allocator refuses an arena whose range would end past the device (`SetDeviceSize`), which is the only thing standing between an arena ID and a write past the end of the volume.
 
-That size is read from the device at startup, but it is not fixed for the life of the process: a shared volume can be grown while every node stays mounted, and an EBS volume is routinely resized that way. So when `AcquireArena` fails with `ErrNoSpace`, the service re-reads the size (`blockio.Device.RefreshSize`) and retries once if the device turned out to be larger. Nothing polls: a filesystem that is not full never pays for the ioctl, and a filesystem that is full is by definition about to ask. A size that comes back *smaller* is ignored — shrinking a volume under a live filesystem is not supported, and honouring the smaller number would strand arenas already in use.
+The size is read at startup, but an EBS volume can be grown while every node keeps it mounted. When `AcquireArena` fails with `ErrNoSpace`, the service therefore reads the size again (`blockio.Device.RefreshSize`) and retries once if the device has grown. Nothing polls for growth: a filesystem that is not full never reads the size again, and a full one reads it exactly when it needs more space. A smaller size is ignored: shrinking a volume under a mounted filesystem is not supported, and using the smaller size would strand arenas already in use.
 
 ### Reported Free Space
 
-`statfs` — what `df` prints — has to answer for the whole device, but the two halves of the answer are known in different places:
+`statfs` (what `df` prints) reports free space for the whole device, but the two parts of that number are known in different places:
 
 - **Unclaimed space** is a cluster-wide fact. Counting the `arena:<node_id>/<arena_id>` records gives the arenas owned by anyone, and everything past them is space no node can be writing into. Arenas in the `free_arena:` pool are not counted: they have no owner and any node may claim one.
 - **Free space inside an arena** is known only to that arena's owner, because the bitmap is in-memory and per-node. Only this node's own slack can be added.
 
-The result under-reports: another node's unused space inside its own arenas is counted as used. That is a deliberate choice of which way to be wrong, and it is one direction rather than two. Deriving the whole figure from this node's occupancy — scaling the device size by the local `LiveRatio`, which is what this used to do — was wrong in both directions at once: it reported a nearly empty device as full whenever this node's own arenas filled, and a nearly full one as empty whenever they happened to be free.
+Free space is therefore the unclaimed space plus this node's own free blocks. Other nodes' free blocks inside their arenas are counted as used, so the figure can be too low but never too high.
+
+Scaling the whole device size by this node's own fill ratio would be wrong in both directions: a nearly empty device would look full whenever this node's arenas were full, and a nearly full device would look empty whenever they were empty.
 
 ## Block Allocation
 
@@ -195,11 +197,14 @@ Allocate(size):
   return not_enough_space_error
 ```
 
-The allocator returns a *list* of runs, not a single range. A file is already a list of extents, so its bytes never have to be contiguous on the device — one write simply becomes one extent per run, in logical order. Free space that is merely fragmented is therefore still usable space, and the allocator only reports failure when the arenas the node holds cannot cover the request, which is the caller's signal to acquire another arena.
+The allocator returns a *list* of runs, not one range. A file is a list of extents anyway, so its bytes do not need to be contiguous on the device; a write becomes one extent per run. Fragmented free space is therefore usable, and the allocator only fails when the node's arenas together cannot cover the request, which tells the caller to claim another arena.
 
-This is why there is no defragmentation pass. Fragmentation costs an extra extent record per additional run, not a failed write; the classic reason to defragment — recovering contiguity so a large request can be satisfied — does not apply when the request never needed contiguity in the first place. The other classic reason, seek locality, does not apply either: the shared device is NVMe or EBS, where random access costs essentially what sequential access costs.
+There is no defragmentation, for two reasons:
 
-A request that cannot be met leaves the bitmap exactly as it found it. Keeping the blocks taken on the way to discovering the shortfall would leak them, since the caller never learns which runs were reserved.
+- fragmentation costs one extra extent record per extra run, never a failed write, so contiguity never has to be recovered;
+- the device is NVMe or EBS, where random access costs about the same as sequential access, so there is no seek time to save.
+
+A request that cannot be met leaves the bitmap unchanged. The caller does not learn which runs were reserved before the shortfall was found, so keeping them would leak them.
 
 ### Allocation Size
 
@@ -209,23 +214,31 @@ The block size (4096 bytes) matches the O_DIRECT sector alignment requirement fo
 
 ## Arena Release
 
-An arena is not just allocated, it must eventually be given back — otherwise every node departure, graceful or not, leaks that node's arena space permanently. `Store.ReleaseArenaID(ctx, nodeID, arenaID)` moves one arena from its `arena:<node_id>/<arena_id>` record into `free_arena:<arena_id>` in a single transaction; an arena listed as free while still recorded as owned would be handed to a second node, which is the one outcome the scheme exists to prevent. `Store.ReleaseArena(ctx, nodeID)` applies it to *every* arena the node owns — not just one — as an independent transaction each, so an arena released concurrently fails its own comparison without aborting the release of the rest. `ClaimFreeArena` (above) is the other half of the same round trip.
+Arenas must be given back, or every node that leaves, cleanly or not, would keep its arena space forever.
 
-Release is wired in three places, gated on different proofs of quiescence:
+- `Store.ReleaseArenaID(ctx, nodeID, arenaID)` moves one arena from `arena:<node_id>/<arena_id>` to `free_arena:<arena_id>` in one transaction. Doing it in two steps could leave an arena both owned and free, and it could then be given to a second node.
+- `Store.ReleaseArena(ctx, nodeID)` releases *every* arena the node owns, each in its own transaction, so one arena released concurrently by someone else does not stop the others.
+- `ClaimFreeArena` (above) takes an arena back out of the free pool.
 
-- **Graceful departure.** `Membership.Leave(ctx, store)` releases the node's arenas, then revokes the membership lease — in that order, so the ownership records are already gone by the time the membership key's deletion could wake a fencing controller. `cmd/etcfuse-meta` calls `Leave` after its IPC server has stopped, not from the context-cancellation path that starts shutdown: the IPC server having stopped is what proves no further write can be issued from this node, and that proof only exists once shutdown is further along than "cancel received."
-- **Confirmed fence.** `pkg/fencing.Controller` releases a fenced node's arenas after the generation bump, but only when a `Fencer` confirmed the severance (NVMe preempt or EBS detach — see [External Fencing Controller](../fencing/external-fencing-controller.md)). Single-signal mode (no `Fencer` configured, e.g. plain Docker) leaves the arenas leaked deliberately: a lease expiry alone is not proof the node has stopped writing, so there is nothing to satisfy invariant 4 of [Kleppmann's Stale-Write Hazard](kleppmann-stale-write-analysis.md) with.
-- **Emptied during normal operation.** `Allocator.ReleaseEmptyArenas(ctx)` returns any arena whose every block has been freed by deletes and truncates, on a one-minute sweep from `cmd/etcfuse-meta`. Without it a long-lived node accumulates arenas it no longer uses: the blocks inside them are free and reusable by that node, but the arena stays its own, so the space is unreachable by any peer until the process exits. The proof of quiescence here is the bitmap itself — an arena has exactly one owner, and the owner is the one asking.
+An arena can be released only when its owner can no longer write to it. Release happens in three places, each with its own proof of that:
 
-  The order matters. The arena is detached from the local free list *before* the etcd release and reattached if that release does not go through, so no allocation can land in a range already on its way to another node. Doing it the other way round would open the two-writers-one-range window directly.
+- **Clean departure.** `Membership.Leave(ctx, store)` releases the node's arenas and then revokes its membership lease. In that order, the arenas are already free when the deleted membership key could start a fence on another node. `cmd/etcfuse-meta` calls `Leave` only after its IPC server has stopped, because only then can no further write come from this node.
+- **Confirmed fence.** `pkg/fencing.Controller` releases a fenced node's arenas after raising its generation, but only if the fence was enforced by the device (NVMe reservation removed or EBS volume detached; see [External Fencing Controller](../fencing/external-fencing-controller.md)). Without a device-enforced fence, as in plain Docker, the arenas are deliberately not released: an expired lease does not prove the node has stopped writing (see invariant 4 of [Kleppmann's Stale-Write Hazard](kleppmann-stale-write-analysis.md)).
+- **Empty arenas.** Every minute, `Allocator.ReleaseEmptyArenas(ctx)` releases any arena whose blocks have all been freed by deletes and truncates. Without this, a long-running node would keep arenas it no longer uses; their blocks are free for that node but unusable by any other. The bitmap is the proof here: the owner is the one releasing, and it knows nothing is allocated in the arena.
 
-Block-level reclamation is in-memory and per-node: the free list above lives in each allocator's own bitmap, and a node only ever reads its own `arena:<node_id>/` records (never a prefix scan over all nodes, see below), so there is no mechanism for a node to reclaim ranges inside *another* node's still-owned arena — and there won't be. Two nodes allocating inside one arena is exactly the two-writers-one-range corruption the whole scheme exists to prevent; whole-arena transfer via `free_arena:` already recycles space at the only granularity that's safe without a fenced source. A durable, cluster-visible block free list is likewise not planned: the durable `extent:` keys already are that free list, one level of indirection away — both `Reconstruct` (crash recovery, below) and a recycled arena's live-extent scan derive the bitmap from them on demand. Persisting a second bitmap would just be a second source of truth that can drift from the first.
+  The arena is removed from the local free list *before* the etcd release, and put back if the release fails. In the other order, a write on this node could be given blocks in an arena that is already being handed to another node.
 
-Space that falls through the cracks anyway — a released arena's ownership record surviving a crash between delete and put, or a single-signal-mode fence's deliberate leak — is not silently lost: `fsck.checkArenaOrphans` walks every arena ID below the `arena_alloc_log` high-water mark and reports any that is owned by no node and absent from the free pool, or owned by one and free in the pool at the same time. It reports, it does not repair — deciding an arena is truly abandoned needs an operator's knowledge of which nodes are gone for good.
+**Nodes never allocate inside another node's arena.** Two nodes allocating in one arena is the corruption the arena scheme exists to prevent, so space moves between nodes only as whole arenas through `free_arena:`. A node reads only its own `arena:<node_id>/` records (see below).
+
+**There is no stored cluster-wide free list.** The `extent:` keys already record which blocks are in use, and the bitmap is rebuilt from them when needed (at startup, and when claiming a recycled arena). A second stored free list could disagree with the extents.
+
+**Space that is lost is reported.** If a crash leaves an arena neither owned nor in the free pool, or a single-signal fence leaves one owned by a dead node, `fsck.checkArenaOrphans` reports it. It checks every arena ID below the `arena_alloc_log` counter for one that is owned by nobody and not free, or owned and free at the same time. It does not repair anything, because deciding that a node is gone for good needs an operator.
 
 ### Free After Deletion
 
-Deleting a file returns its blocks the same way: the scrubber's orphan-extent pass (`pkg/scrub`) calls `Allocator.Free(diskOff, length)` after deleting the dangling `extent:<ino>/<chunk>` key — delete first, so the blocks stop being reachable through metadata before the range can be reissued. This is wired through the optional `scrub.Reclaimer` interface, so the scrubber degrades to metadata-only cleanup when no allocator is attached. The strategy is incremental (update the live bitmap directly, evaluated against periodic-rebuild and append-only alternatives) because the free list is already in-memory and per-arena-owning-process — `Free` ignores ranges outside the calling node's own arenas, so no cross-node visibility is required for it to be safe.
+Deleting a file leaves its extent keys behind as orphans. The scrubber's orphan pass (`pkg/scrub`) deletes each orphaned `extent:<ino>/<chunk>` key and then calls `Allocator.Free(diskOff, length)`. The key is deleted first, so no metadata refers to the blocks by the time they can be given out again. The scrubber reaches the allocator through the optional `scrub.Reclaimer` interface; without an allocator it only cleans up metadata.
+
+`Free` updates the bitmap directly and ignores ranges outside the calling node's own arenas, so each node frees only blocks it owns and needs no information from other nodes.
 
 ## Block Deallocation
 
@@ -243,9 +256,11 @@ Free(diskOff, size):
       return
 ```
 
-The free operation is a local bitmap update — no etcd communication. The freed blocks become available for immediate reuse by subsequent `Allocate` calls from the same node. Blocks freed by a truncation are not visible to other nodes until the truncate's metadata commit (which removes the extents from the inode's extent list) is complete. This is the metadata-then-data ordering invariant: the extent removal in etcd happens before the free-list update.
+Freeing only updates the local bitmap; etcd is not contacted. The freed blocks can be reused by this node's next `Allocate`.
 
-When a file is fully deleted (all hard links removed, nlink reaching zero), the `AtomicUnlink` operation deletes the inode and its extent keys, but calls no `Free` itself — that only happens once the scrubber's orphan pass confirms the extent keys are gone (see [Arena Release § Free After Deletion](#free-after-deletion) above). If the node crashes between the extent deletion and the scrubber's pass, the blocks stay marked allocated in the bitmap until the scrubber's next run.
+A truncate or overwrite frees blocks only after its transaction removing or trimming the extents has committed. This is the metadata-then-data order: once a block is freed, no extent in etcd points to it.
+
+Deleting a file (removing its last name) deletes the inode record, but not its extent keys, and frees nothing. The scrubber's orphan pass later deletes the extent keys and frees the blocks (see [Free After Deletion](#free-after-deletion)). Until then the blocks stay allocated.
 
 ## Crash Recovery Integration
 
@@ -259,18 +274,37 @@ After an unclean shutdown, the arena allocator's local state (the in-memory bitm
 
 4. After the bitmap is reconstructed, the node can resume allocating from its arenas.
 
-The bitmap reconstruction from etcd is O(N) in the number of extents. For a completely full arena with 262,144 single-block extents, this is 262,144 extent reads — which takes a few seconds at typical etcd read rates.
+Rebuilding the bitmap reads every extent once. A full arena of 262,144 single-block extents means 262,144 extents to read, which takes a few seconds.
 
 If the node has no arena records in etcd (it was fenced and its arenas were reclaimed by other nodes), the allocator starts with zero arenas and acquires a new one on the first write request.
 
-### Why "own prefix only" is not optional
+### Why each node reads only its own arenas
 
-Step 1 scans only `arena:<node_id>/`, not the whole `arena:` prefix, because reading the whole prefix (see [Kleppmann's Stale-Write Hazard in EtcFS](kleppmann-stale-write-analysis.md#the-allocator-channel)) would pull every node's arena into the restarting node's free-list, and step 4's `Allocate` calls would then hand out disk offsets inside a range another node was actively writing to. Both writers hold valid leases and current fencing generations in that scenario, so the generation guard on the metadata commit has nothing to reject — the corruption is silent, and only the scrubber's `CheckExtentCollisions` catches it, after the fact.
+Step 1 reads only `arena:<node_id>/`, not the whole `arena:` prefix. Reading the
+whole prefix would put every node's arenas into the restarting node's free
+list, and its next `Allocate` would hand out blocks inside a range another node
+is writing to. Both writers would hold valid leases and current generations, so
+the generation guard would reject nothing: the two files would silently share
+blocks, and only the scrubber's `CheckExtentCollisions` would notice, after the
+damage. See [Kleppmann's Stale-Write Hazard in EtcFS](kleppmann-stale-write-analysis.md#the-allocator-channel).
 
-Several related defects fed the same class of bug and are fixed alongside it:
+Three further rules protect the same property:
 
-- `AcquireArena` did not persist an ownership record at acquisition time, so a node had no durable claim on the range it was writing into until some other path happened to write it later.
-- An arena-relocation pass (since removed) encoded the ownership value as ASCII (`fmt.Sprintf("id=%d", arenaID)`) while everything else uses 8-byte big-endian, so a relocated arena decoded to ID 0 on the next restart. The rule it broke still stands: every writer of an `arena:<node_id>/<arena_id>` value uses the 8-byte big-endian encoding, and `existingArenaIDs` skips any record that is not exactly eight bytes.
-- Before the per-arena key layout, a single `arena:<node_id>` record meant a node's *second* `AcquireArena` call silently overwrote its first — the first arena became owned by nobody, never re-adopted on restart and never returned to the free pool. Any node writing more than 1 GiB hit this on every write session. `ReleaseArena` had the matching half of the same bug: it freed only the most recently acquired arena, leaking the rest on every departure or fence.
+- **An arena's ownership record is written when it is claimed**, so a node
+  always has a durable claim on the range it writes into.
+- **Every ownership value is the arena ID as 8 bytes, big-endian.**
+  `existingArenaIDs` skips any record of another length, because a value in a
+  different format could decode to a valid but wrong ID (an ASCII value, for
+  example, decodes as arena 0).
+- **There is one key per arena, not one per node.** With a single
+  `arena:<node_id>` key, a node's second arena claim would overwrite the first,
+  leaving the first arena owned by nobody: never recovered at restart and never
+  returned to the free pool. Releasing would likewise free only the last arena
+  claimed.
 
-Regression coverage: `pkg/arena/allocator_integration_test.go` (real etcd) — `TestIntegration_ReconstructRecoversAllOwnedArenas` and `TestIntegration_ReleaseArenaReleasesAllOwned` are the multi-arena regressions, verified to fail against the old single-key layout and pass against the current one; the rest of that file covers the earlier defects above. `scripts/test/chaos-arena-collision.sh` scenarios S8 (restart-adoption), S9 (concurrent cross-node writes, no offset collision), S10 (fenced writer leaves no torn result) — run against both docker and AWS.
+Tests: `pkg/arena/allocator_integration_test.go`, against a real etcd, includes
+`TestIntegration_ReconstructRecoversAllOwnedArenas` and
+`TestIntegration_ReleaseArenaReleasesAllOwned` for nodes with several arenas.
+`scripts/test/chaos-arena-collision.sh` scenarios S8 (adoption at restart), S9
+(concurrent writes from several nodes, no shared offsets) and S10 (a fenced
+writer leaves no partial result) run on Docker and on AWS.

@@ -1,172 +1,188 @@
 # Write Ordering Invariants
 
-The ordering constraints that guarantee crash consistency: data-then-metadata for writes, metadata-then-data for truncates, and the arena reconstruction that reclaims whatever a crash left behind.
+EtcFS has no journal. What a crash can leave behind is decided instead by the
+order of two steps: putting bytes on the device and changing the extents in etcd
+that refer to them. Writes put data first and metadata second; truncates do the
+reverse. At startup, a node rebuilds its free-block bitmap from the extents in
+etcd, which reclaims whatever a crash left unreferenced.
 
 ## Table of Contents
 
-- [The Fundamental Asymmetry](#the-fundamental-asymmetry)
-- [Data-Then-Metadata for Writes](#data-then-metadata-for-writes)
-- [Metadata-Then-Data for Truncates](#metadata-then-data-for-truncates)
+- [The Asymmetry](#the-asymmetry)
+- [Data Before Metadata for Writes](#data-before-metadata-for-writes)
+- [Metadata Before Data for Truncates](#metadata-before-data-for-truncates)
 - [Recovering Uncommitted Blocks](#recovering-uncommitted-blocks)
-- [Crash Recovery Protocol](#crash-recovery-protocol)
+- [Crash Recovery](#crash-recovery)
 - [Extent Lifespan](#extent-lifespan)
 - [Multi-Node Implications](#multi-node-implications)
 
-## The Fundamental Asymmetry
+## The Asymmetry
 
-Modern cluster filesystems face an asymmetry that determines their crash-recovery semantics:
+A write has two parts: the bytes on the device, and the extent in etcd that says
+where they are. A crash can happen between the two.
 
-If a write's metadata (the extent mapping) is committed to etcd before its data (the extent content) is on the block device, a crash causes **stale data**. The metadata claims blocks exist at a disk offset, but those blocks contain either zeros or data from a previous allocation (a security and integrity violation).
+- **Metadata first, then data:** after a crash, an extent points at blocks that
+  were never written. A reader gets whatever those blocks held before, possibly
+  another file's old data. This exposes data the reader must not see.
+- **Data first, then metadata:** after a crash, the device holds bytes that no
+  extent points at. Nobody can read them, and the blocks are reclaimed.
 
-If the data is on disk before the metadata is committed, a crash causes **orphaned bytes**. The block device has valid data, but no inode references them. They are harmless — the data goes unread — and reclaimable by the scrubber.
+EtcFS uses the second order for writes. Unreferenced bytes waste space for a
+while; stale data shown as file content is a correctness failure.
 
-EtcFS chooses the second outcome: **data first, then metadata**. Orphaned bytes are acceptable; stale data presented as valid is not.
+## Data Before Metadata for Writes
 
-## Data-Then-Metadata for Writes
+### Without a block device
 
-The data-then-metadata ordering is the central write-ordering invariant. Every write operation follows this sequence:
+If `etcfuse-meta` has no block device (`--block-device` and `--volume-id` both
+unset), it runs in metadata-only mode: a write updates the file size in etcd and
+stores no data. This is for testing metadata operations only.
 
-### Metadata-Only Mode
+### The write path
 
-When no block device is configured (`--block-device` flag not provided), the daemon falls back to metadata-only mode: writes update the inode size in etcd but do not store data on disk. This mode is functionally correct for metadata-only testing but provides no data durability across restarts.
+1. **Reserve blocks** from the arena allocator. They are marked allocated in this
+   node's bitmap. No other node knows about them.
+2. **Write the data** to the reserved blocks with `pwrite()` (`O_DIRECT`).
+3. **(With `--write-barriers`) flush the device and sync the range.** Without
+   barriers, the completed `O_DIRECT` write is taken as durable.
+4. **Commit the extent to etcd**, in a transaction carrying the generation guard.
+   If the node has been fenced since it started, the transaction fails.
 
-### Data-Then-Metadata (Full Write Path)
+### If the node crashes between steps 2 and 4
 
-The complete write protocol with the block device is implemented end-to-end:
+- The data is on the device, but no extent refers to it.
+- At restart, `Reconstruct` rebuilds the bitmap from the extents in etcd. No
+  extent refers to these blocks, so they are free again.
+- A later write can reuse and overwrite them.
 
-1. **Reserve disk blocks** from the arena allocator. The blocks are marked allocated in the local arena free-list but the extent is not yet visible to other nodes.
+In the opposite order, a crash after committing the extent but before writing
+the data would leave an extent pointing at blocks with old contents. A reader
+on any node would get those old contents.
 
-2. **Write data to the block device.** An O_DIRECT `pwrite()` at the reserved disk offset writes the user data. The write may be submitted via io_uring for asynchronous completion.
+### When writes are buffered
 
-3. **Fsync the block device.** `fdatasync()` or `sync_file_range()` ensures the data is durably on the block device. This is the critical point at which data becomes permanent.
+While this node holds the inode's exclusive lock, step 4 is normally delayed:
+the extent is kept in a buffer and published by a later flush (see
+[Consistency and Durability](../consistency/consistency-and-durability-model.md#durability-under-write-delegation)).
+With `--write-data-cache` (on by default), step 2 can be delayed too, but only
+for a write the flush can make cheaper: one that continues a contiguous range on
+the device, or one of at least 64 KiB. Other writes put their bytes on the
+device immediately and delay only the extent.
 
-4. **Commit the extent to etcd.** A CAS transaction creates or updates the `extent:<ino>/<chunk>` key with the new extent entry. The transaction includes a generation guard — if the writer's fencing generation has been bumped since the write started, the transaction fails.
+The order between the two steps is the same. A flush first writes every buffered
+run to the device, and only then commits the transaction that publishes the
+extents pointing to them. Step 1 still happens when the write is served, so each
+buffered extent already has its final device offset.
 
-### Why Step 3 Must Precede Step 4
+If writing to the device fails during a flush, nothing is published. The buffer
+is kept and retried, as for a failed etcd transaction. Dropping it would let a
+retried `fsync` report success with the data gone.
 
-If a crash occurs between step 3 and step 4:
-- The data is on the block device (fsynced).
-- The metadata is **not** in etcd — the extent does not exist.
-- On restart, `Reconstruct` rebuilds every arena bitmap from the live extents in etcd, and no extent references those blocks, so they are free again.
-- The data bytes remain on the block device but are no longer referenced — a harmless orphan.
-- A subsequent allocation for another file may overwrite those bytes.
+Buffering increases how much a crash can lose, but not what kind of loss it is.
+Unpublished extents were never visible, and buffered bytes are lost together
+with their extents rather than left unreferenced on the device. After a crash,
+a file reads back as it was at its last flush, never as a mix.
 
-If steps 3 and 4 were reversed (metadata before data):
-- The metadata is in etcd: the extent exists in the filesystem.
-- A crash before the fsync means the data was never durably written.
-- A reader on another node reads the extent, finds its blocks referenced by etcd, reads from the block device, and gets stale data (the previous contents of those blocks) or zeros.
-- This is a data integrity failure.
+## Metadata Before Data for Truncates
 
-### Where the Ordering Moves When Writes Are Buffered
+A truncate (and `fallocate(FALLOC_FL_PUNCH_HOLE)`, which removes a range) frees
+blocks, so the order is reversed:
 
-With `--write-data-cache` (the default when extent publication is deferred at
-all), steps 2 and 4 can both move off the write path and into the flush. Step 2
-moves only for a write the flush can actually make cheaper — one continuing a
-contiguous device run, or one large enough to be latency-bound rather than
-rate-limited; every other write puts its bytes down as it is served, and defers
-only step 4. The ordering between them does not move: the flush puts every buffered run on the
-device first, and only then commits the transaction publishing the extents that
-name those runs. Step 1 still happens as the write is served, which is what lets
-the extents carry their final disk offsets while the bytes are still in RAM.
+1. **Commit the extent change to etcd.** Extents past the new size are deleted
+   or shortened, in a transaction carrying the generation guard.
+2. **Return the freed blocks** to this node's free list.
+3. **For a truncate, commit the new size** in the inode record. A punched hole
+   keeps the size.
 
-A device write that fails at flush time therefore stops the flush before it
-publishes anything. The buffer is kept and retried, exactly as a failed etcd
-transaction is, because the alternative — dropping it — would let a retried
-`fsync` succeed with the data gone.
+### Why step 1 comes before step 2
 
-The crash exposure this adds is larger in size than deferring the commit alone,
-and identical in kind: the bytes are now lost along with the mapping rather than
-stranded on the volume, and an unpublished extent was unreachable either way. A
-file still reads back as it was at its last flush, never as a mixture.
+If the node crashes after step 1 and before step 2, the extents no longer refer
+to the blocks, but the bitmap still marks them allocated. Nobody can read them,
+and they are free again after the next restart rebuilds the bitmap.
 
-## Metadata-Then-Data for Truncates
+In the opposite order:
 
-Truncation reverses the ordering. When a file is truncated (or a range is deallocated with `fallocate(FALLOC_FL_PUNCH_HOLE)`):
+1. the blocks go back to the free list;
+2. another file is given them and writes its data there;
+3. the truncated file's extents still point to them;
+4. a reader of the truncated file sees the other file's data.
 
-1. **Commit the new (smaller) extent list to etcd.** The extent list for the truncated range is removed from the `extent:<ino>/<chunk>` keys. The inode's size is updated. This transaction is generation-guarded.
-
-2. **Return the freed blocks to the arena free-list.** The arena allocator marks the blocks as free, making them available for future writes by any node on the cluster.
-
-### Why Step 1 Must Precede Step 2
-
-If a crash occurs between step 1 and step 2:
-- The metadata says the file is truncated (the freed blocks are no longer in the extent list).
-- The arena free-list still considers those blocks allocated (not freed).
-- On restart, the nodes sees the reduced extent list and the allocated-but-not-referenced blocks.
-- The blocks are wasted (not available for allocation) but no reader can access them — they are not referenced by any inode.
-
-If steps 1 and 2 were reversed (freed before metadata truncated):
-- The blocks are in the arena free-list.
-- Another node allocates those blocks and writes new data.
-- The original file's extent list still references the old blocks.
-- A reader sees the new file's data through the truncated file's extent mapping.
-- This is a data integrity failure: one file reads another file's content.
-
-Meta-then-data truncation is the mirror of data-then-metadata writes. The metadata change (masking the truncation) goes first; the data change (returning blocks to the pool) goes second.
+The extents a truncate changes are only those in arenas this node owns. Extents
+in other nodes' arenas are left for their owners' scrubbers; the new size
+already makes them unreadable, because reads never go past the file size.
 
 ## Recovering Uncommitted Blocks
 
-Blocks reserved for a write that never committed have to become free again, or every crash leaks device space permanently. Nothing records them: the recovery is derived from the metadata that *did* commit.
+Blocks reserved for a write that never committed must become free again, or
+every crash would permanently waste space. Nothing records them. Instead,
+`Reconstruct` runs at startup and rebuilds each arena's bitmap from the extents
+committed in etcd, marking exactly the blocks they refer to. A block that no
+committed extent refers to is free afterwards, whether the crash happened before
+the device write, between the write and the commit, or during the commit.
 
-`Reconstruct` runs at startup and rebuilds each arena's bitmap by scanning the live extents in etcd and marking exactly the blocks they reference. A block reserved but never referenced by a committed extent is therefore free after a restart, whether the crash happened before the device write, between the write and the commit, or during the commit itself.
+A separate write-ahead log of reserved blocks would add a second `fsync` to
+every write, a second record that must agree with etcd, and a file that grows
+without bound, and it would reach the same result as the rebuild.
 
-EtcFS previously carried a local write-ahead log for this, appending an entry per write with an fsync and marking it committed afterwards. It was removed: reconstruction already produces the same outcome from state that has to be correct anyway, and the log added a second fsync to every write, a second source of truth to keep consistent, and a file that grew without bound.
+## Crash Recovery
 
-## Crash Recovery Protocol
+After an unclean shutdown:
 
-The complete crash recovery protocol after an unclean shutdown:
-
-### 1. Metadata Recovery (etcd)
-
-The etcd cluster's own Raft log ensures that any metadata transaction that was committed before the crash is durable. No recovery action is needed for etcd itself — the state is exactly what it was before the crash.
-
-### 2. Arena Reconstruction
-
-`Reconstruct` rebuilds every arena bitmap this node owns from the live extents in etcd. Blocks reserved by a write that never committed, and blocks a truncate removed from the extent list without returning to the free-list, are both free again afterwards — in each case because no committed extent references them.
-
-The `LiveRatio()` function on the allocator reports the fraction of allocated blocks across the arenas this node holds, and answers 0.0 when it holds none.
-
-### 3. Fencing Generation Check
-
-After recovery, the node reads its current fencing generation from etcd. If the generation has been bumped during the crash (because the fencing controller fenced the node), the node must not resume writing until it rejoins the cluster with a fresh membership registration.
-
-### 4. Resume
-
-After all recovery actions are complete, the node re-registers its membership with etcd, acquires new arenas, and resumes serving.
+1. **etcd needs no recovery.** Every transaction committed before the crash is
+   in its Raft log.
+2. **The arena bitmaps are rebuilt.** `Reconstruct` rebuilds the bitmap of every
+   arena this node owns from the extents in etcd. Blocks reserved by a write
+   that never committed, and blocks a truncate removed from the extents before
+   returning them, are both free afterwards.
+3. **The fencing generation is read** from etcd. The node uses this value for
+   every transaction from now on, so if it was fenced while down, it starts
+   with the raised generation.
+4. **The node registers its membership** and starts serving.
 
 ## Extent Lifespan
 
-An extent progresses through four states, corresponding to each step in the ordering protocol:
+An extent goes through four states:
 
-1. **Reserved.** Blocks are allocated in the arena free-list but no data has been written. A crash loses the reservation; the blocks are still free.
-
-2. **Written.** Data is on the block device. The extent is not visible to other nodes (not in etcd). A crash creates an orphan.
-
-3. **Committed.** The extent is in etcd. Other nodes can see and read the extent. A crash is safe — both data and metadata are durable.
-
-4. **Freed.** The extent is removed from etcd (truncation). The blocks are returned to the arena free-list. The data bytes on the block device are overwritten by the next allocation.
-
-### Extent State Machine
+1. **Reserved.** Blocks are marked allocated in the bitmap; nothing is written.
+   A crash loses the reservation, and the blocks are free after restart.
+2. **Written.** The data is on the device, but no extent in etcd refers to it.
+   Other nodes cannot see it. A crash leaves unreferenced bytes, reclaimed at
+   restart.
+3. **Committed.** The extent is in etcd, and any node can read it. A crash loses
+   nothing.
+4. **Freed.** The extent has been removed from etcd (by a truncate, an
+   overwrite or the scrubber) and its blocks returned to the free list. The next
+   allocation may overwrite the bytes.
 
 ```
 Reserved ──(write data)──► Written ──(etcd commit)──► Committed
                                                            │
-                                                      (truncate)
+                                                  (truncate, overwrite,
+                                                    scrubber)
                                                            │
                                                            v
                                                          Freed
 ```
 
-Only the etcd record distinguishes Written from Committed: a block in the Written state is reachable from nothing, which is exactly what makes arena reconstruction able to reclaim it.
+Only the etcd record separates Written from Committed. A block in the Written
+state is referred to by nothing, which is why the rebuild can reclaim it.
 
-An acknowledged write now sits in the Written state for as long as the flush interval, rather than for the length of one transaction: while this node holds the inode's exclusive lock the extent is buffered in memory, and the same reconstruction reclaims it if the node crashes first. Nothing about the ordering changes — the bytes are on the device before anything names them, in both cases — and the buffered extent's blocks are held reserved in the arena until the flush commits, so the allocator cannot hand them out from underneath a record that is about to reference them. See [Consistency and Durability](../consistency/consistency-and-durability-model.md#durability-under-write-delegation).
+With buffered writes, an acknowledged write stays in the Written state (or
+Reserved, if its bytes are buffered too) for up to the flush interval instead
+of for one transaction. The buffered extent's blocks stay marked allocated
+until the flush commits, so the allocator cannot give them to another write in
+the meantime.
 
 ## Multi-Node Implications
 
-The ordering invariants have specific implications in a multi-node cluster:
-
-**A node that crashes mid-write** produces orphaned bytes on the block device. No other node can see those bytes because the extent list was never committed to etcd. The orphans are harmless and reclaimable.
-
-**A node that crashes mid-truncate** produces blocks that are still allocated in the arena free-list but not referenced by any inode. Those blocks are wasted until the next startup rebuilds the bitmap from the committed extents.
-
-**A fenced node that was mid-write** cannot complete its extent commit because the generation guard on the etcd transaction fails. The data bytes are on the block device, orphaned, and the fencing recovery ensures no other node can read them (they are not in any inode's extent list). The scrubber reclaims them after the grace period.
+- **A node that crashes during a write** leaves unreferenced bytes. No other
+  node can see them, because their extent was never committed.
+- **A node that crashes during a truncate** leaves blocks marked allocated in
+  its bitmap but referred to by no extent. They are free after its next
+  restart.
+- **A fenced node in the middle of a write** cannot commit its extent: the
+  generation guard rejects the transaction. Its bytes stay on the device,
+  referred to by no extent, so no other node can read them. If the fence was
+  enforced by the device, the node's arenas go back to the free pool, and the
+  next owner rebuilds their bitmaps from the extents, which also frees these
+  blocks.
