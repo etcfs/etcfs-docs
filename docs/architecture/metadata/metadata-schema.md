@@ -1,6 +1,6 @@
 # Metadata Schema
 
-The EtcFS etcd key schema and the data types that power every namespace and structural operation.
+The etcd keys EtcFS stores, and the format of each value.
 
 ## Table of Contents
 
@@ -11,61 +11,99 @@ The EtcFS etcd key schema and the data types that power every namespace and stru
 
 ## Design
 
-Every mutable structural datum — inode metadata, directory entries, file locks, arena ownership, membership records, and fencing generation counters — lives in etcd as a discrete key-value pair. The shared block device carries only raw byte extents of file content. There is no on-disk filesystem format beyond those extents.
+Every piece of structural state lives in etcd as a separate key: inode metadata, directory entries, locks, arena ownership, membership and fencing generations. The shared block device holds only file content, as raw byte ranges. There is no on-disk filesystem format.
 
-Keys are short, fixed-prefix strings with no structural hierarchy beyond the `/` convention in directory entries. Etcd stores all keys in flat lexicographic order; the separators are a naming convention that enables efficient prefix-range scans for directory listings.
+etcd stores keys in one flat, sorted list. The `/` inside some keys has no meaning to etcd; it is a naming convention that makes "every entry of this directory" a single prefix scan.
 
-All values are encoded as binary blobs. Integer values use big-endian byte order; structured records use a compact fixed-length binary format. The maximum value size is constrained to well under etcd's 1.5 MiB request limit. Extent maps — the largest per-file data — are stored in separate chunked keys per inode to avoid ever approaching that ceiling.
+Values are binary. Integers are 8-byte big-endian, and the inode record is a fixed-length binary struct. etcd rejects requests above 1.5 MiB, so no single value is allowed to grow without bound. The extent map, the largest per-file structure, is therefore split into one key per extent rather than stored as one value.
 
 ## Key Layout
 
 | Key pattern | Value | Purpose |
 |---|---|---|
 | `inode:<ino>` | `InodeRecord` (84 bytes) | File or directory metadata |
-| `dirent:<parent>/<name>` | `<ino>` (8 bytes) | Directory entry resolving a name to an inode |
+| `symlink:<ino>` | target path (bytes) | The target of a symbolic link |
+| `dirent:<parent>/<name>` | `<ino>` (8 bytes) | Directory entry: maps a name to an inode |
 | `xattr:<ino>/<name>` | attribute value (opaque bytes) | One extended attribute of an inode |
 | `quota:<ino>` | `QuotaRecord` (JSON) | Byte and inode limits on a directory that is a quota root |
 | `lock:<ino>/<mode>/<holder>` | holder's node ID | One holder of an inode's lock, written under that node's session lease |
-| `lock_want:<ino>/<node_id>` | requesting node's ID | A peer asking the holder of a cached lock to yield it; outside `lock:` so it cannot block the acquisition it exists to unblock |
+| `lock_want:<ino>/<node_id>` | requesting node's ID | A request from a peer for the holder to give up a cached lock |
 | `arena:<node_id>/<arena_id>` | `<arena_id>` (8 bytes) | One arena a node currently owns |
 | `arena_alloc_log` | counter (8 bytes) | Global arena-ID allocation counter |
-| `membership:<node_id>` | membership metadata | Lease-backed liveness key for cluster membership |
-| `gen:<node_id>` | generation counter | Fencing epoch counter, bumped on confirmed fence |
-| `departed:<node_id>` | RFC3339 timestamp | Written atomically with the membership key's deletion; marks a departure as intentional so peers skip fencing |
-| `inode_alloc_counter` | counter (8 bytes) | Next inode number to hand out; a node CASes it forward by a whole block and allocates from that block in memory |
-| `extent:<ino>/<chunk>` | five comma-separated integers (ASCII) | One extent: a logical byte range of a file mapped onto the shared device |
+| `free_arena:<arena_id>` | `free` | An arena with no owner, which any node may claim |
+| `orphan:<node_id>/<ino>` | empty | A file whose last name is gone but which this node still has open, so it is not deleted yet |
+| `membership:<node_id>` | membership metadata | Lease-backed liveness key |
+| `gen:<node_id>` | generation counter | Fencing generation, raised when a fence is confirmed |
+| `departed:<node_id>` | RFC3339 timestamp | Marks a departure as intentional, so peers do not fence the node |
+| `fence_pending:<node_id>` | instance ID | A fence that has been started but not completed; the controller retries it |
+| `fence_claim:<node_id>` | fencing node's ID (lease-bound) | Which surviving node is carrying out the fence, so only one does |
+| `fence_done:<node_id>` | generation | The node has been fenced since it last registered |
+| `inode_alloc_counter` | counter (8 bytes) | Next free inode number; nodes reserve numbers from it in blocks |
+| `extent:<ino>/<chunk>` | five comma-separated integers and a node ID (ASCII) | One extent: a byte range of a file mapped onto the shared device |
 
-### Key semantics
+`lock_want:` is outside the `lock:` prefix on purpose. A lock acquisition checks that nothing exists under `lock:<ino>/`, so a request stored there would block the acquisition it is asking for.
 
-**Inode keys** are the canonical record of a file or directory. The key is derived solely from the inode number, with no parent information — a file can have multiple hard links pointing to the same inode key from different directory-entry keys.
+### Inode keys
 
-**Directory-entry keys** encode a parent inode and a child name separated by `/`. A directory listing is a prefix scan over `dirent:<parent>/`, which etcd serves in lexicographic order. Each value is simply the target inode number as a big-endian 64-bit integer.
+`inode:<ino>` is the record of one file or directory. The key contains only the inode number, not the parent directory. That is what allows hard links: several directory entries, in different directories, can point at the same inode key.
 
-**Extended-attribute keys** deliberately mirror directory-entry keys, and for the same reason: one key per attribute makes a single attribute readable, writable and removable on its own, and makes "every attribute of this inode" a prefix scan over `xattr:<ino>/`. A single packed value per inode would turn every `setxattr` into a read-modify-write of the whole set, which is both slower and a lost-update race between two nodes setting different attributes at once.
+### Directory-entry keys
 
-Attributes are owned outright by the inode, so removing an inode deletes them in the same transaction, via a range delete over the prefix. That matters beyond leaked keys: inode numbers are reused, and a surviving attribute would be inherited by whatever file next took the number. An inode that still has other hard links keeps its attributes, since they belong to the inode rather than to the name being removed.
+`dirent:<parent>/<name>` maps a name inside directory `<parent>` to an inode number, stored as an 8-byte big-endian integer. Listing a directory is a prefix scan over `dirent:<parent>/`, which etcd returns in sorted order.
 
-Name and value sizes are bounded at the kernel's own `XATTR_NAME_MAX` (255) and `XATTR_SIZE_MAX` (65536). The bound is enforced in the metadata store rather than only in the FUSE layer because it is etcd being protected — an attribute is a Raft-replicated value, and an unbounded one is a route into the store quota. Names containing `/` or NUL are rejected: the first would move the key's split point, the second would end the name early in the NUL-separated `listxattr` buffer, and either lets a caller address an attribute other than the one it named. The `trusted.*` namespace is writable only by uid 0, matching the kernel; `security.*` is left writable so SELinux and IMA labels work, with the contents policed by the LSM hooks that own them.
+### Extended-attribute keys
 
-One name is an action rather than an attribute and is never stored: setting `user.etcfs.publish` on a file publishes the writing node's buffered data and yields the file's cached lock, handing it to whichever node reads it next. See [Explicit Publish](lock-caching.md#explicit-publish).
+Each extended attribute is its own key, `xattr:<ino>/<name>`, for the same reason directory entries are:
 
-**Quota keys** mark a directory as the root of a subtree with byte and inode limits; a zero limit in either dimension means unlimited. Usage is computed by walking the namespace from each root, because an inode records no parent — building the parent index from directory entries is the only way to know which subtree a file is in, the same walk a directory rename already does to check for cycles.
+- one attribute can be read, written or removed without touching the others;
+- listing all of an inode's attributes is a prefix scan over `xattr:<ino>/`.
 
-That walk is why accounting is periodic rather than transactional, and the consequence is deliberate: **these are soft quotas.** Charging a write to its subtree as it happened would need the enclosing root known on the write path, which means either a parent pointer on every inode — a second source of truth to keep consistent — or a counter update inside the transaction that publishes the write. The write path is already bound by the number of Raft round trips it makes, so adding one more to every write is the wrong trade for a limit that is policy rather than a correctness invariant. `etcfsctl quota` reports usage and flags a root that is over; nothing rejects a write. A file hard-linked into two quota roots is charged to both, which is what every filesystem with subtree quotas does — the alternative, charging whichever root a walk reached first, would make the answer depend on iteration order.
+Storing all attributes in one value would turn every `setxattr` into a read-modify-write of the whole set. Two nodes setting different attributes at the same time would then overwrite each other's change.
 
-**Lock keys** are one per holder, not one per inode. The mode is part of the key and the value is just the holder's node ID. Each key carries its holder's own etcd lease, so a holder that stops heartbeating is dropped automatically — and dropping one holder cannot disturb the others, which is what allows a shared lock to have several at once.
+Attributes belong to the inode, not to a name. Removing the last link to an inode deletes its attributes in the same transaction, with a range delete over the prefix. This matters because inode numbers are reused: a leftover attribute would otherwise appear on the next file that receives the number. Removing one link of several leaves the attributes in place.
 
-**Arena keys** own a contiguous 1 GiB range on the shared block device. Each node acquires arenas from a global free pool controlled by the `arena_alloc_log` counter. The key name includes the node ID to guarantee exclusive ownership.
+Limits on attributes:
 
-**Membership keys** are lease-backed liveness records. The presence of `membership:<node>` signals the node is alive and participating. Expiry of the backing lease triggers the fencing controller.
+- **Size.** Names are limited to 255 bytes and values to 65,536 bytes, the kernel's `XATTR_NAME_MAX` and `XATTR_SIZE_MAX`. The metadata store enforces this itself, not only the FUSE layer, because every attribute is a Raft-replicated value and an unbounded one would fill etcd's storage quota.
+- **Characters.** Names containing `/` or NUL are rejected. A `/` would change where the key splits into inode and name, and a NUL would end the name early in the NUL-separated `listxattr` buffer. Either would let a caller read or write an attribute other than the one it named.
+- **Namespaces.** `trusted.*` attributes can be written only by uid 0, as in the kernel. `security.*` attributes stay writable so that SELinux and IMA labels work; the kernel's security modules control their contents.
 
-**Departure keys** exist because that trigger cannot tell an intentional shutdown from a crash — etcd reports an explicit `Revoke` and a lease timeout as the same delete event. A node that is shutting down cleanly writes `departed:<node>` in the same transaction that removes its membership key, and its peers skip the fence. The transaction is conditioned on the membership key still existing, so a node whose lease has already expired cannot write one; it is dropped when the node registers again.
+**`user.etcfs.publish` is a command, not an attribute.** It is never stored. Setting it on a file makes the writing node publish its buffered writes for that file to etcd and then give up its cached lock on the file. The next node to read the file gets the lock and sees the new data immediately, instead of waiting for the writer's next periodic flush. See [Explicit Publish](lock-caching.md#explicit-publish).
 
-**Generation keys** are the fencing epoch counter. The fencing controller bumps this value via a CAS transaction after confirming a node has been successfully fenced. Every metadata mutation that modifies extents checks this generation before committing.
+### Quota keys
+
+`quota:<ino>` makes a directory a quota root, with a limit on bytes and a limit on inodes for everything below it. A limit of zero means no limit.
+
+An inode does not record which directory it is in. To find which quota root a file belongs to, the usage calculation walks the directory tree down from each root. Directory rename uses the same walk to check that a directory is not moved inside itself.
+
+Because the walk is periodic, **these are soft quotas**: `etcfsctl quota` reports usage and flags a root that is over its limit, but no write is rejected. Enforcing the limit on every write would need the enclosing quota root known at write time. That requires either a parent pointer on every inode, which is a second record to keep consistent, or a counter update in the transaction that publishes each write, which adds a Raft round trip to every write. Writes are already bounded by their round trips, and a quota is a policy rather than a safety property, so neither cost is taken.
+
+A file hard-linked into two quota roots counts against both. Charging only the root the walk reached first would make the result depend on the order of the walk.
+
+### Lock keys
+
+There is one lock key per holder, not one per inode. The mode (shared or exclusive) is part of the key, and the value is the holder's node ID. Each key is attached to its holder's own etcd lease. If a holder stops renewing its lease, etcd deletes that holder's key and leaves the other holders' keys alone, which is what lets a shared lock have several holders at once.
+
+### Arena keys
+
+An arena is a contiguous 1 GiB range of the shared device that one node allocates blocks from. `arena:<node_id>/<arena_id>` records that the node owns that arena; the node ID in the key makes ownership exclusive. New arena IDs come from the global `arena_alloc_log` counter.
+
+### Membership and departure keys
+
+`membership:<node>` exists while the node is alive. It is attached to a lease, and when the lease expires, etcd deletes the key and the fencing controller fences the node.
+
+etcd reports a deliberate lease revoke and a lease timeout as the same delete event, so the controller cannot tell a clean shutdown from a crash by the delete alone. A node that shuts down cleanly therefore writes `departed:<node>` in the same transaction that deletes its membership key, and its peers skip the fence. That transaction only succeeds while the membership key still exists, so a node whose lease has already expired cannot mark itself departed. The departure key is deleted when the node registers again.
+
+### Generation keys
+
+`gen:<node>` is the node's fencing generation. The fencing controller raises it with a compare-and-swap transaction after it has confirmed that the node is fenced. Every transaction that changes extents checks the writer's generation, so a fenced node's late writes are rejected.
 
 ### Reserved inode numbers
 
-Inode `0` is never valid — `DecodeUint64` returns `0` for a missing or malformed key, so `0` doubles as an implicit "not found" sentinel and must never be assigned to a real file. Inode `1` is `FUSE_ROOT_ID`, the root directory: the C daemon answers `getattr`/`lookup` for it locally, and `seed-etcd` writes the root directory record directly to `inode:1` before any node starts. The inode allocator (`metadata.FirstUsableIno`) therefore starts handing out numbers at `2`. Handing out `1` to a regular file overwrites the root inode record and makes every subsequent operation on the mount fail — this happened in practice (see the chaos test report) before the allocator's start value was corrected.
+- **Inode 0** is never assigned. `DecodeUint64` returns 0 for a missing or malformed value, so 0 means "not found".
+- **Inode 1** is the root directory (`FUSE_ROOT_ID`). `seed-etcd` writes its record to `inode:1` before any node starts, and the C daemon answers `getattr` and `lookup` for it locally.
+
+The inode allocator therefore starts at 2 (`metadata.FirstUsableIno`). Giving inode 1 to a regular file would overwrite the root directory's record, and every later operation on the mount would fail.
 
 ## Data Types
 
@@ -91,31 +129,35 @@ The fixed-length binary record stored at each `inode:<ino>` key, totalling 84 by
 | 76 | 4 | `Mtime` nanoseconds | Sub-second part of the modification time |
 | 80 | 4 | `Ctime` nanoseconds | Sub-second part of the status-change time |
 
-The three nanosecond fields are appended rather than folded into the timestamps, so a record written before they existed still decodes: it is 72 bytes long and its sub-second parts read as the zero it stored.
+The three nanosecond fields come after the whole-second timestamps instead of being merged into them. A 72-byte record without them therefore still decodes, with sub-second parts of zero.
 
-The extent list is **_not_** embedded in the inode record. Extents are stored in separate keys (`extent:<ino>/<chunk>`) to keep the inode value small and to allow extent maps to grow beyond the 1.5 MiB etcd value limit without splitting the inode record itself.
+The extent list is not part of the inode record. Each extent is its own key (`extent:<ino>/<chunk>`), so the inode value stays small and a file's extent map can grow past etcd's 1.5 MiB request limit.
 
-The `Nlink` field tracks the number of directory entries pointing to this inode. When `Nlink` reaches zero, the inode is eligible for deletion. A directory is the exception: its count is its own `.` plus the `..` of every subdirectory it holds, so it is 2 for an empty directory and rises with each subdirectory. `mkdir`, `rmdir` and a directory `rename` therefore adjust the parent's count in the same transaction that changes the entry, pinned to the revision it was read at.
+`Nlink` counts the directory entries that point to the inode. When it reaches zero, the inode can be deleted.
 
-Every inode is created with the count its first entry implies: 1 for a regular file, symlink, device node or FIFO, and 2 for a directory, which is reached both through its parent's entry and through its own `.`. `metadata.InitialNlink` is the single definition of that rule.
+Directories count differently. A directory's `Nlink` is 2 when empty (its entry in the parent plus its own `.`) and goes up by one for each subdirectory, whose `..` points back to it. `mkdir`, `rmdir` and a directory `rename` therefore update the parent's count in the same transaction as the entry, conditioned on the parent not having changed since it was read.
 
-The fsck and scrubber checks expect 2 plus the number of subdirectories for a directory and compare against the real dirent count for everything else. A filesystem written before directory counts were maintained still holds directories at 2; both checks report that drift and neither repairs it. The mount's root is answered locally by the C daemon with a fixed nlink of 2, whatever it holds.
+A new inode starts with 1 for a regular file, symlink, device node or FIFO, and 2 for a directory. `metadata.InitialNlink` defines this.
+
+`fsck` and the scrubber expect a directory's count to be 2 plus its number of subdirectories, and any other inode's count to equal its number of directory entries. They report a mismatch but do not repair it. The mount's root always reports 2, because the C daemon answers for it locally.
 
 ### Extent
 
-Unlike the other records, an extent's value is ASCII: five comma-separated decimal integers followed by the writer's node ID, at `extent:<ino>/<chunk>`.
+An extent's value is ASCII, unlike the other records: five comma-separated decimal integers followed by the writer's node ID.
 
 ```
 <logical_off>,<disk_off>,<length>,<generation>,<sequence>,<node>
 ```
 
-`generation` is the writer's fencing generation at commit time and `node` is the writer. Both are needed together: a generation is per-node, so the scrubber cannot compare a stamp against anything without knowing whose it is. The node ID is the whole remainder of the value, so one containing a comma still round-trips.
+- `generation` and `node` record which node wrote the extent and that node's fencing generation at the time. Generations are counted per node, so the scrubber needs both to check an extent: a generation alone does not say whose it is. The node ID is everything after the fifth comma, so a node ID containing a comma still parses.
+- `sequence` orders writes to the same bytes. A write never overwrites blocks in place; it allocates new blocks and adds a new extent. Two extents can therefore cover the same range, and a read uses the one with the higher sequence.
+- The chunk number in the key only makes the key unique within the inode. It says nothing about which extent is newer.
 
-`sequence` orders writes to the same logical bytes. A write is never an in-place update — it allocates fresh blocks and appends an extent — so two extents can cover one range, and the higher sequence is the later write and the one a read resolves to. The chunk number in the key makes the key unique within the inode and nothing more.
+Recency is stored in the value, not the key, because extents get split. When a newer write covers the middle of an older extent, the older extent is trimmed to the two pieces still visible, and each piece is stored as a new record. Both pieces must keep the older extent's sequence.
 
-Keeping recency in the value rather than the key is what allows an extent to be split. Trimming an overwritten extent down to the pieces still readable can leave two records, and both must remain exactly as old as the extent they were cut from; a second key would instead assert the piece is newer, and it would then win over a newer extent overlapping it.
+For example, extent A covers bytes 0–100 with sequence 5, and write B covers bytes 40–60 with sequence 7. A is trimmed to 0–40 and 60–100, both still sequence 5, and a read of byte 50 returns B. If the pieces were ranked by a new key instead, they would look newer than B and hide it.
 
-All six fields are required. EtcFS is pre-deployment, so the decoder rejects earlier forms outright rather than carrying a compatibility path for records nothing has written.
+The decoder requires all six fields and rejects a value with fewer.
 
 ### LockRecord
 
@@ -130,9 +172,9 @@ When a holder's lease expires (node crash, network partition beyond TTL margin),
 
 ### Arena ownership record
 
-Stored at `arena:<node_id>/<arena_id>`, one key per arena a node owns — not one key per node, since a node acquires a further arena whenever its current ones fill up. The value is the arena ID itself, 8-byte big-endian; `DiskStart`/`DiskEnd` are derived (`ID * ArenaSizeBytes`, `(ID+1) * ArenaSizeBytes`), not stored.
+Stored at `arena:<node_id>/<arena_id>`, one key per arena. A node can own several, because it claims another arena whenever its current ones are full. The value is the arena ID as an 8-byte big-endian integer. The arena's position on the device is computed from the ID (it starts at `ID * ArenaSizeBytes`), not stored.
 
-Each arena is 1 GiB (2^30 bytes) divided into 4 KiB blocks, yielding 262,144 blocks per arena. The allocator tracks free/allocated blocks via an in-memory bitmap local to the node, rebuilt on restart from the live `extent:` keys — see [Arena Allocator § Crash Recovery Integration](../storage/arena-allocator.md#crash-recovery-integration). Nothing about block-level free/allocated state is persisted; only arena ownership is.
+Each arena is 1 GiB, divided into 262,144 blocks of 4 KiB. Which blocks are free is tracked only in memory, in a bitmap on the owning node. etcd stores which node owns each arena, but not which blocks are in use. On restart the node rebuilds the bitmap from its live `extent:` keys; see [Arena Allocator § Crash Recovery Integration](../storage/arena-allocator.md#crash-recovery-integration).
 
 ### MembershipRecord
 
@@ -145,11 +187,11 @@ Stored at `membership:<node_id>`, a lease-backed liveness beacon.
 | `JoinedAt` | `time` | Timestamp when the node joined |
 | `Address` | `string` | Network address for diagnostics |
 
-The key is created with an etcd lease of configurable TTL (default 5 seconds). The daemon maintains a keepalive stream on this lease. If the stream breaks and cannot be re-established within the self-fencing margin, the node self-fences.
+The key is attached to an etcd lease whose TTL is set by `--lease-ttl` (default 10 s). The daemon renews the lease continuously. If it cannot renew it for twice the TTL, the node fences itself.
 
 ## Key Helpers
 
-Each key family has a constructor function that builds the etcd key string from its components. These ensure consistent formatting across all code paths.
+Each key family has a constructor that builds the key string, so every code path formats keys the same way.
 
 - `InodeKey(ino)` — produces `"inode:<ino>"`
 - `DirentKey(parent, name)` — produces `"dirent:<parent>/<name>"`
@@ -161,4 +203,4 @@ Each key family has a constructor function that builds the etcd key string from 
 - `MembershipKey(nodeID)` — produces `"membership:<nodeID>"`
 - `GenKey(nodeID)` — produces `"gen:<nodeID>"`
 
-All 64-bit integer values stored in etcd use `EncodeUint64` / `DecodeUint64`, which produce and consume 8-byte big-endian byte slices. This is used for inode numbers in dirent values, arena counter values, and allocator counters.
+All 64-bit integers stored in etcd (inode numbers in directory entries, arena IDs and counters) go through `EncodeUint64` and `DecodeUint64`, as 8-byte big-endian values.

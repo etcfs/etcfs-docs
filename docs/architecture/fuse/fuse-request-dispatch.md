@@ -1,40 +1,54 @@
 # FUSE Request Dispatch
 
-The synchronous IPC model used by every FUSE operation handler: how the C daemon sends a request to the Go backend, waits for the response, and calls `fuse_reply_*` — all on the same FUSE reader thread.
+How a request from the kernel is handled inside `etcfuse`: the handler sends it
+to `etcfuse-meta`, waits for the reply, and answers the kernel, all on one
+worker thread. The wire format and the opcode list are on
+[FUSE Daemon Architecture](fuse-architecture.md#ipc-binary-protocol).
 
 ## Table of Contents
 
 - [Dispatch Model](#dispatch-model)
 - [Request Lifecycle](#request-lifecycle)
-- [Wire Format](#wire-format)
+- [Backend Dispatch](#backend-dispatch)
+- [Payload Formats](#payload-formats)
 - [Socket I/O](#socket-io)
 - [Error Handling](#error-handling)
 
 ## Dispatch Model
 
-The FUSE daemon uses a multi-threaded event loop (`fuse_session_loop_mt`). Kernel upcalls are processed concurrently, one handler per worker thread. The handler:
+`etcfuse` runs libfuse's multi-threaded loop (`fuse_session_loop_mt`), so
+several kernel requests are handled at once, each on its own worker thread. A
+handler:
 
-1. Builds the request payload as a binary buffer.
-2. Sends the payload over the Unix socket to the Go backend.
-3. Blocks on `read()` until the response arrives.
-4. Parses the response.
-5. Calls `fuse_reply_*` on the same thread.
+1. builds the request payload;
+2. sends it to `etcfuse-meta` over the Unix socket;
+3. blocks in `read()` until the reply arrives;
+4. parses the reply;
+5. calls `fuse_reply_*` on the same thread.
 
-There is no IPC worker thread, no request queue, no callback indirection. Each worker thread owns its own socket to the backend, opened on that thread's first request and reused for every later one, so the exchange stays synchronous without a socket ever being shared. That is what removes the need for a response demultiplexer: a reply is still simply the next thing to arrive on the connection that sent the request.
+There is no separate IPC thread, request queue or callback. Each worker thread
+has its own connection to `etcfuse-meta`, opened on the thread's first request
+and reused afterwards. Because no connection is shared, the reply to a request
+is simply the next frame on that connection, and no request IDs are needed to
+match replies to requests.
 
 ## Request Lifecycle
 
-### 1. FUSE handler is invoked
+### 1. The kernel calls a handler
 
-The kernel dispatches a VFS operation to the daemon. One of the registered handlers (e.g., `ec_lookup`) is called on the FUSE event loop thread. The handler has access to the `fuse_req_t` handle, the operation parameters, and the `etcfuse_context` (which holds the Unix socket fd).
+The kernel sends a request, and libfuse calls the registered handler, for
+example `ec_lookup`, on a worker thread. The handler receives the `fuse_req_t`
+handle and the operation's arguments.
 
-### 2. Handler builds a payload
+### 2. The handler builds a payload
 
-The handler serialises the operation parameters into a binary buffer. For LOOKUP, this is 12 + name_length bytes: a uint64 parent inode, a uint32 name length, and the name bytes.
+It writes the arguments into a binary buffer. For LOOKUP that is 12 bytes plus
+the name: the parent inode as a `u64`, the name length as a `u32`, and the
+name.
 
-### 3. Handler sends request and blocks
+### 3. The handler sends the request and waits
 
-The handler calls the `ipc_sync()` function:
+It calls `ipc_sync()`:
 
 ```
 ipc_sync(fd, opcode, payload, plen, &resp, &rlen):
@@ -45,141 +59,162 @@ ipc_sync(fd, opcode, payload, plen, &resp, &rlen):
   return 0 on success
 ```
 
-The handler blocks inside `recv_full()` until the Go backend has processed the request and sent the response. Only that request waits: other FUSE workers continue serving on their own connections, so one slow etcd operation no longer stalls the mount. A typical metadata operation completes in 5–20 ms (etcd round-trip).
+The thread blocks in `recv_full()` until `etcfuse-meta` replies. A metadata
+operation usually takes 5–20 ms, one etcd round trip. Other worker threads keep
+serving requests on their own connections meanwhile, so one slow etcd request
+delays only the call that made it.
 
-A connection is never shared between threads. The protocol carries no request identifiers — a reply is whatever arrives next on the socket — so two threads on one descriptor would interleave their frames and read each other's replies, which is protocol corruption rather than a mere race. `etcfs_ipc_fd()` keeps each thread's connection in thread-local storage and connects on first use; the Go side already serves one goroutine per connection, so N workers become N goroutines with no change on that side. The loop also enables `clone_fd`, giving each worker its own `/dev/fuse` descriptor so the kernel request queue does not become the next serialisation point.
+Sharing a connection between threads would break the protocol, not just slow it
+down. Replies carry no request ID, so two threads on one connection would
+interleave their frames and each could read the other's reply.
+`etcfs_ipc_fd()` therefore keeps each thread's connection in thread-local
+storage and opens it on first use. `etcfuse-meta` serves each connection in its
+own goroutine, so N worker threads become N goroutines.
 
-A response length is bounded before it is allocated, on both sides of the socket: the Go daemon refuses a request frame above 1 MiB and the C daemon refuses a response above the same cap, rather than allocating whatever the length field claims.
+The loop also sets `clone_fd`, which gives each worker its own `/dev/fuse`
+descriptor, so reading requests from the kernel is not shared between threads
+either.
 
-### 4. Response is parsed directly
+Frame sizes are checked before any memory is allocated. `etcfuse-meta` rejects a
+request frame larger than 1 MiB plus a 28-byte header (the largest write), and
+`etcfuse` rejects a reply over the same limit, instead of allocating whatever
+size the length field claims.
 
-The handler parses the response buffer inline (no callback). The first 4 bytes are always an int32 error code:
+### 4. The handler parses the reply
 
-- If non-zero, the handler calls `fuse_reply_err(req, -error)` and returns.
-- If zero, the handler parses the operation-specific response fields (attr, entry, direntries, etc.) and calls the appropriate `fuse_reply_*`.
+The first 4 bytes of every reply are a signed error code:
 
-### 5. fuse_reply_* is called on the same thread
+- if non-zero, the handler calls `fuse_reply_err(req, -error)` and returns;
+- if zero, it reads the operation's fields (attributes, entry, directory
+  entries) and calls the matching `fuse_reply_*`.
 
-All `fuse_reply_entry`, `fuse_reply_create`, `fuse_reply_write`, etc. calls happen on the FUSE event loop thread — the same thread that received the kernel upcall. This avoids any threading issues with `/dev/fuse` fd ownership: the reply is always on the correct thread.
+### 5. The handler answers the kernel on the same thread
 
-## Wire Format
+Every `fuse_reply_*` call is made by the thread that received the request, so
+the reply goes back through the `/dev/fuse` descriptor the request came from.
 
-All messages are length-prefixed binary frames over the Unix stream socket:
+## Backend Dispatch
 
-**Request:** `[u16:be opcode] [u32:be payload_len] [payload]`
-**Response:** `[u32:be payload_len] [payload]`
+In `etcfuse-meta`, the opcode is looked up in the `ops` table in
+`internal/ipc/socket.go`. Each entry holds the handler and the name used in that
+operation's metrics and logs. An opcode with no entry is answered with
+`ENOSYS`. Adding an operation is one new table entry, not separate edits to a
+switch statement, a list of metric labels and a default branch.
 
-Both sides use consistent byte order (big-endian). The opcode identifies the FUSE operation being performed. The payload is operation-specific — for LOOKUP it contains the parent inode and name; for GETATTR just the inode number.
+Some work is done once, in the dispatch layer, for every operation:
 
-### Operation Codes
+- the request deadline;
+- recovery from a panic, so one bad request does not crash the daemon and
+  every mount it serves;
+- the operation counters and latency histogram;
+- the record written to the history log.
 
-| Code | Operation | Reply function |
-|---|---|---|
-| 1 | LOOKUP | `fuse_reply_entry` |
-| 2 | GETATTR | `fuse_reply_attr` |
-| 3 | READDIR | `fuse_reply_buf` (dirent entries) |
-| 4 | READLINK | `fuse_reply_readlink` |
-| 5 | CREATE | `fuse_reply_create` (new file + open) |
-| 6 | MKDIR | `fuse_reply_entry` (new directory) |
-| 7 | UNLINK | `fuse_reply_err` |
-| 8 | RMDIR | `fuse_reply_err` |
-| 9 | RENAME | `fuse_reply_err` |
-| 10 | SYMLINK | `fuse_reply_entry` |
-| 11 | LINK | `fuse_reply_entry` |
-| 12 | SETATTR | `fuse_reply_attr` |
-| 13 | OPEN | `fuse_reply_open` |
-| 14 | RELEASE | `fuse_reply_err` |
-| 15 | OPENDIR | `fuse_reply_open` |
-| 16 | RELEASEDIR | `fuse_reply_err` |
-| 17 | STATFS | `fuse_reply_statfs` |
-| 22 | READ | `fuse_reply_buf` |
-| 23 | WRITE | `fuse_reply_write` |
-| 24 | FSYNC | `fuse_reply_err` |
-| 25 | MKNOD | `fuse_reply_entry` |
-| 26 | FLUSH | `fuse_reply_err` |
-| 29 | READDIRPLUS | `fuse_reply_buf` (dirent + attr entries) |
+The handlers are methods on one `Service`, but most of the state they use is in
+separate objects, each with its own mutex:
 
-Codes 18 and 19 (ALLOC, COMMIT) are answered `ENOSYS`: block allocation happens
-inside the WRITE handler rather than as a request of its own. Codes 27 and 28
-were GETLK and SETLK, removed so the kernel handles `fcntl()` locks locally;
-they are deliberately not reused, so an old C daemon's lock request fails
-loudly instead of being served as something else.
+- `lockMap`: which inodes this node has a cached lock entry for, and which to
+  evict;
+- `recallSet`: lock recalls already in progress;
+- `openFiles`: this node's open-descriptor counts, and the inodes to delete
+  when their last descriptor closes;
+- `writeOp`: one write's reserved blocks, planned metadata and proposed
+  transaction.
 
-### Backend Dispatch
+Each mutex therefore protects one object's state, and there is no question of
+which of several mutexes on one struct guards which field.
 
-On the Go side the opcode is looked up in a table (`ops` in
-`internal/ipc/socket.go`), one entry per operation, carrying the handler and
-the name the operation's metrics and logs use. An opcode with no entry is
-`ENOSYS` by construction, so adding an operation is one new entry rather than
-edits spread across a dispatch switch, a metrics label list, and a default
-branch that has to stay correct.
+Settings fixed for the daemon's lifetime (flush interval, cache settings,
+read-only mode, block device, history recorder) are passed to `NewService` as
+`Options`. If they were set afterwards with setters, nothing would guarantee
+they were set before the socket started accepting requests, and they would stay
+changeable while the daemon runs.
 
-The dispatch layer is also where the cross-cutting concerns live, each applied
-once for every operation rather than per handler: the request deadline, the
-panic barrier that keeps one bad request from ending every mount the daemon
-serves, the operation counters and latency histogram, and the history record
-every operation is written to.
+Handlers do not declare how long their payload should be. Each one decodes with
+a bounded reader that refuses to read past the end of the payload, and the
+handler then replies `EINVAL`. A declared length per operation would be a
+second description of the same format, which could disagree with the decoder.
 
-The handlers hang off one `Service`, but its state does not all live there.
-What the daemon holds while serving is split into collaborators the handlers
-reach through: `lockMap` (which inode has which cached lock entry, and which to
-evict), `recallSet` (the recalls already in flight), `openFiles` (this node's
-open descriptor counts and the inodes it has to delete when the last one
-closes), and `writeOp` (one write's reserved blocks, planned metadata and
-proposal). Each owns its own mutex, so what a lock protects is a property of the
-thing rather than a matter of remembering which of several mutexes on one struct
-covers which field.
+## Payload Formats
 
-Everything decided once — the flush interval, the two caches, read-only mode,
-the block device, the history recorder — is passed to `NewService` as `Options`
-rather than set afterwards. As setters, nothing made them run before the socket
-started accepting, and each stayed writable for the process's lifetime.
-
-Payload bounds are not declared in the table. Every handler decodes through the
-bounded reader in the same file, which refuses to read past the payload it was
-given and leaves the handler to reply `EINVAL`; a declared arity would be a
-second copy of that fact, one that could disagree with the decoder.
-
-### Payload Formats
-
-Each operation has a fixed binary payload format on the wire. For example, a LOOKUP request:
+Each operation has a fixed binary layout. A LOOKUP request:
 
 ```
 [u64:parent_ino] [u32:name_length] [name_bytes...]
 ```
 
-And the corresponding response — the *entry response*, shared by LOOKUP, MKDIR, MKNOD, SYMLINK and LINK, since all of them answer with a newly resolved inode. CREATE answers with the same layout plus a trailing `[u32:keep_cache]`, because it opens the file it created:
+LOOKUP, MKDIR, MKNOD, SYMLINK and LINK all answer with an inode, so they share one reply layout, the *entry response*. CREATE uses the same layout followed by a `[u32:keep_cache]`, because it also opens the file:
 
 ```
-[i32:error] [u64:ino] [attr: 72 bytes] [u32:entry_timeout] [u32:attr_timeout]
+[i32:error] [u64:ino] [attr: 84 bytes] [u32:entry_timeout] [u32:attr_timeout]
 ```
 
-The `attr` field is a compact binary representation of the inode metadata: inode number, size, blocks, timestamps (seconds + nanoseconds), mode, nlink, uid, gid, rdev, and blksize — 72 bytes total, mirroring the `InodeRecord` layout in the metadata store but with nanoseconds split out for kernel compatibility. `entry_timeout` is how long the kernel may cache the name-to-inode mapping; `attr_timeout` how long it may cache the attributes.
+- `attr` is 84 bytes of inode metadata, in this order: inode number, size,
+  blocks, and the access, modification and change times in seconds (six
+  `u64`s); then the three nanosecond parts, mode, nlink, uid, gid, rdev and
+  blksize (nine `u32`s).
+- `entry_timeout` is how long the kernel may cache the name-to-inode mapping.
+- `attr_timeout` is how long it may cache the attributes.
 
-A LOOKUP for a name that is not there uses this same layout with `error = 0` and `ino = 0`: a *negative entry*, which is how FUSE spells an absence the kernel is allowed to remember for `entry_timeout`. The attr block is zeroed and `attr_timeout` is zero, since there is no inode for either to describe; the block is still written in full, because the reply is fixed-width and a short one would desynchronise the C parser. A LOOKUP that failed rather than resolved still answers with an errno, which caches nothing.
+**A name that does not exist** is answered with the same layout, `error = 0` and
+`ino = 0`. FUSE calls this a *negative entry*: the kernel remembers that the name
+is absent for `entry_timeout`. The `attr` block and `attr_timeout` are zero,
+because there is no inode. The block is still sent in full, because the C
+parser expects a fixed-width reply and a shorter one would make it misread the
+next reply. A LOOKUP that fails, rather than finding nothing, answers with an
+`errno`, and the kernel caches nothing.
 
-This layout is written in exactly two places — `buf.wAttr` on the Go side and `rb_attr` in `pkg/fuse/ops.c` — and it is described here and referenced elsewhere rather than transcribed, because three copies of a byte layout is three things to update when a field moves.
+The layout is encoded in two places only: `buf.wAttr` in Go and `rb_attr` in
+`pkg/fuse/ops.c`. Other pages link here instead of repeating it.
 
-Every fixed-width reply is pinned from both sides: `TestFixedWidthRepliesMatchTheCDaemon` measures what the daemon writes, and `test_fixed_reply_widths_match_the_daemon` in `test/c/test_ops.c` asserts what the C parser consumes, both against the same absolute byte counts. The two encoders never meet except at run time, so a field added on one side alone would otherwise show up as a parser reading the next reply's bytes rather than as a failure. Variable-length replies (READ, READDIR, READDIRPLUS, READLINK, the xattr pair) are excluded on purpose: their length rides in the frame and the reader is bounded, so a mismatch is a short read rather than a desynchronised stream.
+**Fixed-width replies are tested from both sides** against the same byte
+counts: `TestFixedWidthRepliesMatchTheCDaemon` checks what the Go daemon writes,
+and `test_fixed_reply_widths_match_the_daemon` in `test/c/test_ops.c` checks
+what the C parser reads. The two encoders only meet at run time, so without
+these tests a field added on one side would show up as the C parser reading the
+next reply's bytes. Variable-length replies (READ, READDIR, READDIRPLUS,
+READLINK, GETXATTR, LISTXATTR) are not included: their length is in the frame
+header and the reader is bounded, so a mismatch produces a short read rather
+than a misaligned stream.
 
-On the C side each handler's exchange goes through `ipc_call`, which sends the request, answers `EIO` if the socket failed, and answers the daemon's errno if it returned one — the three blocks that used to open all twenty-odd handlers, each one a chance to leak the response buffer on one path or reply twice on another. Handlers whose reply is nothing but an errno use `ipc_reply_status`, which is the whole operation.
+On the C side, every handler calls `ipc_call`, which sends the request and
+returns `EIO` if the socket failed or the daemon's `errno` if it returned one.
+Handlers whose reply is only a status use `ipc_reply_status`, which does the
+whole exchange.
 
 ## Socket I/O
 
-All socket operations are blocking `write()` and `read()` calls, wrapped in retry loops for `EINTR`:
+Socket reads and writes are blocking `read()` and `write()` calls:
 
-- `send_full(fd, buf, len)` — writes all `len` bytes, retrying on `EINTR` and partial writes. Returns -1 on any other error.
-- `recv_full(fd, buf, len)` — reads exactly `len` bytes, retrying on `EINTR` and short reads. Returns -1 on EOF or error.
+- `send_full(fd, buf, len)` writes all `len` bytes, retrying after `EINTR` and
+  partial writes, and returns -1 on any other error.
+- `recv_full(fd, buf, len)` reads exactly `len` bytes, retrying after `EINTR`
+  and short reads, and returns -1 on end of file or error.
 
-Both functions assume the socket is reliable (Unix stream socket, local machine). There is no message framing beyond the explicit length prefixes — the length fields in the headers tell the reader exactly how many bytes to expect.
+The length prefixes tell the reader how many bytes to expect; there is no other
+framing.
 
-If an exchange fails for any reason — EOF, EPIPE, ECONNRESET, a response frame longer than the cap, or a peer that stops sending mid-frame — `ipc_sync()` closes the thread's connection through `etcfs_ipc_drop()` and returns -1; the handler calls `fuse_reply_err(req, EIO)`. Dropping the connection covers both failures at once: a broken stream and a desynchronised one are indistinguishable from this side, and reading the tail of an abandoned reply as the next request's header would be worse than reconnecting. The next request from that thread opens a fresh connection, so a Go daemon restart costs one EIO per worker rather than leaving the mount permanently broken.
+**When an exchange fails** (end of file, `EPIPE`, `ECONNRESET`, a reply larger
+than the limit, or a peer that stops in the middle of a frame), `ipc_sync()`
+closes the thread's connection with `etcfs_ipc_drop()` and returns -1, and the
+handler replies `EIO`. Closing the connection is the right response to every one
+of these: from this side, a broken connection and one that is out of step look
+the same, and reading the rest of an abandoned reply as the next request's
+header would corrupt that request. The thread's next request opens a new
+connection, so a restart of `etcfuse-meta` costs each worker one `EIO` and the
+mount keeps working.
 
-The failed request itself is never retried transparently. A request that has been written may already have been applied before the daemon went away, and not every operation is idempotent, so the error is surfaced and the retry decision left to the caller. `SIGPIPE` is ignored process-wide for the same reason the reconnect exists: its default action would kill the mount on the first write to a dead socket.
+**The failed request is not retried automatically.** It may already have been
+applied before the daemon went away, and not every operation is safe to apply
+twice, so the error goes back to the application, which decides whether to
+retry.
+
+**`SIGPIPE` is ignored** in the whole process. Its default action would kill
+`etcfuse` the first time it wrote to a closed socket; ignored, the write fails
+with `EPIPE` and the connection is reopened.
 
 ## Error Handling
 
-Error codes are carried in the first 4 bytes of every response. The common pattern in every handler:
+Every reply starts with a 4-byte error code. Each handler checks it first:
 
 ```
 uint32_t pos = 0;
@@ -192,4 +227,4 @@ if (err != 0) {
 // parse and reply with success
 ```
 
-This structure ensures that every error path produces a valid FUSE reply — the kernel never hangs waiting for a response that was dropped.
+Every error path therefore sends the kernel a reply, so no request is left waiting for an answer that never comes.

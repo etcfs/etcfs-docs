@@ -1,6 +1,9 @@
 # FUSE Write Operations
 
-The write FUSE operations that make the filesystem mutable: creation, deletion, renaming, writing data, setting attributes, and creating special files. Every namespace mutation is a single atomic etcd transaction; no directory-level locking is ever used.
+The operations that change the filesystem: creating, deleting and renaming
+names, writing data, changing attributes, and opening, flushing and closing
+files. Every change to the namespace is one etcd transaction, and no directory
+is ever locked.
 
 ## Table of Contents
 
@@ -14,134 +17,193 @@ The write FUSE operations that make the filesystem mutable: creation, deletion, 
 - [Symbolic Links (SYMLINK)](#symbolic-links-symlink)
 - [Hard Links (LINK)](#hard-links-link)
 - [Device Nodes (MKNOD)](#device-nodes-mknod)
-- [File Lifecycle (OPEN, RELEASE, FLUSH)](#file-lifecycle-open-release-flush)
+- [File Lifecycle (OPEN, FLUSH, RELEASE)](#file-lifecycle-open-flush-release)
 - [Synchronisation (FSYNC)](#synchronisation-fsync)
 
 ## Operation Overview
 
-Each write operation in EtcFS follows the same synchronous IPC pattern as the read operations: the C handler builds a binary payload, sends it over the Unix socket, blocks until the Go backend responds, parses the response directly, and calls the kernel-facing `fuse_reply_*`.
+Every operation is handled as described in
+[Request Dispatch](fuse-request-dispatch.md): the C handler sends a request to
+the Go daemon, waits for the reply, and answers the kernel.
 
-All namespace mutations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK, MKNOD) are implemented entirely in the metadata layer — they touch only etcd keys, never the block device. WRITE involves data that reaches the EBS volume through the Go daemon's block device I/O layer.
+The namespace operations (CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, LINK,
+MKNOD) only change etcd keys. WRITE also writes the data to the shared volume.
 
-| Operation | IPC Opcode | FUSE Reply | Metadata Calls | Touches Block Device |
+| Operation | Opcode | Reply | Store call | Writes the device |
 |---|---|---|---|---|
-| CREATE | 5 | `fuse_reply_create` | `allocInode` + `AtomicCreateFile` | No |
-| MKDIR | 6 | `fuse_reply_entry` | `allocInode` + `AtomicCreateDir` | No |
-| UNLINK | 7 | `fuse_reply_err` | `AtomicUnlink` | No |
+| CREATE | 5 | `fuse_reply_create` | `AtomicCreateFile` | No |
+| MKDIR | 6 | `fuse_reply_entry` | `AtomicCreateDir` | No |
+| UNLINK | 7 | `fuse_reply_err` | `AtomicUnlinkKeepingOpen` | No |
 | RMDIR | 8 | `fuse_reply_err` | `AtomicRmdir` | No |
-| RENAME | 9 | `fuse_reply_err` | `LookupDirent` + `AtomicRename` | No |
-| WRITE | 23 | `fuse_reply_write` | Arena allocate + device write + fsync + extent commit + reclaim of buried extents | Yes |
-| SETATTR | 12 | `fuse_reply_attr` | `GetInode` | No |
-| SYMLINK | 10 | `fuse_reply_entry` | `allocInode` + `AtomicCreateSymlink` | No |
+| RENAME | 9 | `fuse_reply_err` | `AtomicRename` | No |
+| WRITE | 23 | `fuse_reply_write` | allocate blocks, write, publish extents | Yes |
+| SETATTR | 12 | `fuse_reply_attr` | guarded inode update | Only when truncating |
+| SYMLINK | 10 | `fuse_reply_entry` | `AtomicCreateSymlink` | No |
 | LINK | 11 | `fuse_reply_entry` | `AtomicLink` | No |
-| MKNOD | 25 | `fuse_reply_entry` | `allocInode` + `AtomicCreateNode` | No |
-| OPEN | 13 | `fuse_reply_open` | None (acknowledge) | No |
-| RELEASE | 14 | `fuse_reply_err` | None (acknowledge) | No |
-| FLUSH | 26 | `fuse_reply_err` | None (acknowledge) | No |
-| FSYNC | 24 | `fuse_reply_err` | None (acknowledge) | Eventually |
+| MKNOD | 25 | `fuse_reply_entry` | `AtomicCreateNode` | No |
+| OPEN | 13 | `fuse_reply_open` | truncate, count the descriptor | No |
+| FLUSH | 26 | `fuse_reply_err` | publish buffered extents | Buffered data |
+| RELEASE | 14 | `fuse_reply_err` | uncount the descriptor | No |
+| FSYNC | 24 | `fuse_reply_err` | publish buffered extents and timestamps | Buffered data |
 
 ## File Creation (CREATE)
 
-CREATE is the canonical file creation operation in the FUSE protocol. Unlike MKNOD (which just creates a named inode), CREATE pairs file creation with an open on the same path. The kernel may use this to atomically check-and-create a file that is immediately opened for writing.
+CREATE makes a new regular file and opens it in one request. The kernel uses it
+for `open()` with `O_CREAT`.
 
-### IPC Payload
+### Payload
 
 ```
 [u64:parent_ino] [u32:name_len] [name_bytes...] [u32:mode] [u32:flags] [u32:umask]
 [u32:uid] [u32:gid]
 ```
 
-The `mode` is the file type and permissions from the kernel. The `flags` are the open flags (O_RDONLY, O_WRONLY, O_RDWR, etc.). The `umask` is applied to the mode's permission bits.
+- `mode` is the file type and permissions; `umask` is applied to its
+  permission bits.
+- `flags` are the open flags (`O_RDONLY`, `O_WRONLY`, `O_RDWR`, …).
+- `uid` and `gid` come from `fuse_req_ctx(req)`, the identity of the calling
+  process, and become the file's owner. With `default_permissions`, the kernel
+  checks access against these values, so they must be the caller's real ones.
 
-`uid` and `gid` come from `fuse_req_ctx(req)`, which is the identity of the process that made the syscall. Every creating operation carries them and stores them as the owner. They are not advisory: with `default_permissions` in force, they are what the kernel evaluates its access checks against.
+### Handler flow
 
-### Handler Flow
+1. **Pick an inode number.** Each node reserves a block of inode numbers from
+   the global `inode_alloc_counter` and hands them out from memory. Only when
+   the block is used up does the node advance the counter, with a
+   compare-and-swap.
+2. **Create the file in one transaction**, `AtomicCreateFile`. It checks two
+   conditions:
+   - the name does not exist yet (`CreateRevision(dirent:parent/name) == 0`);
+   - the inode number is unused (`CreateRevision(inode:ino) == 0`).
 
-1. Take a fresh inode number from the block this node reserved from the global `inode_alloc_counter`; only an exhausted block CASes the counter forward.
-2. Call `AtomicCreateFile(parent, name, ino, mode &^ umask, uid, gid)` which executes a single etcd transaction:
-   - **Comparison 1:** `CreateRevision(dirent:parent/name) == 0` — the name must not already exist.
-   - **Comparison 2:** `CreateRevision(inode:ino) == 0` — the inode number must not already be allocated.
-   - **Success:** Create the dirent key and the inode key atomically.
-3. Return the new inode's metadata in the entry response format, with the open descriptor's caching decision appended:
+   If both hold, it writes the directory entry, the inode record and this
+   node's exclusive lock on the new inode. If either fails, it writes nothing.
+3. **Reply** with the new inode in the
+   [entry response](fuse-request-dispatch.md#payload-formats), followed by a
+   `keep_cache` flag:
 
 ```
-[i32:error] [u64:ino] [attr: 72 bytes] [u32:entry_timeout] [u32:attr_timeout] [u32:keep_cache]
+[i32:error] [u64:ino] [attr: 84 bytes] [u32:entry_timeout] [u32:attr_timeout] [u32:keep_cache]
 ```
 
-The `keep_cache` flag is decided exactly as it is for OPEN — a create hands back an open descriptor, so it is answered by the same rule, and the C side sets `fi->keep_cache` and clears `fi->direct_io` only when it is set. See [FUSE Cache Management](fuse-cache-management.md#data-page-cache).
+`keep_cache` is decided as for OPEN, because CREATE also returns an open file;
+see [FUSE Cache Management](fuse-cache-management.md#data-page-cache).
 
-### Error Semantics
+Taking the lock in the create transaction saves a separate Raft commit for the
+first write, which almost always follows a create.
 
-- `EEXIST` (error 17, negated): The file already exists. The kernel sends this back to the application as if `open()` with `O_CREAT | O_EXCL` found an existing file.
-- `ENOSPC` (error 28): Inode number allocation has exhausted retries (five CAS attempts failed, likely from concurrent contention on the global counter, or the counter has reached a limit). This is reported to the kernel as a disk-full error.
-- `EIO`: The etcd transaction failed with an infrastructure error (connection lost, quorum loss). The kernel retries the operation.
+### What the transaction guarantees
 
-### AtomicCreateFile Transaction Detail
+- No inode exists without a name pointing to it.
+- No name points to an inode that does not exist.
+- No inode number is used twice, even when two nodes create files at the same
+  moment.
 
-The single transaction that creates a file is the most important atomicity guarantee in the system. It guarantees:
+### Errors
 
-- No orphan inodes without a dirent pointing to them.
-- No dirents pointing to non-existent inodes.
-- No duplicate inode numbers — the inode CAS ensures the allocated number hasn't been taken by a concurrent CREATE on another node.
+- `EEXIST`: the name already exists. The application sees this as `open()`
+  with `O_CREAT | O_EXCL` finding an existing file.
+- `ENOSPC`: no inode number could be reserved.
+- `EIO`: the transaction could not reach etcd (connection or quorum lost).
 
-If the transaction fails because the inode number was claimed by a concurrent operation, the handler does **not** retry automatically. Instead, it returns `EEXIST` to the kernel, which propagates to the application as a failed `open()`. This contrasts with inode allocation, which does retry on CAS failure with exponential backoff.
+The create is acknowledged only after its transaction has committed. Answering
+earlier would be wrong, not just less durable: if another node created the
+same name in the meantime, the application would hold a descriptor for a file
+that belongs to someone else. See
+[Design Decisions](../../design-decisions.md#creates-are-not-deferred-into-a-batch).
 
 ## Directory Creation (MKDIR)
 
-MKDIR creates a new directory with the same structure as CREATE but with `S_IFDIR` mode and an initial `nlink` of 2 (representing `.` and `..`). The directory size is initialised to 4096 bytes (one block) by convention — this is a placeholder, as directories in EtcFS do not have a meaningful size.
+MKDIR works like CREATE, with these differences:
 
-The IPC payload is identical to CREATE minus the open flags, and the response is the plain entry format — a directory is not opened by the operation that creates it, so there is no `keep_cache` to answer. The `umask` is applied to the mode, and the caller's `uid`/`gid` become the directory's owner. The handler calls `AtomicCreateDir` instead of `AtomicCreateFile`.
+- The new inode has type `S_IFDIR`, `nlink` 2 (its entry in the parent and its
+  own `.`), and a size of 4096. The size is a convention; EtcFS directories have
+  no meaningful size.
+- The same transaction raises the parent's `nlink` by one, for the new
+  directory's `..`.
+- The payload has no open flags, and the reply is a plain entry response with
+  no `keep_cache`, because MKDIR does not open the directory.
+
+The umask is applied to the mode, and the caller's uid and gid become the
+owner.
 
 ## Deletion (UNLINK, RMDIR)
 
 ### UNLINK
 
-UNLINK removes a name from a directory. It calls `AtomicUnlink`, which does the following in a single etcd transaction:
+UNLINK removes one name. `AtomicUnlinkKeepingOpen` does it in one transaction:
 
-1. Read the current inode's nlink.
-2. Delete the dirent key (checking it exists via `CreateRevision > 0`).
-3. Decrement nlink on the inode.
-4. If nlink reaches zero, also delete the inode key — and, for a symlink, the key holding its target.
+1. delete the directory entry, if it still exists;
+2. lower the inode's `nlink` by one;
+3. if `nlink` reaches zero, delete the inode record (and, for a symlink, its
+   target key).
 
-This is atomic: if the daemon crashes after step 2 but before step 3–4, no corruption occurs because the transaction either committed all operations or none. The transaction includes a CAS on the dirent key to prevent concurrent double-unlink.
+A crash cannot leave this half-done, because the transaction commits all of it
+or none.
 
-If the inode's extent list is non-empty at nlink zero (meaning there are allocated blocks but no directory entry), the extent keys remain orphaned. The scrubber eventually detects these orphans and reclaims the blocks — each node reclaiming the ones inside its own arenas.
+**A file that is still open on this node** keeps its inode record when its last
+name is removed. The transaction writes an `orphan:<node>/<ino>` key instead,
+and the record is deleted when the node's last descriptor for the file closes
+(see [RELEASE](#release)). This only covers descriptors on the node doing the
+unlink: if another node removes the last name of a file this node has open,
+the record is deleted immediately. Tracking open descriptors in etcd would fix
+that, at the cost of a round trip on every `open()`.
+
+**The file's data blocks** are not freed by the unlink. Its extent keys become
+orphans, and the scrubber on the node that owns each arena frees them; see
+[Continuous Scrubber](../reliability/continuous-scrubber.md#automatic-remediation).
 
 ### RMDIR
 
-RMDIR removes a directory through `AtomicRmdir`, a single transaction. It reads the dirent and the inode to confirm the target is a directory — returning `ENOTDIR` if it is not — and then commits with three comparisons: the dirent and the inode still at the revisions they were read at, and a range comparison asserting that `dirent:<ino>/` holds no keys. An entry created under the directory between the read and the commit therefore aborts the removal (`ENOTEMPTY`) instead of stranding the subtree.
+`AtomicRmdir` removes a directory in one transaction. It first reads the entry
+and the inode, and returns `ENOTDIR` if the target is not a directory. It then
+commits with three conditions:
 
-The directory's inode is deleted outright rather than decremented: a directory has exactly one name, and its count is its own `.` plus the `..` of its subdirectories, so it never reaches zero on its own.
+- the entry has not changed since it was read;
+- the directory's inode has not changed since it was read;
+- there are no keys under `dirent:<ino>/`, so the directory is empty.
 
-RMDIR lowers the parent directory's nlink by one in the same transaction, for the removed directory's `..`, pinned to the revision the parent was read at.
+If another node creates a name inside the directory between the read and the
+commit, the third condition fails and RMDIR returns `ENOTEMPTY` instead of
+leaving that name unreachable.
+
+The directory's inode is deleted outright rather than having its count
+lowered: a directory has one name, and its `nlink` counts its own `.` and its
+subdirectories' `..`, so it never reaches zero by itself. The same transaction
+lowers the parent's `nlink` by one, for the removed directory's `..`.
 
 ## Rename (RENAME)
 
-RENAME moves a file or directory from one location to another, possibly across directories. It calls `AtomicRename`, which validates the move and then applies it in a single etcd transaction.
-
-The IPC payload carries the old parent, old name, new parent, new name, and a flags bitmask:
+RENAME moves a name, possibly to another directory. `AtomicRename` checks the
+move and applies it in one transaction.
 
 ```
 [u64:old_parent] [u32:old_name_len] [old_name_bytes...]
 [u64:new_parent] [u32:new_name_len] [new_name_bytes...] [u32:flags]
 ```
 
-### Replacing an existing target
+### Replacing an existing name
 
-POSIX requires a rename onto an existing name to replace it, and replacing it *is* an unlink. The transaction therefore carries a third operation alongside the two dirent writes: the target inode's link count drops, and the inode record itself is deleted once nothing points at it any more.
+POSIX says a rename onto an existing name replaces it, and replacing a name is
+an unlink of it. The transaction therefore also lowers the replaced inode's
+`nlink`, and deletes its record if no name points to it any more. Without this,
+the replaced file's inode and extents would stay in etcd with no path leading
+to them. The extents themselves are left for the scrubber, as for UNLINK.
 
-Leaving that out is what orphaned the replaced file — its inode and every extent behind it stayed in etcd, reachable through no path. The extents are still left behind deliberately, becoming orphans that the scrubber reclaims on the node owning their arena, which is the only node that may (see [Continuous Scrubber](../reliability/continuous-scrubber.md#automatic-remediation)).
+### Transaction
 
-### Transaction shape
+1. Look up the source inode, and the inode currently at the target name, if
+   any.
+2. Condition: the source entry exists (`CreateRevision(dirent:old_parent/old_name) > 0`).
+3. Condition on the target, so that a concurrent change to it aborts this
+   rename instead of being overwritten:
+   - if the target was free: `CreateRevision(dirent:new_parent/new_name) == 0`;
+   - if it was taken: its `ModRevision` equals the revision it was read at.
+4. If both hold: delete the old entry, write the new one, and update or delete
+   the replaced inode.
 
-1. Resolve the source inode, and the target name if one is already taken.
-2. **Comparison 1:** `CreateRevision(dirent:old_parent/old_name) > 0` — the source must exist.
-3. **Comparison 2**, pinning the target so a concurrent write to that name aborts this rename rather than being silently replaced by it:
-   - target free: `CreateRevision(dirent:new_parent/new_name) == 0`
-   - target taken: `ModRevision(dirent:new_parent/new_name)` equal to the revision the checks below were read at
-4. **Success operations:** delete the old dirent, put the new dirent, and — when a target was replaced — write its decremented inode record or delete it outright.
-
-For cross-directory renames, every key is modified in that one transaction.
+A rename between directories changes all of these keys in the same
+transaction.
 
 ### Rejected renames
 
@@ -152,203 +214,382 @@ For cross-directory renames, every key is modified in that one transaction.
 | Directory renamed onto a non-directory | `ENOTDIR` |
 | Non-directory renamed onto a directory | `EISDIR` |
 | Target is a directory with entries in it | `ENOTEMPTY` |
-| Destination lies inside the directory being moved | `EINVAL` |
+| Destination is inside the directory being moved | `EINVAL` |
 
-`RENAME_EXCHANGE` is rejected rather than approximated. An ordinary rename deletes the source and overwrites the target, which is data loss for a caller that asked for the two names to swap.
+`RENAME_EXCHANGE` (swap two names) is rejected rather than approximated. An
+ordinary rename would delete one of the two files, which is data loss for a
+caller that asked for a swap.
 
-The last row is the subtree check. Moving a directory beneath itself detaches everything under it: the entries still exist, but no path from the root reaches them, and nothing afterwards can distinguish that from ordinary data. Inodes record no parent, so the ancestor walk builds a reverse index from one scan of the `dirent:` prefix. It runs only when a *directory* is being renamed, which is rare — a per-inode parent pointer would be a second source of truth to keep consistent for no benefit at this scale. The walk is bounded by the number of entries it has seen, so a namespace that already contains a cycle cannot spin there forever.
+**Moving a directory inside itself** would detach it: its entries would still
+exist, but no path from the root would reach them. To detect this, RENAME walks
+up from the destination to the root and checks that it never passes the
+directory being moved. Inodes do not record their parent, so the walk first
+builds a child-to-parent index from one scan of the `dirent:` prefix. This
+only happens when a directory is renamed, which is rare; storing a parent on
+every inode would be a second record to keep consistent. The walk stops after
+as many steps as there are entries, so a namespace that already contains a
+cycle cannot make it loop forever.
 
-A dirent whose inode is missing is already corrupt, and fsck reports it. Renaming it is still allowed: moving a broken pointer breaks nothing further, and refusing would take away the obvious way to clear it. Its type is unknown, so the directory rules above do not apply to it.
+**An entry whose inode is missing** is already damaged, and `fsck` reports it.
+Renaming it is still allowed, because moving it does no further harm and is the
+obvious way to clean it up. Its type is unknown, so the directory rules above do
+not apply to it.
 
 ## Data Write (WRITE)
 
-WRITE is called when the kernel has data to write to a file. The Go backend receives the full IPC payload (including the data bytes), allocates disk blocks from the arena allocator, writes the data to the shared EBS volume via the block device I/O layer, fsyncs the written range, commits the extent to etcd with a generation stamp, and updates the inode size. The caller's `uid` rides along because a write by an unprivileged user has to clear the file's set-user-ID and set-group-ID bits, and the mode lives in EtcFS's inode record rather than anywhere the kernel can reach.
+WRITE carries data for a range of a file. The Go daemon reserves blocks on the
+shared device for it, records where they are in new extents, and replies with
+the number of bytes written. Whether those extents are committed to etcd at
+once or buffered on this node depends on the write; see
+[Buffered and synchronous writes](#buffered-and-synchronous-writes).
 
-### IPC Payload
+### Payload
 
 ```
-[u64:ino] [u64:offset] [u32:data_len] [data_bytes...] [u32:uid]
+[u64:ino] [u64:offset] [u32:data_len] [data_bytes...] [u32:uid] [u32:flags]
 ```
 
-### Handler Flow
+- `uid` is the caller's: a write by an unprivileged user must clear the file's
+  set-user-ID and set-group-ID bits, and the mode is stored in EtcFS's inode
+  record, where the kernel cannot clear it itself.
+- `flags` are the open flags the kernel attaches to this write. They decide
+  whether the write must be synchronous (`O_SYNC`, `O_DSYNC`). They are read per
+  write because on a direct-I/O file the kernel never sends a separate FSYNC
+  for a synchronous open.
 
-1. Take the inode's exclusive lock, then read the inode record and its extent list — from the snapshot cached under that lock when this node already held it, and from etcd in one transaction otherwise (see [Lock Caching](../metadata/lock-caching.md)). If the inode does not exist, return `ENOENT`.
-2. If no arena is acquired yet, acquire one from the global pool via CAS.
-3. Call `alloc.Allocate(dataLen)` to reserve disk blocks. Returns a list of runs — free space that is merely fragmented is still usable, so one write may be spread over several device ranges.
-4. Write the data bytes to the block device via `pwrite()`, one call per run.
-5. Call `sync_file_range()` on each written range to ensure data durability.
-6. Stamp the extents with the fencing generation the commit will be guarded against — the node's own, already resolved, rather than a fresh read of `gen:<node_id>`. The two are the same number: a write whose stamp disagreed with its own guard could not commit.
-7. Store one extent entry per run in etcd at `extent:<ino>/<chunk>` with the value `"logical_off,disk_off,length,generation,sequence"`, in logical order. Chunk numbers continue from one past the highest currently in use, and every run of a single write shares one sequence — they are one write, over disjoint logical ranges.
-8. If the write extends beyond the current file size, update the inode size in etcd.
-9. Rewrite every extent this write buries to whatever it still leaves readable (see below).
-10. Delete this write's inode-lock key.
-11. Return the number of bytes written.
+### Handler flow
 
-Steps 7 through 10 are a **single** generation-guarded transaction. Each was once a round trip of its own after the commit, and each was a Raft commit on the critical path of every write — the dominant cost of a write, since the ceiling a write can reach is set by how many sequential Raft commits it pays for (see [Performance Benchmarks](../reliability/performance-benchmarks.md)). Folding them also makes the write atomic in a way it was not: a buried extent stops being referenced at the same revision the extent burying it appears, and the lock is dropped exactly when the work it protected becomes visible.
+1. **Refuse if fenced.** A node that has fenced itself writes nothing to the
+   device.
+2. **Take the inode's exclusive lock.** If it cannot be had after retries, the
+   write fails with `EAGAIN`.
+3. **Read the inode record and its extents.** If this node already held the
+   lock, they come from the copy cached with the lock and cost no etcd request
+   (see [Lock Caching](../metadata/lock-caching.md)).
+4. **Reserve blocks.** `alloc.Allocate(dataLen)` returns one or more runs of
+   free blocks in this node's arenas. Free space that is fragmented is still
+   used: one write can be split across several runs.
+5. **Plan the metadata change**: one new extent per run, a larger inode size if
+   the write extends the file, and the trimming of older extents this write
+   covers (see [Overwrites](#overwrites)).
+6. **Buffer or commit** the change, as described next.
+7. **Reply** with the number of bytes written.
 
-etcd caps how many operations one transaction may carry, and a single write can bury many extents. What does not fit is reclaimed afterwards in round trips of its own — correct either way, only not free. When anything is left over, the lock release is left out of the transaction too and issued afterwards: a reclaim still to come needs the inode held, or another node could rewrite those extents in between and turn a leak into a lost update.
+### Buffered and synchronous writes
 
-### Data-Then-Metadata Ordering
+While this node holds the inode's exclusive lock, no other node can read the
+file, so the new extents do not need to be in etcd yet. They only need to be
+there before the lock is given up. By default, a write therefore leaves its
+extents in a per-inode buffer on this node and replies without a Raft commit.
+The buffer is published:
 
-The fsync (step 5) happens before the extent commit (step 7). This means the data is durable on the EBS volume before etcd records its existence. If the daemon crashes between steps 5 and 7:
+- every `--metadata-flush-interval` (100 ms by default);
+- on `fsync`, `close` (FLUSH) and a lock recall from another node;
+- when the buffer is full.
 
-- The data is on the block device (fsynced).
-- The extent is NOT in etcd — no inode references the blocks.
-- On restart, the blocks are orphaned (not referenced by any inode). The orphan is harmless — the data goes unread — and the scrubber eventually reclaims the blocks.
+A write is **committed before replying** instead when:
 
-If the order were reversed (extent before data), a crash would leave a metadata reference to data that was never written — a data integrity failure. The data-then-metadata ordering is the central write-ordering invariant.
+- `--metadata-flush-interval` is 0;
+- the write is synchronous (`O_SYNC` or `O_DSYNC`);
+- it changes the file's mode (clearing set-user-ID bits);
+- its planned transaction cannot be replayed into the cached copy of the
+  inode's metadata.
 
-### Partial and Sequential Writes
+A committed write first publishes anything already buffered for the inode,
+writes its data to the device, and then commits its extents in one transaction
+guarded by the node's fencing generation.
 
-Multiple writes to the same file create separate extent keys (`extent:<ino>/0`, `extent:<ino>/1`, ...). The read handler scans all extents for the inode, finds the ones covering the requested range, and concatenates the data from each. Allocation is sequential within the arena's free bitmap — blocks are contiguous unless the arena is fragmented, in which case the write becomes several extents instead of failing.
+**The data bytes** of a buffered write are held in memory too, and written to
+the device when the buffer is published, if `--write-data-cache` is on and the
+write either continues a contiguous range on the device or is at least 64 KiB.
+Otherwise the bytes are written to the device immediately and only the extents
+wait. See
+[Consistency and Durability](../consistency/consistency-and-durability-model.md#durability-under-write-delegation)
+for what a crash can lose in each case.
+
+### What one commit contains
+
+A committed write, or a buffer being published, is one transaction guarded by
+the node's fencing generation. It contains:
+
+- the new extent keys;
+- the new inode size, if the file grew;
+- the rewritten or deleted older extents this write covers.
+
+Putting all of this in one transaction saves Raft commits, which set the upper
+limit on write throughput. It also makes the change atomic: an older extent
+stops being referenced at the same revision as the extent that replaces it
+appears.
+
+etcd limits how many operations one transaction may hold, and a single write
+can cover many older extents. Rewrites that do not fit are committed
+afterwards in further transactions, while the inode is still locked; otherwise
+another node could rewrite the same extents in between.
+
+### Data before metadata
+
+The data reaches the device before the extent that points to it is committed
+to etcd. If the daemon crashes between the two:
+
+- the data is on the device;
+- no extent in etcd refers to it, so no reader can see it;
+- the blocks are free again after the node restarts, because the allocator's
+  bitmap is rebuilt from the extents in etcd.
+
+In the opposite order, a crash could leave an extent pointing to blocks that
+were never written, and a reader would get whatever those blocks held before.
+See [Write Ordering Invariants](../storage/write-ordering-invariants.md).
 
 ### Overwrites
 
-A write is never an in-place update. Overwriting a range allocates fresh blocks and appends a new extent, so two extents end up covering the same logical bytes. Two consequences follow.
+A write never changes blocks in place. Overwriting a range allocates new blocks
+and adds a new extent, so for a while two extents cover the same bytes. Two
+rules follow.
 
-**Reads must resolve to the newer one.** Every extent carries a sequence number in its value. Extents are ordered by logical offset and then by *descending* sequence, and the read handler takes the first extent covering the offset it wants — so the later write is the one it sees.
+**Reads use the newer extent.** Every extent has a sequence number in its value.
+Extents are ordered by file offset and then by descending sequence, and a read
+takes the first extent covering each byte, so it sees the later write.
 
-**The buried bytes' blocks are dead.** Each extent the write touched is rewritten to whatever it still leaves readable in the same transaction that publishes the write, and the blocks in between are returned to the free-list once that transaction commits. As with truncation this applies only to extents in an arena this node owns; the rest are left for their owner's scrubber.
+**The older extent is trimmed.** In the same transaction that publishes the
+write, each older extent it covers is rewritten to keep only the parts still
+visible:
 
-An extent covered entirely is deleted. One covered at its front or its back is trimmed to the single surviving piece under the original key. One covered in the *middle* leaves two pieces: the head keeps the original key and the tail is written under a fresh one, both in the same transaction, so a crash cannot leave the middle described twice.
+- covered entirely: deleted;
+- covered at its start or its end: shortened, under its original key;
+- covered in the middle: split in two, the first part under the original key and
+  the second under a new key, both in the same transaction.
 
-Each of these rewrites is a blind put of a value derived from the extent list this write worked from. It therefore carries a comparison that the record is still at the revision it was read at. Without it a stale view could resurrect an extent that was deleted in between — a real possibility, because that list is either the one cached under the lock or a serializable read served by whichever etcd member the node is connected to, neither of which is the leader's. A comparison that fails is not an error: the write re-reads from the leader and proposes again.
+For example, extent A covers bytes 0–12K with sequence 5, and a write W covers
+4K–8K with sequence 7. A is split into 0–4K (original key) and 8K–12K (new
+key), both still sequence 5. The blocks under 4K–8K are freed once the
+transaction has committed.
 
-That is also what makes working from the cached list safe rather than merely fast. Nothing in the proposal trusts the list to be current: the new extents are written under `CreateRevision == 0` comparisons, and every rewrite under the revision it was read at. A list that has fallen behind loses a comparison, and the write re-reads linearizably and proposes again. After the commit, the transaction's own operations are replayed over the list they were built from to produce the new cached view — so what the cache holds is derived from the write itself rather than described a second time, and every key the transaction wrote carries its revision for the next write's comparisons.
+Both pieces keep A's sequence number. This is why the sequence is in the value,
+not the key: a piece ranked by a new key would look newer than A, and would
+then hide any newer extent overlapping it. That situation does occur, because
+extents in another node's arena are never trimmed by this node.
 
-Every surviving piece keeps its parent's sequence number. That is the reason the sequence lives in the value and not in the key: a piece ranked by its own key would claim to be newer than the extent it was cut from, and would then win over a newer extent overlapping it — reachable, because extents in another node's arena are never trimmed and so do overlap.
+Only extents in arenas this node owns are trimmed; the others are left for
+their owner's scrubber. The freed blocks go back to the free list only after
+the transaction has committed, because a transaction rejected by the
+generation guard must not free blocks the file still uses.
 
-Trimming the front moves the survivor's device offset forward, and that distance is rounded *down* to a block boundary. Two reasons. A read reaches the extent through `O_DIRECT`, where the device offset must be sector-aligned; and rounding the other way would leave the bytes between the write's end and the survivor's start described by no extent at all, so they would read back as zeroes. Rounding down instead leaves the survivor holding a few bytes the write also covers, which costs at most one block and resolves correctly, because the write's chunk is the higher one.
+**Every rewrite is conditional** on the extent still being at the revision it
+was read at. The extent list a write works from is either the copy cached with
+the lock, or a serializable read from whichever etcd member the node is
+connected to; neither is guaranteed to be the latest. Without the condition, a
+write working from an old list could recreate an extent that had been deleted
+in the meantime. A failed condition is not an error: the write re-reads the
+extents from the etcd leader and tries again. New extents are written with
+`CreateRevision == 0`, so a stale list also cannot make two writes use the same
+chunk key.
 
-What is still left unreclaimed is a covered region smaller than one block, since blocks are the unit of reuse. The bytes are buried and read correctly; their block stays allocated until the extent holding it is fully covered or the file is deleted.
+After the commit, the daemon applies the transaction's own operations to the
+cached list to produce the new cached copy, with the revisions etcd assigned,
+for the next write's conditions.
 
-The metadata rewrite rides in the write's own transaction, but the blocks are handed back to the free-list only once that transaction is known to have committed — never before, since a transaction rejected by the generation guard must not have freed blocks the file still refers to.
+**Trimming the start of an extent** moves its device offset forward by a whole
+number of blocks, rounded down. Reads use `O_DIRECT`, which needs block-aligned
+device offsets. Rounding up instead would leave the bytes between the end of
+the write and the start of the trimmed extent covered by no extent, and they
+would read back as zeroes. Rounding down leaves the trimmed extent covering up
+to one block that the newer write also covers, which reads correctly because
+the newer extent wins.
 
-### Generation Stamp
+A covered region smaller than one block is not freed, since a block is the unit
+of reuse. Its bytes are hidden by the newer extent; the block stays allocated
+until the extent holding it is fully covered or the file is deleted.
 
-Every extent carries the node's current fencing generation at write time. The generation is read from `gen:<node_id>` before the extent is committed. The scrubber's generation consistency check reads this stamp and compares it against the node's current generation. If the node was fenced mid-write, the generation guard on the etcd transaction prevents the commit, and the data bytes remain as harmless orphans on the block device.
+### Generation stamp
+
+Every extent records the writer's fencing generation, the same number the
+commit's generation guard checks. If the node is fenced while a write is in
+progress, the guard rejects the commit, and the written bytes are referenced by
+no extent. The scrubber compares each extent's stamp against its writer's
+current generation.
 
 ### Alignment
 
-The block device is opened `O_DIRECT` where the device allows it, falling back to buffered I/O otherwise. Under `O_DIRECT` the payload is copied into a sector-aligned buffer padded out to whole blocks, which is also what lets a multi-run write slice one buffer per run: every run begins and ends on a block boundary. The padding past the end of the data is written but never described by an extent, so it is never read back. The `sync_file_range()` call flushes the written range.
+The device is opened with `O_DIRECT` when it supports it. The data is copied
+into a block-aligned buffer padded to whole blocks, so every run starts and ends
+on a block boundary and one buffer can be split across several runs. The
+padding is written but no extent covers it, so it is never read.
 
 ## Attribute Setting (SETATTR)
 
-SETATTR modifies one or more inode attributes: size (truncation), mode (permissions), uid/gid (ownership), and timestamps (atime, mtime). The kernel sends a bitmask indicating which fields to apply.
+SETATTR changes one or more attributes: size (truncate), mode, owner and
+timestamps.
 
-### IPC Payload
+### Payload
 
 ```
 [u64:ino] [u64:fh] [u32:valid] [u64:size] [u32:mode] [u32:uid] [u32:gid]
-[u64:atime] [u64:mtime] [u64:ctime]
+[u64:atime] [u64:mtime] [u64:ctime] [u32:atime_nsec] [u32:mtime_nsec] [u32:ctime_nsec]
 ```
 
-Every field SETATTR can change is on the wire whether or not it is being changed; `valid` is the kernel's `FUSE_SET_ATTR_*` mask saying which of them it actually means, and the rest hold whatever the caller's `struct stat` happened to contain.
+Every field is always sent. `valid` is the kernel's mask of the fields to
+apply; the others hold whatever the caller's `struct stat` contained.
 
-- `FATTR_MODE`: Apply the mode field.
-- `FATTR_UID`, `FATTR_GID`: Apply the ownership fields.
-- `FATTR_SIZE`: Truncate or extend the file (see below).
-- `FATTR_ATIME`, `FATTR_MTIME`, `FATTR_CTIME`: Apply the given timestamps.
-- `FATTR_ATIME_NOW`, `FATTR_MTIME_NOW`: Set the timestamp to the current time instead.
+- `FATTR_MODE`: apply the mode.
+- `FATTR_UID`, `FATTR_GID`: apply the owner.
+- `FATTR_SIZE`: truncate or extend (see below).
+- `FATTR_ATIME`, `FATTR_MTIME`, `FATTR_CTIME`: apply the given time.
+- `FATTR_ATIME_NOW`, `FATTR_MTIME_NOW`: set the time to now.
 
-Timestamps are whole seconds. The inode record stores no sub-second component, so the nanosecond halves are dropped on the C side rather than sent and discarded on the other.
+### Rules
 
-The mode is masked before it is stored: the kernel sends a whole `st_mode`, but `chmod` may not change what kind of file something is, so the stored type bits are kept and only the permission bits are replaced. Without that, a `chmod` on a symlink or a device node would quietly turn it into a regular file.
-
-Any change to mode, ownership or size also moves `ctime`, unless the caller set it explicitly.
-
-The write is a transaction pinned to the revision the inode was read at, so a concurrent change to a different field is not silently overwritten by this one. Losing that comparison returns `EAGAIN` and the kernel retries.
+- **The file type cannot change.** The kernel sends a whole `st_mode`, but
+  `chmod` may only change permission bits. The stored type bits are kept, so a
+  `chmod` on a symlink or device node does not turn it into a regular file.
+- **`ctime` moves** with any change of mode, owner or size, unless the caller
+  set it explicitly.
+- **Conflicting updates are detected.** The update is conditional on the inode
+  not having changed since it was read, so a concurrent change to another field
+  is not overwritten. If the condition fails, SETATTR returns `EAGAIN` and the
+  kernel retries.
+- **Permission changes are committed immediately; timestamps can wait.** Another
+  node checks access against the mode and owner stored in etcd, without taking
+  the inode's lock. A change that removes permission must therefore be in etcd
+  before SETATTR returns, or the other node would keep granting access. A
+  timestamp has no effect on access, so a timestamp-only change is queued and
+  published with the next batch. A SETATTR that sets the mode or owner to the
+  value it already has (as `tar` does for every file it extracts) changes
+  nothing and commits nothing.
 
 ### Truncation
 
-Truncation (size change) follows the **metadata-then-data** ordering invariant:
+Truncation removes data, so it reverses the write order: **metadata first, then
+data**.
 
-1. Commit the reduced extent list to etcd: scan all `extent:<ino>/` keys, shorten or delete any extent whose logical range extends beyond the new size.
-2. If the extent was shortened, keep the first `newSize - logOff` bytes of the extent. If the extent was entirely beyond the new size, delete the extent key and return the freed blocks to the arena free-list via `alloc.Free()`.
-3. Update the inode size in etcd.
+1. Commit the extent rewrite: delete each extent entirely past the new size,
+   and shorten any that crosses it.
+2. Once that commit has succeeded, return the freed blocks to the arena's free
+   list.
+3. Commit the new size in the inode record.
 
-Metadata-then-data ordering ensures the inode size shrinks before the freed blocks are returned to the arena free-list. If the node crashes between steps 2 and 3, the blocks are still allocated (not reusable) but the inode still has the old size — the blocks are wasted but no reader can access them because the extent was removed.
+No extent refers to a block by the time it is freed, so a block can never be
+handed to another file while a reader of this file could still reach it. If the
+blocks were freed first, another file could reuse them while an extent of this
+file still pointed to them, and a reader would see the other file's data.
 
-A truncate is an overwrite of everything from the new size to the end of the address space, so steps 1 and 2 run through the same path as [Overwrites](#overwrites) and inherit its rules — including the block-boundary rounding, the revision comparison on each rewritten record, and the fact that only whole blocks the survivor no longer reads from are handed back.
+If the node crashes after step 1 and before step 3, the file keeps its old size,
+and the range past the new size reads as zeroes, because no extent covers it
+any more.
 
-Unlike a write, a truncate takes no inode lock, so an extent it planned to rewrite can be rewritten under it by another node. The revision comparison is what catches that: the rewrite is refused rather than applied from a stale view, and the whole pass is retried from a fresh read, which is the only view a correct plan can be built from.
+A truncate is handled as an overwrite of everything from the new size onward,
+so it follows the same rules as [Overwrites](#overwrites): block-boundary
+rounding, a revision condition on each rewritten extent, and freeing only whole
+blocks.
 
-They apply only to the extents whose device range **this node's arenas own**. A file's bytes may sit in several nodes' arenas — a write always allocates from the writer's own arena, so a file written by two nodes is spread across both — and only an arena's owner may rewrite one of its extent records. Deleting a peer's record would strip the reference that peer's in-memory free-list is rebuilt from, stranding those blocks as allocated until it restarted. Extents belonging to another node are therefore left in place, and its scrubber reclaims them (see [Continuous Scrubber](../reliability/continuous-scrubber.md#3-dead-extent-detection)).
+A truncate does not take the inode lock, so another node may change an extent
+the truncate planned to rewrite. The revision condition catches this: the
+rewrite fails, and the whole truncate is retried from a fresh read.
 
-Leaving them costs nothing in correctness. Step 3 is what truncation actually means to a reader: the kernel clamps every read to the size it last saw, so bytes past the new end of file are unreachable whether or not an extent still describes them.
+Only extents in arenas this node owns are rewritten. A file written by two
+nodes has extents in both nodes' arenas, and only an arena's owner may change
+its extent records. If this node deleted another node's extent record, that
+node could no longer rebuild its free list correctly, and the blocks would stay
+allocated until it restarted. Other nodes' extents are left in place for their
+scrubbers to reclaim (see [Continuous Scrubber](../reliability/continuous-scrubber.md#3-dead-extent-detection)).
+
+Leaving them does not expose any data. The kernel limits every read to the file
+size it last saw, so bytes past the new end cannot be read whether or not an
+extent still describes them.
 
 ### Extending a file
 
-`FATTR_SIZE` with a size *larger* than the current one moves the inode's size and nothing else. The bytes it exposes are a hole: no extent describes them, and a read of that range returns zeroes.
-
-That is what makes holes work in general. A read fills only the ranges an extent actually covers, over a buffer that starts zeroed, and returns the whole range the kernel asked for — so a gap between extents, or a tail past the last one, reads back as zeroes rather than as a short read. The kernel has already clamped the request to the size it last saw, so there is nothing past the end of the file in it.
+A `FATTR_SIZE` larger than the current size changes only the size. The new
+range is a hole: no extent covers it, and reading it returns zeroes, because a
+read starts from a zeroed buffer and fills only the ranges extents cover (see
+[READ](fuse-read-operations.md#read)).
 
 ## Symbolic Links (SYMLINK)
 
-SYMLINK creates a symbolic link — a special file whose content is interpreted as a path to another file. The symlink target is stored in a separate key (`symlink:<ino>`) rather than in the inode record itself.
-
-### IPC Payload
+SYMLINK creates a symbolic link. Its target is stored in a separate key,
+`symlink:<ino>`, not in the inode record.
 
 ```
 [u64:parent] [u32:name_len] [name_bytes...] [u32:target_len] [target_bytes...]
 ```
 
-### Handler Flow
-
-1. Allocate a new inode number.
-2. Create the inode with `S_IFLNK | 0777` mode.
-3. Store the target path in the symlink key.
-4. Create the directory entry.
-
-Note that these operations are **not** in a single transaction. If the daemon crashes between step 2 and step 4, an orphan inode exists with a symlink key but no directory entry. The fsck checker would flag this as an orphan inode; the scrubber would eventually reclaim it.
-
-The inode record, the symlink target key and the dirent are written by one transaction, `AtomicCreateSymlink`. A symlink that loses the race for its name therefore leaves nothing behind — neither an inode nor a stray target key.
+`AtomicCreateSymlink` writes the inode record (mode `S_IFLNK | 0777`), the
+target key and the directory entry in one transaction. A symlink whose name is
+already taken therefore leaves nothing behind. The mode is fixed rather than
+umask-masked, because access checks use the target's permissions, not the
+link's.
 
 ## Hard Links (LINK)
 
-LINK creates an additional directory entry pointing to an existing inode — a hard link. The new dirent and the raised link count are written by one transaction.
-
-### IPC Payload
+LINK adds another name for an existing inode.
 
 ```
 [u64:ino] [u64:new_parent] [u32:new_name_len] [new_name_bytes...]
 ```
 
-### Handler Flow
+`AtomicLink` writes the new entry and the raised `nlink` in one transaction,
+conditional on the new name being free and on the inode not having changed
+since its `nlink` was read.
 
-1. Call `AtomicLink(ino, new_parent, new_name)`. The transaction asserts that the new name is free and that the inode still stands at the revision its link count was read at, then writes the dirent and the raised count together.
-2. A name that is already taken is reported as `EEXIST` with the count untouched; losing the revision comparison is contention, and the operation is redone against fresh state.
-
-Hard links to directories are refused with `EPERM`: one would let the namespace form a cycle that no unlink can break.
+- If the name is taken, LINK returns `EEXIST` and the count is unchanged.
+- If the inode changed, LINK reads it again and retries.
+- A hard link to a directory is refused with `EPERM`. It would allow a cycle in
+  the namespace that no unlink could break.
 
 ## Device Nodes (MKNOD)
 
-MKNOD creates a device node — a special file representing a character or block device. The handler allocates an inode number, then `AtomicCreateNode` writes the inode record — carrying the device number (`rdev`) and the umask-masked mode — and its directory entry in one transaction.
-
-### IPC Payload
+MKNOD creates a device node, FIFO or socket. After picking an inode number,
+`AtomicCreateNode` writes the inode record, with the device number (`rdev`) and
+the umask-masked mode, and its directory entry in one transaction.
 
 ```
 [u64:parent] [u32:name_len] [name_bytes...] [u32:mode] [u32:rdev]
 ```
 
-MKNOD is rarely used on modern Linux systems (udev manages device nodes) but is required for POSIX compliance.
-
-## File Lifecycle (OPEN, RELEASE, FLUSH)
+## File Lifecycle (OPEN, FLUSH, RELEASE)
 
 ### OPEN
 
-OPEN is called when a file is opened with `open()`, `creat()`, or `openat()`. Currently, OPEN is a no-op that acknowledges the open. The file handle (`fh`) is set to zero, and the `direct_io` flag is set to 1 — bypassing the kernel's page cache for file data, consistent with the eventual O_DIRECT block I/O model.
+OPEN goes to the Go daemon, which:
 
-### RELEASE
-
-RELEASE is the counterpart to OPEN, called when the last file descriptor for a file is closed. It is a no-op — the Go daemon acknowledges the close without performing any action. In a future implementation, RELEASE would flush cached write data and release the inode's per-open state.
+- empties the file if `O_TRUNC` is set;
+- counts the open descriptor, so that the file's record survives the removal of
+  its last name until the last close;
+- decides whether the kernel may cache the file's pages (`keep_cache`); see
+  [READ: OPEN and OPENDIR](fuse-read-operations.md#open-and-opendir).
 
 ### FLUSH
 
-FLUSH is called on every `close()` system call, not just the final `close()`. Its contract is to ensure that data written by prior WRITE calls reaches the storage medium. Currently, FLUSH is a no-op — writes are already durable on the block device (the WRITE handler syncs before returning), so no additional action is needed for data durability.
+The kernel sends FLUSH on every `close()`. The daemon publishes the extents
+buffered for the inode and waits for the commit. POSIX does not require
+`close()` to make data durable, but another node that opens the file next must
+see its data (close-to-open consistency), so the extents are published here.
 
-### Synchronisation (FSYNC)
+Queued timestamps are not published on FLUSH. An archiver such as `tar` sets a
+file's times and then closes it, and publishing them at every close would add a
+Raft commit per file. They are published within one flush interval anyway.
 
-FSYNC is called when an application calls `fsync()`, `fdatasync()`, or `syncfs()` on a file descriptor. The kernel may issue `FSYNC` separately for data and metadata. Currently FSYNC is a no-op — writes are already synced by the WRITE handler, so calling fsync after a write is redundant for data durability.
+### RELEASE
 
-In a future implementation, FSYNC would explicitly sync the block device ranges for the inode and confirm the etcd transaction committed to the Raft quorum before returning success.
+The kernel sends RELEASE when the last descriptor for an open file is closed.
+The daemon lowers its count of open descriptors for the inode. If the count
+reaches zero and the file has no names left (it was unlinked while open), the
+daemon deletes the inode record and its `orphan:` key now. Its extents become
+orphans for the scrubber, and the daemon drops its cached lock on the inode,
+so that the scrubber, which skips locked inodes, can reclaim them.
+
+## Synchronisation (FSYNC)
+
+FSYNC is sent for `fsync()` and `fdatasync()`. The daemon publishes everything
+it is holding for the inode (buffered extents and queued timestamps) and waits
+until the commit succeeds. If the commit fails for a temporary reason, the
+buffer is kept and FSYNC keeps returning `EIO` until a commit succeeds.
+
+With `O_DIRECT`, the data was on the device as soon as it was written, so
+publishing the extents is enough. Without `O_DIRECT`
+(`--allow-buffered-io`), FSYNC also flushes the device, because the data may
+still be in this node's page cache.
+
+For a directory, FSYNC publishes its queued timestamp. A create inside the
+directory is already committed before it returns, but the parent's
+modification time is queued, and a caller who asks for the directory to be
+durable expects that too.

@@ -1,6 +1,9 @@
 # FUSE Daemon Architecture
 
-The process model, component boundaries, and IPC protocol that connect the Linux kernel's VFS layer to the etcd-backed metadata store.
+Every file operation an application makes on an EtcFS mount reaches the kernel's
+VFS, which forwards it to a userspace daemon through FUSE. This page describes
+the two processes that handle those requests, how they talk to each other, and
+how a request travels from the kernel to etcd and back.
 
 ## Table of Contents
 
@@ -12,126 +15,179 @@ The process model, component boundaries, and IPC protocol that connect the Linux
 
 ## Process Model
 
-EtcFS runs as two cooperating processes, not one monolithic binary:
+Each node runs two processes:
 
-1. **`etcfuse` (C daemon)** — Handles FUSE kernel protocol I/O via libfuse. This is the process that mounts the filesystem at a user-specified mountpoint. It creates a `fuse_session`, registers low-level operation handlers, and enters the libfuse event loop.
+1. **`etcfuse`, in C.** It mounts the filesystem through libfuse, receives
+   requests from the kernel, and answers them.
+2. **`etcfuse-meta`, in Go.** It talks to etcd and reads and writes the block
+   device. It listens on a Unix socket and serves requests from `etcfuse`.
 
-2. **`etcfuse-meta` (Go daemon)** — Talks to the etcd cluster, manages the metadata store, and performs block device I/O. It listens on a Unix domain socket and processes binary IPC requests from the C daemon.
+They communicate over two Unix stream sockets:
 
-The processes communicate over a Unix stream socket (`/run/etcfuse/etcfuse.sock` by default, set with `--socket` on the C daemon and `--listen` on the Go one; the C side also reads `ETCFS_IPC_SOCKET`). A second socket, `/run/etcfuse/etcfuse-notify.sock` (`--notify-socket`), carries cache-invalidation notifications in the other direction. The C daemon connects to the Go daemon at startup. All FUSE operations from the kernel are forwarded over this socket as structured binary messages; responses come back the same way.
+- **The request socket**, `/run/etcfuse/etcfuse.sock` by default (`--socket` on
+  `etcfuse`, `--listen` on `etcfuse-meta`). `etcfuse` sends each kernel request
+  to `etcfuse-meta` here as a binary message and receives the reply on the same
+  connection.
+- **The notification socket**, `/run/etcfuse/etcfuse-notify.sock`
+  (`--notify-socket` on both). `etcfuse-meta` uses it in the other direction,
+  to tell `etcfuse` which kernel cache entries to invalidate.
 
-### Why Two Processes
+### Why two processes
 
-This architecture separates two concerns that have fundamentally different latency and safety profiles:
+The two halves have different needs:
 
-- **FUSE protocol handling** requires timely response to kernel upcalls. The C daemon makes synchronous IPC calls to the Go backend for each operation and returns the reply directly — no separate callback thread is involved.
-
-- **Metadata and data I/O** involves network round-trips (etcd) and block device access (O_DIRECT/io_uring). These operations have variable latency and may fail with retryable errors. The Go daemon handles these complexities using goroutines, connection pools, and retry logic, while presenting a simple request-response interface to the C side.
+- **Answering the kernel** must be quick and predictable. libfuse is a C
+  library, and each `etcfuse` handler makes one blocking request to the Go
+  daemon and then replies to the kernel directly.
+- **etcd and device I/O** involve network round trips and device latency, and
+  can fail with errors that need retrying. Go handles this with goroutines, the
+  etcd client library and retry logic, behind a simple request–response
+  interface.
 
 ## C/Go Boundary
 
-The boundary is the Unix socket IPC protocol. The C daemon owns all FUSE state: the session, the mount, the `fuse_req_t` handles. The Go daemon owns all etcd state: the client connection, the lease keepalives, the watch channels.
+The socket protocol is the only boundary between the two. `etcfuse` owns all
+FUSE state: the session, the mount and the `fuse_req_t` handles. `etcfuse-meta`
+owns all etcd state: the client connection, lease renewals and watches.
 
-The IPC protocol is request-response. The C side sends a request and blocks its dedicated worker thread until the response arrives. The Go side processes one request at a time per connection (connections are handled in dedicated goroutines).
+Each request is answered before the next one is sent on the same connection.
+An `etcfuse` worker thread sends a request and waits for its reply.
+`etcfuse-meta` handles each connection in its own goroutine, one request at a
+time.
 
 ## Daemon Lifecycle
 
-### Startup Sequence
+### Startup
 
-1. **Parse configuration.** The C daemon reads environment variables for the mountpoint, IPC socket path, volume ID (for block device), and node identifier.
+1. **Read settings.** `etcfuse` parses its command line (`--socket`,
+   `--notify-socket`, `--volume-id`, `--node-id`, the mountpoint) and passes the
+   socket paths to the FUSE code through the `ETCFS_IPC_SOCKET` and
+   `ETCFS_NOTIFY_SOCKET` environment variables.
+2. **Check the backend.** It connects once to `etcfuse-meta`. If that fails,
+   `etcfuse` exits before taking over the mountpoint.
+3. **Create the session.** `fuse_session_new` creates the FUSE session with the
+   table of operation handlers.
+4. **Mount.** `fuse_session_mount` attaches the session to the mountpoint. From
+   here on the kernel can send requests.
+5. **Serve.** `fuse_session_loop_mt` runs the multi-threaded loop. Each worker
+   thread opens its own connection to `etcfuse-meta` on its first request and
+   reuses it afterwards.
 
-2. **Connect to Go backend.** A Unix stream socket is opened to the Go daemon's listener. If the connection fails, the C daemon exits with an error.
+### Shutdown
 
-3. **Initialize FUSE session.** `fuse_session_new` creates a session with the registered low-level operation table. A multi-threaded event loop (`fuse_session_loop_mt`) processes kernel upcalls concurrently.
+1. `fuse_session_unmount` removes the kernel mount.
+2. `fuse_session_destroy` frees libfuse's state.
+3. The socket connections are closed.
 
-5. **Mount filesystem.** `fuse_session_mount` registers the mount with the kernel. From this point, the kernel can issue FUSE requests.
+### If `etcfuse` crashes
 
-6. **Enter event loop.** The daemon blocks in `fuse_session_loop_mt`, processing kernel upcalls. Each call triggers an IPC exchange with the Go backend over the calling worker's own connection.
+If `etcfuse` is killed, its `/dev/fuse` descriptor closes and the kernel ends
+the FUSE connection. The mount itself stays. Every later operation on it,
+including operations on files that were already open, fails with `ENOTCONN`
+("Transport endpoint is not connected") until the filesystem is unmounted and
+mounted again (`fs/fuse/dev.c`, `fuse_get_req`).
 
-### Shutdown Sequence
-
-1. **Unmount.** `fuse_session_unmount` tears down the kernel mount.
-2. **Destroy session.** `fuse_session_destroy` cleans up libfuse state.
-3. **Close socket.** The Unix socket FD is closed.
-
-### Crash Recovery
-
-If the C daemon crashes (SIGKILL), the kernel's FUSE connection ends when the `/dev/fuse` FD is closed. The mount is not removed: every subsequent operation on it, including those on descriptors that were already open, fails with `ENOTCONN` ("Transport endpoint is not connected") until the filesystem is unmounted and mounted again (`fs/fuse/dev.c`, `fuse_get_req`). The Go daemon detects the closed IPC connection and can clean up its resources — though in practice, the Go daemon typically restarts alongside the C daemon in a systemd-managed deployment.
+`etcfuse-meta` sees its connections close and frees their resources. Under
+systemd, the two services are normally restarted together.
 
 ## Session Configuration
 
-The FUSE session is configured with parameters that affect kernel-side caching and I/O characteristics:
+### Kernel capabilities
 
-| Parameter | Default | Purpose |
-|---|---|---|
-| `max_read` | 256 KiB | Maximum size of a single read request from the kernel |
-| `max_write` | 256 KiB | Maximum size of a single write request |
-| `max_background` | 128 | Maximum number of queued asynchronous requests |
+When the session starts, `etcfuse` asks the kernel for three FUSE capabilities:
+
+- `FUSE_CAP_READDIRPLUS`: a directory listing also returns each entry's
+  attributes, so `ls -l` does not need one `getattr` per entry.
+- `FUSE_CAP_ASYNC_READ`: the kernel may send several reads of one file at once.
+- `FUSE_CAP_AUTO_INVAL_DATA`: the kernel checks a file's modification time
+  and drops its cached data when it has changed. EtcFS caches directory
+  listings only if the kernel grants this, because otherwise a lost
+  invalidation could leave a listing stale indefinitely.
+
+Read and write sizes and the background queue length are left at libfuse's
+defaults.
+
+### Worker threads
+
+The loop runs with `clone_fd = 1` and up to 16 idle worker threads
+(`ETCFS_MAX_THREADS`). With `clone_fd`, every worker reads the kernel's request
+queue through its own `/dev/fuse` descriptor, so reading requests does not
+become a bottleneck shared by all threads.
+
+Each worker also has its own connection to `etcfuse-meta`, so a request waits
+only for its own reply, not for other workers' requests. Concurrent operations
+on the same file are ordered by the inode's lock in etcd, which works across
+nodes and therefore also orders threads within one node.
 
 ### Permission checking
 
-The mount is created with `-o default_permissions`, which hands access control to the kernel: it evaluates the mode, uid and gid this daemon reports for an inode against the calling process, and rejects the syscall before any request reaches the daemon.
+The mount uses `-o default_permissions`, so the kernel checks permissions. It
+compares the mode, uid and gid that EtcFS reports for an inode against the
+calling process, and rejects the call before any request reaches the daemon.
 
-That is a deliberate division of labour. EtcFS implements no access checks of its own, because a second copy of those rules in the daemon would be one that can diverge from the kernel's — and getting them subtly wrong is how a filesystem ends up enforcing something other than what `ls -l` shows. What the daemon owes in return is accurate ownership: every creating operation carries `fuse_req_ctx(req)->uid/gid` and stores it, so the values the kernel checks against are the ones the caller actually had.
-
-The multi-threaded event loop (`fuse_session_loop_mt`) processes kernel upcalls concurrently. Each handler still does synchronous IPC with the Go backend, but on a connection private to its worker thread, so a request waits only for its own backend round trip. Nothing is serialised at the daemon any more: what orders concurrent operations on the same inode is the etcd-backed inode lock, which is cluster-wide and therefore has to do that job across nodes regardless of how many threads a single mount runs.
+EtcFS has no permission checks of its own. A second implementation in the
+daemon could disagree with the kernel's, and the filesystem would then enforce
+something other than what `ls -l` shows. In return, the daemon must report
+ownership correctly: every operation that creates a file stores the caller's
+uid and gid, taken from `fuse_req_ctx(req)`.
 
 ## IPC Binary Protocol
 
-### Wire Format
+### Wire format
 
-All messages are length-prefixed binary frames over the Unix stream socket:
+Every message is a length-prefixed binary frame:
 
-**Request:** `[u16:be opcode] [u32:be payload_len] [payload]`
-**Response:** `[u32:be payload_len] [payload]`
+- **Request:** `[u16 opcode][u32 payload_len][payload]`
+- **Response:** `[u32 payload_len][payload]`
 
-Both sides use consistent byte order (big-endian). The opcode identifies the FUSE operation being performed (LOOKUP, GETATTR, CREATE, etc.). The payload is operation-specific — for LOOKUP it contains the parent inode and name; for GETATTR just the inode number.
+All integers are big-endian. The opcode names the operation (LOOKUP, GETATTR,
+CREATE, …). The payload depends on the operation; a LOOKUP payload, for
+example, is the parent inode and the name.
 
-### Request Submission
+### One request
 
-Synchronous IPC is used for all FUSE operations. From the perspective of a FUSE operation handler in the C daemon:
+From the point of view of a handler in `etcfuse`:
 
-1. The handler builds a binary payload specific to its operation (e.g., for LOOKUP: parent inode as uint64, name length as uint32, name bytes).
-2. It calls the synchronous IPC function, which sends the payload over the Unix socket and blocks until the response arrives.
-3. The handler parses the response directly and calls the appropriate `fuse_reply_*` (e.g., `fuse_reply_entry` for LOOKUP, `fuse_reply_attr` for GETATTR) — all on the same FUSE reader thread.
+1. It builds the payload for its operation. For LOOKUP: the parent inode as a
+   `u64`, the name length as a `u32`, then the name.
+2. It sends the frame on its worker's connection and waits for the reply.
+3. It parses the reply and calls the matching `fuse_reply_*` function, such as
+   `fuse_reply_entry` for LOOKUP or `fuse_reply_attr` for GETATTR, on the same
+   thread.
 
-### Response Handling
+Every reply payload starts with a 4-byte signed error code: zero for success,
+or a negated `errno`. The handler checks it before reading the rest.
 
-Every response begins with a 4-byte error code (int32, big-endian). Zero means success; a negative value is a negated errno. This uniform header lets the handler quickly determine whether to report success or error before parsing the rest of the response.
+### Operation codes
 
-### Operation Codes
+The opcodes are defined in `pkg/fuse/ops.c` and `internal/ipc/socket.go`:
 
-The protocol defines 26 operation codes covering the full FUSE low-level API:
+| Code | Operation | Code | Operation |
+|---|---|---|---|
+| 1 | LOOKUP | 17 | STATFS |
+| 2 | GETATTR | 18 | ALLOC (unused; answers `ENOSYS`) |
+| 3 | READDIR | 19 | COMMIT (unused; answers `ENOSYS`) |
+| 4 | READLINK | 22 | READ |
+| 5 | CREATE | 23 | WRITE |
+| 6 | MKDIR | 24 | FSYNC |
+| 7 | UNLINK | 25 | MKNOD |
+| 8 | RMDIR | 26 | FLUSH |
+| 9 | RENAME | 29 | READDIRPLUS |
+| 10 | SYMLINK | 30 | SETXATTR |
+| 11 | LINK | 31 | GETXATTR |
+| 12 | SETATTR | 32 | LISTXATTR |
+| 13 | OPEN | 33 | REMOVEXATTR |
+| 14 | RELEASE | 34 | LSEEK |
+| 15 | OPENDIR | 35 | FALLOCATE |
+| 16 | RELEASEDIR | | |
 
-| Code | Operation | FUSE callback |
-|---|---|---|
-| 1 | LOOKUP | `fuse_reply_entry` |
-| 2 | GETATTR | `fuse_reply_attr` |
-| 3 | READDIR | `fuse_reply_buf` (dirent entries) |
-| 4 | READLINK | `fuse_reply_readlink` |
-| 5 | CREATE | `fuse_reply_create` (new file + open) |
-| 6 | MKDIR | `fuse_reply_entry` (new directory) |
-| 7 | UNLINK | `fuse_reply_err` |
-| 8 | RMDIR | `fuse_reply_err` |
-| 9 | RENAME | `fuse_reply_err` |
-| 10 | SYMLINK | `fuse_reply_entry` |
-| 11 | LINK | `fuse_reply_entry` |
-| 12 | SETATTR | `fuse_reply_attr` |
-| 13 | OPEN | `fuse_reply_open` |
-| 14 | RELEASE | `fuse_reply_err` |
-| 15 | OPENDIR | `fuse_reply_open` |
-| 16 | RELEASEDIR | `fuse_reply_err` |
-| 17 | STATFS | `fuse_reply_statfs` |
-| 18 | ALLOC | Reserved for block allocation |
-| 19 | COMMIT | Reserved for extent commit |
-| 20 | GETLK | `fuse_reply_lock` |
-| 21 | SETLK | `fuse_reply_err` |
-| 22 | READ | `fuse_reply_buf` |
-| 23 | WRITE | `fuse_reply_write` |
-| 24 | FSYNC | `fuse_reply_err` |
+Codes 20, 21, 27 and 28 are unassigned. 27 and 28 stay reserved for POSIX
+lock requests, which the kernel handles locally (see
+[POSIX Lock Operations](../metadata/posix-lock-operations.md)), so an `etcfuse`
+that sends one gets an error rather than a different operation. Any opcode
+with no handler is answered with `ENOSYS`.
 
-The read-only operations (1–4, 13–17) form the read-only surface. Write operations (5–12, 22–24) are implemented. Block-device operations (18–19) are wired up.
+### Payload formats
 
-### Payload Formats
-
-Each operation has a fixed binary payload format on the wire: a LOOKUP request carries a parent inode and a name, and answers with the [entry response](fuse-request-dispatch.md#payload-formats) that every operation resolving an inode shares. The layouts are given once, in [Request Dispatch](fuse-request-dispatch.md#payload-formats).
+The byte layout of each request and reply is in
+[Request Dispatch](fuse-request-dispatch.md#payload-formats).

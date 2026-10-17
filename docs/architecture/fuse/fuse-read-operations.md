@@ -1,6 +1,6 @@
 # FUSE Read Operations
 
-The read-only operations that make EtcFS mountable and navigable: LOOKUP, GETATTR, READDIR, READLINK, STATFS, and ACCESS. This document covers their semantics, IPC payloads, and interactions with the kernel VFS cache.
+The operations that read the filesystem without changing it: LOOKUP, GETATTR, READDIR, READLINK, STATFS, READ, OPEN and OPENDIR. For each one, this page gives what it does, its request and reply payloads, and how it interacts with the kernel's caches.
 
 ## Table of Contents
 
@@ -11,12 +11,13 @@ The read-only operations that make EtcFS mountable and navigable: LOOKUP, GETATT
 - [READDIR](#readdir)
 - [READLINK](#readlink)
 - [STATFS](#statfs)
+- [READ](#read)
 - [OPEN and OPENDIR](#open-and-opendir)
 - [Cache Timeouts](#cache-timeouts)
 
 ## Operation Overview
 
-The read-only FUSE operations are the ones that allow applications to discover and navigate the filesystem without modifying it. Each operation is handled synchronously: the C handler builds a binary payload, sends it over the Unix socket, blocks until the Go backend responds, parses the response, and calls `fuse_reply_*` directly.
+Each operation is handled as described in [Request Dispatch](fuse-request-dispatch.md): the C handler sends a request to the Go daemon, waits for the reply, and answers the kernel.
 
 | Operation | FUSE Callback | Etcd Operation | What It Does |
 |---|---|---|---|
@@ -31,7 +32,7 @@ The read-only FUSE operations are the ones that allow applications to discover a
 
 ## LOOKUP
 
-LOOKUP is the most frequently called FUSE operation. Every path traversal by the kernel involves a series of LOOKUP calls — one per path component. For `/home/user/file.txt`, the kernel issues:
+LOOKUP is the most frequent FUSE operation. The kernel resolves a path one component at a time, with one LOOKUP per component that is not already in its cache. For `/home/user/file.txt` it issues:
 1. LOOKUP `home` in the root directory
 2. LOOKUP `user` in the `/home` directory
 3. LOOKUP `file.txt` in the `/home/user` directory
@@ -44,17 +45,14 @@ LOOKUP is the most frequently called FUSE operation. Every path traversal by the
 
 ### Processing
 
-The Go backend calls `LookupDirent(parent, name)` to resolve the name, then `GetInode(ino)` to fetch the inode record. Both calls hit etcd.
+The Go daemon calls `LookupDirent(parent, name)` to find the inode number, then `GetInode(ino)` to read the inode record.
 
-If the dirent does not exist, the response contains error `-ENOENT`. The kernel caches this negative result for `negative_timeout` seconds (default 0, meaning no negative caching — each miss re-queries).
-
-If the inode exists but the inode record cannot be decoded, the response contains error `-EIO`. This indicates metadata corruption and requires fsck attention.
+- **The name does not exist.** The reply is a *negative entry*: success with inode number 0. The kernel remembers that the name is absent for `entry_timeout` (one minute by default) and does not ask again until then, unless a watch event invalidates it first. See [FUSE Cache Management](fuse-cache-management.md#negative-cache).
+- **The inode record cannot be decoded.** The reply is `-EIO`. This means the metadata is damaged, and `fsck` should be run.
 
 ### Response
 
 The [entry response](fuse-request-dispatch.md#payload-formats): the resolved inode number, its attributes, and the two cache timeouts.
-
-### Callback
 
 ### Handler
 
@@ -62,13 +60,13 @@ The handler (`ec_lookup`) decodes the response, fills a `struct fuse_entry_param
 
 ## Root Inode Handling
 
-The root inode (`FUSE_ROOT_ID`, inode 1) is special: it is handled entirely in the C daemon without any IPC call. When the kernel issues LOOKUP for `.` or `..` in the root, or GETATTR for the root inode, the handler returns a synthetic response with the root directory's known attributes (S_IFDIR | 0755, nlink=2, size=4096).
+The root directory (`FUSE_ROOT_ID`, inode 1) is answered by the C daemon without asking the Go daemon. A GETATTR for the root, or a LOOKUP of `.` or `..` in it, gets fixed attributes: a directory with mode 0755, nlink 2 and size 4096.
 
-This avoids a circular dependency: without a root inode, the filesystem cannot be mounted; without a mount, the root inode cannot be created. The root inode is bootstrapped as a synthetic entry, and the actual root directory listing is fetched from etcd on the first READDIR.
+The kernel asks for the root's attributes while mounting, so answering locally means the mount succeeds even before the Go daemon has read anything from etcd. The root's contents are read from etcd like any other directory, on the first READDIR. Because the attributes are fixed, the root always reports nlink 2, whatever its subdirectories.
 
 ## GETATTR
 
-GETATTR is called whenever the kernel needs inode attributes — for `stat()`, `fstat()`, or after a cached attribute expires.
+The kernel sends GETATTR when it needs an inode's attributes and has none cached, for example for `stat()` or `fstat()`.
 
 ### Payload
 
@@ -78,23 +76,23 @@ GETATTR is called whenever the kernel needs inode attributes — for `stat()`, `
 
 ### Processing
 
-The Go backend calls `GetInode(ino)`. If the inode does not exist, the response carries `-ENOENT`.
+The Go daemon calls `GetInode(ino)`. If the inode does not exist, the reply is `-ENOENT`.
 
 ### Response
 
 ```
-[i32:error] [attr: 72 bytes] [u32:attr_timeout]
+[i32:error] [attr: 84 bytes] [u32:attr_timeout]
 ```
 
-The `attr_timeout` tells the kernel how long to cache these attributes before issuing another GETATTR.
+`attr_timeout` tells the kernel how long it may use these attributes before asking again.
 
-### Callback
+### Handler
 
 The handler (`ec_getattr`) decodes the attr blob, fills a `struct stat`, and calls `fuse_reply_attr`.
 
 ## READDIR
 
-READDIR is called when an application lists a directory (`ls`, `find`, shell glob). The kernel may issue multiple READDIR calls for a large directory, each with a different offset.
+The kernel sends READDIR when an application lists a directory (`ls`, `find`, a shell glob). A large directory takes several READDIR calls, each continuing from an offset. When the kernel supports it, it sends READDIRPLUS instead, which returns each entry's attributes as well.
 
 ### Payload
 
@@ -102,19 +100,22 @@ READDIR is called when an application lists a directory (`ls`, `find`, shell glo
 [u64:ino] [u64:offset] [u32:size]
 ```
 
-The `offset` is a cookie from a previous READDIR response indicating where to resume. The `size` is the kernel's buffer size for the response.
+`offset` is the position to continue from, taken from the previous reply. `size` is the size of the kernel's buffer for this reply.
 
 ### Processing
 
-The offset is a *position*, and etcd cannot skip to one: a range starts at a key. Reading position N by counting means reading the N keys before it and discarding them, so a listing that does that once per page reads the whole directory once per page — quadratic in directory size, and measured at three seconds for a 5,000-entry directory.
+The offset is a position in the listing (entry 1, 2, 3, …), but an etcd range read starts at a key, not at a position. Finding entry N by counting means reading and discarding the N entries before it. Doing that for every page reads the whole directory once per page: listing a 5,000-entry directory this way took three seconds.
 
-A scan is sequential, so the daemon remembers the last name it handed out for a directory. A request continuing from exactly there is answered by `ListDirentsAfter`, an etcd range starting after that name with a limit sized to the kernel's buffer, and one scan then costs one pass over the directory however many pages it takes. Anything that does not continue the previous reply — a `seekdir`, a second process scanning the same directory, a cursor that has expired — falls back to `ListDirents(ino)` and counting from the start. A miss is slower, and because its offset is only a position, a name created or removed before it since the previous page makes one unrelated name be skipped or returned twice (see [Namespace Operations](../metadata/namespace-operations.md#directory-listing)).
+The daemon therefore remembers, per directory, the last name it returned:
 
-Either way the page is trimmed to what the kernel's buffer can hold, from the names actually read. At least one entry is always returned, because an empty reply is how a listing ends.
+- **A request that continues from that name** is served by `ListDirentsAfter`: an etcd range read starting just after the name, limited to what fits in the kernel's buffer. A whole listing then reads each entry once.
+- **Any other request** (after a `seekdir`, from a second process listing the same directory, or after the remembered name expired) falls back to `ListDirents(ino)` and counts from the start. This is slower. Because the offset is only a position, a name created or removed earlier in the directory since the previous page can make one entry be skipped or returned twice; see [Directory Listing](../metadata/namespace-operations.md#directory-listing).
 
-The cursor holds a name, not directory contents: it is the start of a fresh linearizable range read, so a stale one cannot produce a stale listing. See [Directory Listing](../metadata/namespace-operations.md#directory-listing).
+Each reply contains as many entries as fit in the kernel's buffer, and always at least one, because an empty reply tells the kernel the listing is finished.
 
-The inode records for that page are fetched in a single batched transaction rather than one `Get` per entry, which is what made a listing of a thousand-file directory a thousand sequential etcd round trips, repeated on every `ls`. Each record supplies the entry's dirent type (DT_REG, DT_DIR, DT_LNK), which the kernel needs to populate `d_type` in `struct dirent`.
+The remembered name is only where the next etcd read starts, not a copy of the directory, so it cannot make a listing return entries that no longer exist.
+
+The inode records for the page are read in one transaction, not one `Get` per entry, so listing a 1,000-file directory is one etcd round trip rather than 1,000. Each record gives the entry's type (`DT_REG`, `DT_DIR`, `DT_LNK`), which the kernel needs for `d_type`.
 
 ### Response
 
@@ -127,17 +128,15 @@ Each entry:
 [u64:ino] [u32:name_len] [name_bytes...] [u32:type] [u64:offset]
 ```
 
-The `offset` is a monotonically increasing cookie (1, 2, 3, ...) used by the kernel to resume listing in subsequent READDIR calls.
+`offset` is the entry's position (1, 2, 3, …), which the kernel sends back to continue the listing.
 
-### Callback
+### Handler
 
-### Callback
-
-The handler (`ec_readdir`) iterates over the entries, building a dirent buffer using `fuse_add_direntry`. The kernel expects a packed `dirent` struct with `d_ino`, `d_off`, `d_reclen`, `d_type`, and `d_name`. The handler calls `fuse_reply_buf` with the assembled buffer.
+The handler (`ec_readdir`) adds each entry to a buffer with `fuse_add_direntry`, which writes the packed `dirent` the kernel expects (`d_ino`, `d_off`, `d_reclen`, `d_type`, `d_name`), and sends the buffer with `fuse_reply_buf`.
 
 ## READLINK
 
-READLINK is called when the kernel follows a symbolic link.
+The kernel sends READLINK when it follows a symbolic link.
 
 ### Payload
 
@@ -147,7 +146,7 @@ READLINK is called when the kernel follows a symbolic link.
 
 ### Processing
 
-The Go backend reads the target from a separate key (`symlink:<ino>`), distinct from the inode record. The target is stored as raw bytes.
+The Go daemon reads the target from `symlink:<ino>`, a separate key from the inode record, where it is stored as raw bytes.
 
 ### Response
 
@@ -155,17 +154,19 @@ The Go backend reads the target from a separate key (`symlink:<ino>`), distinct 
 [i32:error] [u32:target_len] [target_bytes...]
 ```
 
-### Callback
+### Handler
 
 The handler (`ec_readlink`) extracts the target string (null-terminated in the response buffer) and calls `fuse_reply_readlink`.
 
 ## STATFS
 
-STATFS is called by `statvfs()` and `df` to report filesystem-level statistics.
+The kernel sends STATFS for `statvfs()`, which `df` uses.
 
 ### Processing
 
-Total and free blocks come from the device's size and the allocator's live ratio. The file count comes from the inode allocation counter — one read, where a full scan of the inode space used to be performed for nothing but its length. The counter counts numbers handed out rather than inodes alive, so it over-reports after deletions; an upper bound is the right error to make for a number no caller can act on. Free files are reported as free blocks, since inode numbers are 64-bit and every file needs at least one block.
+- **Blocks.** Total and free blocks come from the device size and the allocator's count of free space.
+- **Files.** The file count is read from the inode allocation counter, in one etcd read instead of a scan of every inode. The counter counts inode numbers handed out, not files that still exist, so after deletions it reports too many. No program can act on this number, so an upper bound is acceptable.
+- **Free files.** Reported as equal to free blocks. Inode numbers are 64-bit, so the only limit on the number of files is space, and every file needs at least one block.
 
 ### Response
 
@@ -173,13 +174,13 @@ Total and free blocks come from the device's size and the allocator's live ratio
 [i32:error] [u64:blocks] [u64:bfree] [u64:bavail] [u64:files] [u64:ffree] [u32:bsize] [u32:namelen] [u32:frsize]
 ```
 
-### Callback
+### Handler
 
 The handler (`ec_statfs`) fills a `struct statvfs` and calls `fuse_reply_statfs`.
 
 ## READ
 
-READ is called when an application reads file data via `read()`, `cat`, or `dd`. The handler sends an IPC request to the Go backend, which retrieves the file content from the shared EBS volume.
+The kernel sends READ when an application reads file data and the data is not in the page cache. The Go daemon reads the bytes from the shared volume.
 
 ### Payload
 
@@ -187,23 +188,25 @@ READ is called when an application reads file data via `read()`, `cat`, or `dd`.
 [u64:ino] [u64:offset] [u32:size]
 ```
 
-The `offset` is the byte position within the file where reading starts. The `size` is the maximum number of bytes to read (the kernel may request up to 256 KiB).
+`offset` is where in the file the read starts, and `size` is the most bytes to return.
 
 ### Processing
 
-The Go backend takes a shared lock on the inode, and fails the read with `EAGAIN` if it cannot get one. The lock is not only excluding a racing update: a writer that buries an extent frees its blocks in the same transaction that publishes the write, so a reader proceeding without the lock could resolve an extent, have its blocks returned to the arena and handed to another file, and read back that other file's bytes. Acquisition already asks the current holder to yield and retries before giving up, so failing is the rare case and a wrong answer is not the alternative worth taking.
+**1. Take the lock.** The Go daemon takes a shared lock on the inode. If it cannot get one, the read fails with `EAGAIN`. The lock does more than keep the read consistent with a concurrent write. A write that replaces an extent frees the old extent's blocks in the same transaction that publishes the new one. Without the lock, a reader could look up the old extent, the blocks could be freed and given to another file, and the reader would return that other file's bytes. Acquiring the lock already asks the current holder to give it up and retries before failing, so `EAGAIN` is rare.
 
-With the lock held, the backend asks for the inode record and the inode's extent keys (`extent:<ino>/<chunk>`). Both are needed before the read can be answered — the record to clamp the request to the file's size, the extents to resolve the range.
+**2. Read the inode record and the extents.** The record gives the file's size, used to shorten a request that goes past the end. The extents (`extent:<ino>/<chunk>`) say where each range of the file is on the device.
 
-If this node already held the lock, both come from the snapshot cached under it and the read costs no etcd round trip at all (see [Lock Caching](../metadata/lock-caching.md)). Otherwise they are read as one serializable transaction (`Store.GetInodeAndExtents`): together rather than separately, so it is one round trip and one revision, and serializable rather than linearizable because the shared lock, not the read's place in etcd's linear order, is what keeps a concurrent writer off the range.
+- If this node already held the lock, both come from the copy cached with the lock, and the read makes no etcd request (see [Lock Caching](../metadata/lock-caching.md)).
+- Otherwise they are read in one serializable transaction (`Store.GetInodeAndExtents`), so the read costs one round trip and sees both at the same revision. A serializable read is enough because the shared lock, not etcd's ordering, is what keeps a writer off the file.
 
-For each extent, the handler parses the value `"logical_off,disk_off,length,generation"`. It finds the first extent that covers the requested offset and reads the data from the block device via `pread()` at the correct disk offset plus the offset within the extent.
+**3. Clamp the request** to the file size from the record. The kernel usually does this itself, but not always. A request past the end that was not clamped would come back as a buffer of zeroes, and the application would not get the short read that tells it the file has ended.
 
-If the file has multiple extents (e.g., from sequential writes), the handler walks them in order and copies each one into the position it occupies *within the request*, not into a running output cursor. That distinction is the whole of it: with a hole before an extent, placing its bytes at the running position shifts everything after the gap.
+**4. Copy the data.** The reply buffer starts as zeroes. For each extent, in order of file offset, the daemon reads the part of the extent that falls inside the request from the device with `pread()`, and copies it to the position that part occupies in the request. Each piece goes to its position in the request, not to the end of what has been copied so far: after a gap, appending would shift every later byte.
 
-The output buffer starts zeroed, so a hole needs no work at all — only the ranges an extent covers are filled in. The handler returns the whole range that was asked for, so a gap between extents, or a tail past the last extent, reads back as zeroes rather than as a short read. That is why the request is clamped to the size in the inode record first: the kernel usually clamps to the size it last cached, but it does not always, and an unclamped request past the end would come back as a buffer of zeroes instead of the short read a reader terminates its loop on.
+- A hole between extents, or a range past the last extent but within the file size, stays zero, so the reply is the full requested length.
+- Where two extents cover the same bytes, they arrive with the newer one first, and the first extent that covers a byte is used, so an overwrite returns the later write's data.
 
-Extents arrive ordered by logical offset, and newest first where two of them cover the same one, so taking the first extent that reaches the cursor resolves an overwrite to the later write.
+For example: a file of 12 KiB has extent A covering bytes 0–4K and extent B covering 8K–12K. A read of 0–12K returns A's data at 0–4K, zeroes at 4K–8K, and B's data at 8K–12K.
 
 ### Response
 
@@ -211,20 +214,30 @@ Extents arrive ordered by logical offset, and newest first where two of them cov
 [i32:error] [u32:data_len] [data_bytes...]
 ```
 
-If the requested offset is beyond the file's last extent, the handler returns `data_len=0` to indicate EOF. Partial reads (fewer bytes than requested) are returned when the remaining file data is smaller than the requested size.
+A read starting at or past the end of the file returns `data_len = 0`, which the application sees as end of file. A read that runs past the end returns only the bytes up to the end.
 
 ## OPEN and OPENDIR
 
-OPEN and OPENDIR are called when a file or directory is opened. OPENDIR is answered locally with a fresh file handle. OPEN goes to the backend — `O_TRUNC` has to empty the file, and the descriptor is counted there so unlinking a file's last name can keep its record alive until the last close — and the reply carries the caching decision. The backend sets it, because only the backend knows whether it can take the pages back again: `fi->keep_cache = 1` and `fi->direct_io = 0` for a file this node holds a lock on, with the pages invalidated before that lock is yielded; otherwise `fi->direct_io = 1` and `fi->keep_cache = 0`, which sends every read and write straight to the daemon. See [FUSE Cache Management](fuse-cache-management.md#data-page-cache).
+**OPENDIR** is answered by the C daemon with a new file handle.
+
+**OPEN** goes to the Go daemon, for two reasons:
+
+- with `O_TRUNC`, the file has to be emptied;
+- the daemon counts open descriptors, so that when a file's last name is removed while it is still open, its record is kept until the last close.
+
+The reply also says whether the kernel may cache the file's pages. Only the Go daemon can decide this, because it is the one that must remove those pages before another node changes the file:
+
+- if this node holds a lock on the file, the reply sets `keep_cache = 1` and `direct_io = 0`, and the daemon drops the pages before it gives up the lock;
+- otherwise it sets `direct_io = 1` and `keep_cache = 0`, so every read and write goes to the daemon.
+
+See [FUSE Cache Management](fuse-cache-management.md#data-page-cache).
 
 ## Cache Timeouts
 
-The kernel VFS maintains three caches for FUSE filesystems, each with a configurable timeout:
+The kernel keeps three caches for a FUSE filesystem. EtcFS sets their lifetimes in its replies:
 
-- **Entry cache** (`entry_timeout`, default 1.0 second): maps `(parent_ino, name)` → `ino`. LOOKUP results are cached for this duration. A shorter timeout means fresher namespace visibility at the cost of more etcd traffic.
+- **Entry cache** (`entry_timeout`, `--entry-timeout`, default 1 minute): name in a directory → inode number. Repeated lookups of the same path within this time do not reach the daemon.
+- **Negative entries** (also `entry_timeout`): the fact that a name does not exist. A repeated lookup of a missing name, such as a compiler searching include paths, is answered by the kernel.
+- **Attribute cache** (`attr_timeout`, `--attr-timeout`, default 1 minute): an inode's attributes. `stat()` within this time does not reach the daemon.
 
-- **Attribute cache** (`attr_timeout`, default 1.0 second): caches `struct stat` for an inode. `stat()` calls within this window return kernel-cached data without a FUSE upcall.
-
-- **Negative cache** (`negative_timeout`, default 0.0 seconds): caches the fact that a name does _not_ exist in a directory. Set to zero to disable — every `ENOENT` return causes a fresh LOOKUP on the next attempt. A non-zero value would reduce load for workloads that repeatedly probe non-existent paths but would delay visibility of newly created files.
-
-These timeouts represent a trade-off between freshness and performance. In a multi-node cluster, cache coherence is maintained through etcd watches: when a remote node mutates a directory, the local node receives a watch event and issues `FUSE_NOTIFY_INVAL_ENTRY` to the kernel, forcing the cache to be refreshed on the next access — regardless of the timeout.
+Another node's change does not wait for these timeouts. Every node watches the `dirent:` and `inode:` keys in etcd, and when another node changes one, the local daemon tells the kernel to drop the matching cache entry (`FUSE_NOTIFY_INVAL_ENTRY` or `FUSE_NOTIFY_INVAL_INODE`). The timeouts only matter if a watch is interrupted and cannot resume. See [FUSE Cache Management](fuse-cache-management.md).
