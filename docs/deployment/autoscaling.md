@@ -218,7 +218,9 @@ that repository's `README.md` describes the consequence.
   should drive it.
 - **A crashed member can stay registered.** Dead etcd members are removed when
   the next node joins. A cluster that crashes down to `min_size` and never
-  scales out again keeps the dead member. etcd counts it towards the cluster
-  size, so the cluster tolerates one fewer further failure than its live
-  member count suggests. Remove it with `etcdctl member remove` if the cluster
+  scales out again keeps the dead member. etcd computes quorum as (n/2)+1 over all
+  members, including members that are down, so the cluster tolerates one fewer
+  further failure than its live member count suggests (see the
+  [etcd FAQ](https://etcd.io/docs/v3.5/faq/), which also recommends removing a
+  failed member before adding its replacement). Remove it with `etcdctl member remove` if the cluster
   will stay that size.
