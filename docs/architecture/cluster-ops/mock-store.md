@@ -119,7 +119,7 @@ Key binding is implicit: keys are bound to leases only through the `WithLease` o
 
 ### Lease Revocation
 
-`RevokeLease` immediately terminates a lease, deleting all its bound keys and delivering DELETE watch events. This simulates `ReleaseLock` (which revokes the lock's backing lease).
+`RevokeLease` ends a lease at once, deleting all its bound keys and delivering DELETE watch events. It simulates a node ending its lock session or its membership lease. (In production, `ReleaseLock` deletes one holder key and never revokes the lease, because the lease is shared by all of the node's locks.)
 
 ## Watch Delivery
 

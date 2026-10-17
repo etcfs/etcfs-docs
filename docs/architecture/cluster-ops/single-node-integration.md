@@ -97,14 +97,14 @@ Subsequent LOOKUPs (path components below the root) are forwarded to the Go daem
 
 ### 4. Metadata is Discovered Lazily
 
-No metadata is pre-loaded at startup. The first access to a file or directory triggers a LOOKUP, which fetches the inode from etcd. The inode's extent list is fetched on first read or write (via `GetExtents`). Caches warm up naturally as the OS traverses paths — the kernel VFS cache, the FUSE entry/attr timeouts, and the Go daemon's in-memory inode cache all fill on demand.
+No metadata is loaded at startup. The first access to a file or directory triggers a LOOKUP, which reads the inode from etcd. A file's extents are read on its first read or write (`GetExtents`), and then kept with the file's lock. The kernel's entry and attribute caches, and the per-lock cache in the Go daemon, fill as paths are used.
 
 ## Membership Heartbeat
 
 The membership heartbeat is a goroutine (`Membership.Run`) that maintains the node's lease-backed membership key in etcd:
 
 ```
-1. Grant an etcd lease with configurable TTL (default 5s).
+1. Grant an etcd lease with TTL `--lease-ttl` (default 10 s).
 2. Put(membership:<nodeID>, {node_id, cluster, joined_at}) with lease.
 3. Start keepalive stream (client.KeepAlive).
 4. Loop:
@@ -112,17 +112,18 @@ The membership heartbeat is a goroutine (`Membership.Run`) that maintains the no
      if channel closed:
        grant new lease → re-put membership key → restart keepalive
        if grant fails: set alive=false, return
-5. On context cancel: revoke lease → set alive=false
+5. On a clean shutdown: the membership key is deleted in the departure
+   transaction (see Graceful Shutdown) → set alive=false
 ```
 
-The heartbeat runs independently of the FUSE request loop. If etcd becomes unreachable, the keepalive stream breaks, the goroutine attempts to re-establish, and after the self-fencing watchdog's 2×TTL margin, the node self-fences.
+The heartbeat runs independently of request handling. If etcd becomes unreachable, renewals stop, and once the lease has gone unrenewed for twice its TTL, the self-fencing watchdog stops the daemon.
 
 ## FUSE Session Lifecycle
 
 The C daemon creates a FUSE session with the low-level API (`fuse_lowlevel.h`) and the multi-threaded event loop (`fuse_session_loop_mt`). The session is configured with:
 
 - **Event loop:** `fuse_session_loop_mt` — multi-threaded, with `clone_fd` so each worker reads the kernel queue on its own `/dev/fuse` descriptor.
-- **Cache timeouts:** `entry_timeout=1.0`, `attr_timeout=1.0`, `negative_timeout=0.0` (no negative caching).
+- **Cache timeouts:** set per reply by the Go daemon from `--entry-timeout` and `--attr-timeout` (60 s by default). Missing names are answered with negative entries, which the kernel keeps for the entry timeout. Watches invalidate all of them when another node changes something (see [FUSE Cache Management](../fuse/fuse-cache-management.md)).
 
 The event loop blocks until the session is unmounted. Each kernel upcall calls the registered handler (e.g., `ec_lookup`). The handler does synchronous IPC with the Go backend (blocks on socket read/write) over the connection belonging to its own thread, and calls `fuse_reply_*` on that same thread.
 
@@ -256,19 +257,19 @@ IPC Service:
     ... allocate and create ...
 ```
 
-When the self-fencing watchdog fires, the Go daemon's process exits (exit code 77). This closes the Unix socket connection. The C daemon's next synchronous IPC call will fail with EIO, and the FUSE handler will respond to the kernel with an error. The FUSE session is still alive (the kernel hasn't unmounted it), but any subsequent FUSE operation that attempts an IPC call will fail with EIO.
-
-In the ideal scenario, the C daemon detects the IPC disconnection and unmounts the filesystem before the kernel receives EIOs. In practice, the process exit is so fast that there is no time for a graceful shutdown — the kernel gets EIO, applications see errors, and the system administrator must restart the daemon.
+When the self-fencing watchdog fires, the Go daemon drops its cached locks, stops its IPC server, releases its arenas and exits with code 77. Its socket connections close. Each of the C daemon's later requests fails, and the handler answers the kernel with `EIO`. The FUSE session stays mounted, so applications get `EIO` on every operation until the daemons are restarted (normally by systemd).
 
 ## Graceful Shutdown
 
 When the Go daemon receives SIGINT or SIGTERM:
 
-1. The signal handler calls `cancel()` on the root context.
-2. The membership heartbeat goroutine sees the cancelled context, revokes its lease, and exits.
-3. The self-fencing watchdog sees the cancelled context and exits (no fence).
-4. The IPC server's accept loop returns the listener error.
-5. The Go daemon exits cleanly.
+1. The IPC server stops accepting and serving requests.
+2. The daemon publishes every buffered write and releases every cached lock, then closes its lock session.
+3. It releases its arenas to the free pool.
+4. If every arena was released, it writes `departed:<node_id>` and deletes its membership key in one transaction, so the other nodes do not fence it.
+5. The self-fencing watchdog stops without fencing, and the daemon exits.
+
+See [Elastic Join and Leave § Graceful Leave](elastic-join-leave.md#graceful-leave).
 
 The C daemon must be stopped separately (via SIGINT, SIGTERM, or `fusermount -u`). When the FUSE session is unmounted:
 
