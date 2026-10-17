@@ -1,12 +1,8 @@
 # Consistency and Durability Model
 
-What EtcFS guarantees about reads and writes, what it deliberately does not,
-and the argument behind each. This page is the reference for questions of the
-form "can a node see stale data here?" and "is this write durable yet?".
-
-It states the model as implemented today, and marks separately the places
-where a planned change would move a guarantee. Anything marked *planned* is
-not built and must not be relied on.
+What EtcFS guarantees about reads and writes, what it does not, and why. Use
+this page to answer questions such as "can a node see stale data here?" and "is
+this write durable yet?".
 
 ## Table of Contents
 
@@ -17,7 +13,7 @@ not built and must not be relied on.
 - [The Lease Assumption](#the-lease-assumption)
 - [Blast Radius of a Stale Read](#blast-radius-of-a-stale-read)
 - [Lock Acquisition and Staleness](#lock-acquisition-and-staleness)
-- [Durability Today](#durability-today)
+- [The Synchronous Write Path](#the-synchronous-write-path)
 - [Durability Under Write Delegation](#durability-under-write-delegation)
 - [Why Caching Is the Only Way Past the Device Ceiling](#why-caching-is-the-only-way-past-the-device-ceiling)
 - [Comparison with NFS](#comparison-with-nfs)
@@ -26,7 +22,7 @@ not built and must not be relied on.
 ## Where State Lives
 
 Nothing is cached in etcd, and nothing is cached on the shared device. Every
-cache in the system is private RAM belonging to one node.
+cache is private memory belonging to one node.
 
 | Copy | Where it lives | Shared between nodes |
 |---|---|---|
@@ -39,87 +35,88 @@ cache in the system is private RAM belonging to one node.
 | etcd's key-value store | replicated across the etcd members | yes, by Raft |
 | the block volume | the device itself | yes, with no caching semantics |
 
-The daemon's own page cache for the device stays bypassed, and that is
-deliberate: it is the subject of [Cache Coherence](cache-coherence.md).
-`--allow-buffered-io` turns it back on and is documented as a correctness
-change, not a fallback, because a write served back out of it never proves it
-reached the other attachers.
+The daemon opens the device with `O_DIRECT`, bypassing the kernel's page cache
+for the device itself (see [Cache Coherence](cache-coherence.md)).
+`--allow-buffered-io` turns that cache on, which is unsafe on a shared device:
+a write served back from this node's cache does not show that it reached the
+other nodes.
 
-The kernel page cache above it is a different matter, because the lock supplies
-the invalidation the device cannot. A page may be cached only for an inode this
-node holds a lock on, and the daemon drops those pages — and waits for the drop
-to complete — before it yields the key. `--page-cache=false` returns to
-unconditional `direct_io = 1`, `keep_cache = 0`.
+The kernel's page cache for *files* on the mount is different, because the
+inode lock provides the invalidation the device cannot. Pages are cached only
+for inodes this node holds a lock on, and the daemon drops them, and waits until
+they are gone, before giving up the key. `--page-cache=false` turns file page
+caching off (`direct_io = 1`, `keep_cache = 0`).
 
 ## What the Shared Device Does and Does Not Provide
 
-The volume is shared: a completed `O_DIRECT` write on one node is
-visible to a read on another. It is tempting to conclude that a shared device
-removes the coordination problem. It does not, because a block device offers
-only bytes:
+On a shared volume, a completed `O_DIRECT` write on one node is visible to a
+read on another. That does not remove the need for coordination, because a
+block device offers only bytes:
 
-- **No atomicity beyond a sector.** A metadata update spanning sectors can be
-  torn by a crash. This is why every shared-disk filesystem carries a journal.
-- **No compare-and-swap.** Mutual exclusion requires an atomic read-modify-write.
-  Building exclusion from plain shared registers (Lamport's bakery) costs O(N)
-  reads per acquisition and is not fault-tolerant: a node that dies inside its
-  critical section wedges everyone. Repairing that needs leases, which need
-  failure detection, which is an agreement problem again. NVMe reservations
-  exist and EtcFS uses them, but they are whole-namespace — a fencing hammer,
-  not a per-inode lock. The one hardware primitive that could serve, the NVMe
-  fused compare-and-write, is not among the four NVMe commands AWS documents
-  for Multi-Attach `io2` volumes (Reservation Register, Acquire, Release,
-  Report); a controller's actual support is readable with `nvme id-ctrl` as
-  ONCS bit 0 and FUSES bit 0. Coordination stays in etcd, deliberately — see
+- **No atomicity beyond a sector.** An update spanning several sectors can be
+  torn by a crash. This is why every shared-disk filesystem has a journal.
+- **No compare-and-swap.** Mutual exclusion needs an atomic read-modify-write.
+  Exclusion built from plain shared reads and writes (Lamport's bakery
+  algorithm) costs one read per node for every acquisition, and a node that
+  dies while holding the lock blocks everyone. Fixing that needs leases, which
+  need failure detection, which is again an agreement problem.
+  - NVMe reservations exist, and EtcFS uses them, but they cover the whole
+    namespace: they can fence a node, not lock one inode.
+  - The hardware operation that could serve as a lock, NVMe fused
+    compare-and-write, is not among the four NVMe commands AWS documents for
+    Multi-Attach `io2` volumes (Reservation Register, Acquire, Release,
+    Report). A controller's support shows in `nvme id-ctrl` as ONCS bit 0 and
+    FUSES bit 0.
+
+  Coordination therefore stays in etcd; see
   [Design Decisions](../../design-decisions.md).
 - **No notification.** The device cannot tell node B that node A wrote. B can
-  only find out by reading, and every poll is a device I/O taken from the same
-  budget the data path needs. Moving an index onto the device does not create
-  capacity, it splits it.
-- **No cache coherence.** Each attacher's page cache is independent.
+  only find out by reading, and every such read uses the same device I/O budget
+  as file data. Keeping an index on the device would split that budget, not add
+  to it.
+- **No cache coherence.** Each node's page cache is independent.
 
-So the device supplies durability and byte visibility. It supplies none of
-atomic exclusion, change discovery, or failure detection. Those come from
-etcd, which is why coordination travels a different path from data — the
-opposite arrangement to NFS, where both go through one server.
+The device therefore provides durability and visibility of bytes, but not
+atomic exclusion, change notification or failure detection. Those come from
+etcd, so coordination and data take different paths. In NFS, by contrast, both
+go through one server.
 
-The dividing line the design follows: **the disk is used for what it is good
-at (durable, single-writer, sequential), and consensus for what only consensus
-does (atomic exclusion and discovery).**
+**The disk is used for durable, single-writer, sequential storage, and etcd for
+atomic exclusion and change discovery.**
 
 ## The Lock Is the Coherence Protocol
 
-A node may cache an inode's metadata only while it holds that inode's lock
-key. A peer that wants the inode writes a `lock_want:<ino>/<node>` key, the
-holder's watcher drops its lock key, and `releaseKeyLocked` clears the cached
-snapshot in the same step. At most one node has a usable cached copy of any
-inode's writable state at a time, and it is a copy no one else could have
-changed.
+A node may cache an inode's metadata only while it holds the inode's lock key.
+A node that wants the inode writes a `lock_want:<ino>/<node>` key; the holder's
+watcher gives up the lock key, and `releaseKeyLocked` drops the cached copy at
+the same time. At any moment at most one node has a usable cached copy of an
+inode's writable state, and nobody else can have changed it.
 
-The union of these private caches therefore behaves as one coherent cache —
-kept so by exclusion, not by living in one place. This is a software
-cache-coherence protocol of the same shape as a GFS2 glock or an NFSv4
-delegation. Details in [Lock Caching and Recall](../metadata/lock-caching.md).
+Taken together, the per-node caches behave like one coherent cache, because the
+lock keeps them from overlapping, not because they are in one place. This is
+the same kind of protocol as a GFS2 glock or an NFSv4 delegation; see
+[Lock Caching and Recall](../metadata/lock-caching.md).
 
 ## Read Guarantees
 
-**File contents are linearizable.** A read takes the inode's shared lock and
-fails with `EAGAIN` rather than proceeding without it. A shared lock is
-blocked by an exclusive holder, and an exclusive lock is blocked by any
-holder, so while the shared key is held no peer can be writing. The cached
-snapshot is tagged with the holder token it was read under, so it is usable
-only while that same key has been held continuously. The value read was
-current when the key was taken and cannot have changed before the reply, so
-the read can be linearized anywhere in its own interval — without touching
-etcd at all.
+**File contents are linearizable.** A read takes the inode's shared lock, and
+fails with `EAGAIN` rather than read without it. While the shared lock is held,
+nobody can hold the exclusive lock, so nobody is writing. The cached copy is
+tagged with the holder token it was read under, so it is used only while that
+same key has been held without a break. The data read was current when the key
+was taken and cannot change before the reply, so the read can be placed
+anywhere in its own time interval, as linearizability requires, without
+contacting etcd.
 
-**A serializable metadata read is still sound.** When the cache misses, the
-record and extents are read serializably from the colocated etcd member,
-which could in principle be behind. It cannot miss a relevant write: the lock
-acquisition that precedes it is a transaction, a quorum operation the local
-member had to apply before answering. Any write committed before that
-acquisition is at a lower revision and therefore already applied there; any
-write after it is impossible while this node holds the lock.
+**A serializable metadata read is still correct.** On a cache miss, the record
+and extents are read serializably from the local etcd member, which could in
+principle lag behind. It cannot miss a relevant write:
+
+- the lock acquisition before it is a transaction, which the local member must
+  have applied before answering;
+- any write committed before that acquisition has a lower revision, so the
+  local member has applied it too;
+- no write can happen after it while this node holds the lock.
 
 **What is not covered:**
 
@@ -163,367 +160,354 @@ write after it is impossible while this node holds the lock.
 
 ## The Lease Assumption
 
-Everything above rests on one assumption: the lock session's lease is
-honoured. If a node's session expires — a partition, or a pause past the TTL —
-etcd deletes its lock keys, a peer may take the inode, and the node can still
-believe it holds a lock it does not. This is the standard lease caveat and it
-predates the caching work; what caching changed is that the node can now serve
-from RAM while it believes it, rather than failing at etcd.
+Everything above assumes the lock session's lease is respected. If a node's
+session expires (a partition, or a pause longer than the TTL), etcd deletes its
+lock keys and another node may take the inode, while this node still believes
+it holds the lock. This is the usual weakness of leases. With caching, a node in
+that state can serve reads from memory, where without caching its reads would
+fail at etcd.
 
-Three properties bound it:
+Three properties limit it:
 
-**The check is on the operation path, not a timer.** `ensureLockKey` validates
-before any cached key is trusted, so a process paused past its lease serves
-nothing while paused and revalidates before its first operation on resuming.
+- **Every operation checks.** `ensureLockKey` checks before any cached key is
+  used, so a process paused past its lease serves nothing while paused, and
+  checks again before its first operation after resuming.
+- **The loss is acted on when it happens.** A watcher on the lock session drops
+  every cache written under a lease as soon as the lease ends, instead of
+  waiting for the next operation on each inode. This matters most for buffered
+  writes: until the loss is noticed, the node keeps accepting writes into a
+  buffer whose publication will certainly be rejected.
+- **The check compares which lease, not whether a lease is alive.** A dead
+  session is replaced by the next acquisition on any inode, so "is a session
+  alive?" becomes true again while a key written under the old lease is gone.
+  Each entry records the lease its key was written under and compares it with
+  the current one.
 
-**The loss is also acted on the moment it happens.** A watcher on the lock
-session drops every cache written under a lease as soon as that lease ends,
-rather than leaving each inode to be noticed by the next operation to touch
-it. It matters most for buffered writes: until the loss is acted on, the node
-keeps acknowledging writes into a buffer whose publication is certain to be
-rejected.
+What remains is the time between the lease expiring in etcd and the node
+noticing. It is at most the lock session's TTL (2 s, `inodeLockTTL`), much
+shorter than the self-fencing watchdog's window. Within it, a partitioned node
+can answer a read from its cache; without the cache the read would fail at
+etcd. This is the one safety property caching gives up.
 
-**The check compares lease identity, not liveness.** A dead session is
-replaced lazily by the next acquisition on any inode, so "a session is alive"
-becomes true again while a key written under the previous lease is already
-gone. The entry records the lease its key was written under and compares
-against the session's current lease. Checking liveness alone would admit
-exactly the stale holder the check exists to catch.
+The kernel page cache extends that window but adds no new case. When a key is
+given up deliberately, the pages are dropped first and the release waits for
+them. When the key turns out to be already gone (a lease that expired
+unnoticed), the pages can only be dropped afterwards, so until that completes a
+read on this node can be answered from a page cached before the loss.
+`--page-cache=false` removes this case.
 
-The residual window is the gap between the lease expiring in etcd and the
-client observing it. It is bounded by the lock session's TTL (2 s,
-`inodeLockTTL`), not by the self-fencing watchdog's much longer window.
-
-**What changed when the metadata cache was introduced:** before it, a
-partitioned node's read failed at etcd; now it can be served from cache inside
-that window. That is the one safety property the caching work traded away, and
-it is recorded here rather than left implicit.
-
-The kernel page cache widens that window rather than opening a new one, and it
-is the one cache the daemon cannot simply drop from its own memory. When a lock
-key is yielded deliberately the pages go first and the yield waits for them.
-When the key is discovered to be already gone — a lease that expired
-unobserved — the invalidation is still issued, but it can only be attempted
-after the fact, so a read on this node can be answered from a page cached
-before the loss until it completes. `--page-cache=false` removes this case
-entirely.
-
-Fencing does not open a separate hole. A generation bump stops a node's
-writes but does not delete its lock keys, so a fenced node's cached reads are
-stale only if its lease is also gone — which the check above catches. What a
-fenced node can do is block healthy peers until it exits, which is why a
-self-fence drops every cached lock ahead of the rest of shutdown.
+Fencing adds no separate case. A generation bump stops a node's writes but does
+not delete its lock keys, so a fenced node's cached reads are stale only if its
+lease is also gone, which the check above catches. A fenced node can still
+block healthy nodes until it exits, which is why a self-fence drops every cached
+lock before the rest of the shutdown.
 
 ## Blast Radius of a Stale Read
 
-Data is cached now — a kernel page for a held inode, and this node's own
-unflushed write payload — but neither widens this section, because both are
-tied to the lock and released with it. A stale *page* is bounded by the same
-window as a stale snapshot and carries the same consequence; the write buffer
-is this node's own writes, which cannot be stale to the node that made them.
-So every possible stale read still traces back to stale metadata, and the
-consequences split in two:
+Two kinds of file data are cached: kernel pages for a held inode, and this
+node's own unpublished writes. Neither adds a new way to read stale data. A
+stale page is limited by the same window as a stale cached record, and the write
+buffer holds this node's own writes, which cannot be stale to this node. Every
+possible stale read therefore comes from stale metadata, with two possible
+outcomes:
 
 **A mapping that is old but still points at this file's own blocks.** The read
-returns a previous version of the file's bytes, or the wrong length because
-the cached size is behind. Bounded, and the ordinary case.
+returns an earlier version of the file's bytes, or the wrong length because the
+cached size is behind. This is limited in time, and is the ordinary case.
 
-**A mapping that points at blocks now belonging to a different file.** This
-would be a correctness and confidentiality failure, and it is categorically
-worse. It is not reachable in the partition case: blocks become another file's
-only after being freed and reallocated, and both `planReclaim` and the
-scrubber refuse to reclaim ranges outside the arenas *this* node owns. A peer
-that takes our inode buries our extent but cannot free our blocks. Only we
-can, and doing so requires reading etcd to learn the extent is dead — which a
-partitioned node cannot do. The arena-ownership rule exists for an unrelated
-reason (a node's bitmap is rebuilt from its own extents) and caps the blast
-radius here as a side effect.
+**A mapping that points at blocks now belonging to another file.** This would
+return another file's data, a far worse failure. A partitioned node cannot
+reach it:
 
-**Known residual.** A node holds a shared lock, resolves an extent, loses its
-lease while etcd is still reachable, a peer takes the inode and buries that
-extent, this node's scrubber completes a pass, frees the blocks, and the
-allocator hands them to another file — all inside one read. It requires a full
-scrub pass (30-second interval) to fit inside a single operation. The
-scrubber's revision-conditional delete does not close it: that guard prevents
-double-freeing, not a concurrent reader. Closing it properly means the
-scrubber consulting the lock cache before freeing, which is a local map lookup
-and no round trip.
+1. Blocks belong to another file only after being freed and allocated again.
+2. Only the owner of an arena frees blocks in it: `planReclaim` and the
+   scrubber both refuse ranges outside this node's own arenas.
+3. Another node that takes our inode can supersede our extent, but cannot free
+   our blocks.
+4. To free them, this node would have to read etcd to learn that the extent is
+   dead, which a partitioned node cannot do.
+
+The arena-ownership rule exists for another reason (each node rebuilds its
+bitmap from its own extents), and limits this failure as a side effect.
+
+**One case remains.** This node holds a shared lock and resolves an extent. Its
+lease is lost while etcd is still reachable. Another node takes the inode and
+supersedes the extent. This node's scrubber then completes a pass, frees the
+blocks, and the allocator gives them to another file, all while the first read
+is still in progress. This needs a full scrub pass (every 30 s) to fit inside a
+single read. The scrubber's revision condition on its delete does not prevent
+it, because that condition prevents double frees, not a concurrent reader. The
+fix is for the scrubber to check the lock cache before freeing, a local lookup
+with no round trip.
 
 ## Lock Acquisition and Staleness
 
-**No lock decision is ever made from a read.** `AcquireLock` is a single
-transaction: the comparison (`CreateRevision == 0` over the blocking range)
-and the put of the holder key are one atomic unit evaluated by the Raft leader
-at commit time. A node whose etcd member is far behind still cannot be granted
-a lock a peer holds. Deciding it inside the transaction rather than by a
-preceding read is what closes the check-then-act window. Acquisitions also use
-the cluster-wide client, never the endpoint-pinned read client.
+**No lock decision is made from a read.** `AcquireLock` is one transaction: the
+comparison (`CreateRevision == 0` over the blocking range) and the write of the
+holder key are applied together, in the order Raft gives them. A node whose
+local etcd member lags far behind still cannot be granted a lock another node
+holds. Acquisitions also always use the cluster-wide client, never the
+local-member read client.
 
-`GetLockInfo`, `IsLocked` and `WatchLock` read lock state, and are marked
-observation-only for tooling and tests. Wiring either of the first two into an
-acquisition path would reintroduce exactly that window.
+`GetLockInfo`, `IsLocked` and `WatchLock` read lock state and are marked for
+tooling and tests only. Using either of the first two to decide an acquisition
+would reopen the gap between checking and acting that the transaction closes.
 
-The single place local state decides is the cached fast path, which can only
-ever say "I already hold this" — never "nobody holds this". It cannot
-manufacture a lock, only continue to believe in one it took, which
-is the lease case above.
+Local state decides only on the cached path, and it can only say "I already
+hold this", never "nobody holds this". It cannot create a lock, only keep
+believing in one it took, which is the lease case above.
 
-Two related failure modes are handled explicitly: a node never deletes another
-node's lock (release targets one holder key by token, and no prefix delete
-touches lock keys), and an acquisition whose reply was lost adopts its own
-orphaned key rather than blocking on it forever.
+Two related failures are handled:
 
-## Durability Today
+- **A node never deletes another node's lock.** A release deletes one holder
+  key, by its token, and no prefix delete touches lock keys.
+- **An acquisition whose reply was lost** finds and adopts its own key instead
+  of being blocked by it forever.
 
-An acknowledged write is durable in the strongest sense the system can offer.
-The write path is:
+## The Synchronous Write Path
 
-1. Allocate blocks from the node's own arena (in-memory, no etcd).
-2. `pwrite()` the data with `O_DIRECT` — on a volume that acknowledges only
-   when durable, the data is durable here. `--write-barriers` covers devices
-   with a volatile write cache that do not honour that.
-3. Commit the extent and any size change to etcd — **this is the point the
-   bytes become part of the file**.
+With `--metadata-flush-interval=0`, and for every `O_SYNC` or `O_DSYNC` write,
+an acknowledged write is as durable as the system can make it:
+
+1. Allocate blocks from the node's own arena (in memory, no etcd).
+2. `pwrite()` the data with `O_DIRECT`. On a volume that acknowledges a write
+   only when it is durable, the data is durable here. `--write-barriers` covers
+   devices with a volatile write cache.
+3. Commit the extent and any size change to etcd. **This is when the bytes
+   become part of the file.**
 4. Reply to the kernel; `write()` returns.
 
-Because step 3 precedes step 4, an acked write is in Raft on a quorum. This is
-*stronger* than POSIX requires: `write()` promises only visibility, not
-durability, and a local filesystem would have the data sitting in the page
-cache. EtcFS has no write-back cache anywhere, so it happens to give more.
+Because step 3 comes before step 4, an acknowledged write is stored by a quorum
+of etcd members. That is more than POSIX requires: `write()` promises only that
+other readers see the data, not that it survives a crash, and a local
+filesystem would keep the data in its page cache.
 
-A file is defined by its extent list, not by its bytes: blocks on the device
-that no extent references are not part of any file and are unreachable. That
-is what makes the ordering safe in the other direction — a crash between steps
-2 and 3 leaves orphaned blocks, which `Allocator.Reconstruct` returns to the
-free list on restart. See
+A file is its extent list. Blocks on the device that no extent refers to belong
+to no file and cannot be read. That is why a crash between steps 2 and 3 is
+harmless: it leaves unreferenced blocks, which `Allocator.Reconstruct` returns
+to the free list at restart. See
 [Write Ordering Invariants](../storage/write-ordering-invariants.md).
 
 ## Durability Under Write Delegation
 
-Step 3 is deferred. While this node holds an inode's exclusive lock, the extent
-record is buffered in RAM beside the cached metadata snapshot and published in
-batches; no peer can take even a shared lock in the meantime, so no peer can
-observe the gap. `--metadata-flush-interval` sets the bound (default 100 ms);
-`0` restores the behaviour above, one commit per write.
+By default, step 3 is delayed. While this node holds an inode's exclusive lock,
+the extent is buffered in memory next to the cached metadata and published
+later, in batches. No other node can take even a shared lock in the meantime,
+so none can see that the extent is missing from etcd. `--metadata-flush-interval`
+sets the maximum delay (default 100 ms); `0` gives the synchronous path above.
 
-The consequence is local and it changes the meaning of an acknowledged write:
-**a write that was acknowledged but not yet flushed is lost if the node
-crashes.**
+This changes what an acknowledged write means: **a write acknowledged but not
+yet published is lost if the node crashes.**
 
-The loss is clean rather than corrupting. What is lost is the reference to the
-bytes, so on restart the arena reclaims those blocks and the file reads back as
-it was at the last flush. There is no torn content and no partial publication,
-because publication is a single transaction. Per inode the semantics are
-"rewind to last flush", never a mixture.
+The loss is clean. What is lost is the extent pointing to the bytes, so at
+restart the arena reclaims the blocks and the file reads back as it was at the
+last publication. Publication is one transaction, so a file is never left with
+part of a flush applied: after a crash it is exactly as of the last flush.
 
 ### The payload is buffered too
 
-`--write-data-cache` (on by default whenever the flush interval is non-zero)
-buffers the write's *bytes* beside its extents rather than putting them on the
-volume as the write is served, so a write costs no device I/O either. The
-blocks are still reserved from the arena at write time, which is what lets the
-buffered extents carry their final disk offsets.
+With `--write-data-cache` (on by default when the flush interval is not zero),
+a write's *bytes* can also stay in memory until the flush, so the write costs no
+device I/O either. Its blocks are still reserved at write time, so the buffered
+extents already have their final device offsets.
 
-Three things keep that sound:
+Three rules keep this correct:
 
-1. **The flush writes data before it publishes metadata**, in that order,
-   always. Publishing an extent whose bytes are not on the volume is the one
-   inversion that turns a lost write into a read of garbage.
-2. **A read on this node consults the buffer before the device**, by disk
-   range, so a node reads back what it just wrote. No peer can read the inode
-   at all, because this node holds its lock.
-3. **The buffer is bounded and applies backpressure**, twice over. Past the
-   per-inode cap a write publishes that inode's buffer before joining it, so
-   the memory one inode's unpublished data may occupy is the same bound that
-   already limited how much a crash could lose. Past the process-wide cap —
-   256 MiB across every inode at once — the write drains *other* inodes'
-   buffers instead, because the per-inode bound multiplied by a thousand hot
-   files is no bound at all. Its own buffer is never flushed there: that would
-   invalidate the proposal the write is holding, and the write has already
-   established that its own buffer had room. An inode with an operation in
-   flight is skipped rather than waited for, so the total can overshoot by at
-   most one write per inode in flight.
+1. **A flush writes the data before it publishes the extents.** Publishing an
+   extent before its bytes are on the volume would let a crash turn a lost
+   write into a read of old block contents.
+2. **A read on this node checks the buffer before the device**, by device range,
+   so the node reads back what it has just written. No other node can read the
+   inode, because this node holds its lock.
+3. **The buffer is limited in two ways:**
+   - **Per inode.** A write that would exceed the per-inode limit first
+     publishes that inode's buffer. This limit also bounds how much one inode
+     can lose in a crash.
+   - **Per process**, 256 MiB across all inodes. A write that would exceed it
+     publishes *other* inodes' buffers, because a per-inode limit times a
+     thousand busy files is no limit. It never publishes its own inode's buffer
+     there, because that would invalidate the transaction the write is
+     building, and it has already checked that its own buffer has room. Inodes
+     with an operation in progress are skipped, not waited for, so the total
+     can exceed the limit by at most one write per such inode.
 
-The payload is buffered only where doing so pays, which is not everywhere. A
-provisioned volume meters I/O operations per second rather than capping how
-many may be outstanding, so batching small scattered writes spends the same
-budget and only turns steady latency into a burst. Two cases escape that: a
-write that continues a contiguous device run, where the flush merges it with
-its neighbours into fewer operations; and a large write, where the
-workload is bound by device latency at queue depth one and issuing the batch
-against the device's queue is pure gain. Anything else is written through as
-it was before, with only its extent deferred. The flush issues whatever it does
-hold concurrently, for the same reason. Measurements in
+Data is only buffered where that helps. A provisioned volume limits operations
+per second, not operations in flight, so batching small scattered writes uses
+the same budget and only turns steady latency into bursts. Buffering helps in
+two cases:
+
+- a write that continues a contiguous range on the device, which the flush can
+  merge with its neighbours into fewer operations;
+- a large write (at least 64 KiB), where one write at a time is limited by
+  device latency, and sending the batch concurrently uses the device's queue.
+
+Other writes go to the device immediately, and only their extent is delayed.
+The flush sends what it holds concurrently. See
 [Performance Benchmarks](../reliability/performance-benchmarks.md).
 
-Crash exposure is larger in size and unchanged in kind: the bytes are now lost
-with the mapping instead of being stranded on the volume, which is observably
-identical because an unpublished extent was unreachable either way.
-`--write-data-cache=false` restores a device write per write, and
-`--metadata-flush-interval=0` restores full synchronous behaviour.
+A crash can lose more, but loses the same kind of thing: buffered bytes are lost
+together with their extent instead of being left unreferenced on the volume,
+and either way they were unreachable. `--write-data-cache=false` writes every
+write to the device immediately, and `--metadata-flush-interval=0` makes every
+write synchronous.
 
 ### What makes it POSIX-legal
 
-`write()` promises visibility, never durability, so deferring the commit is
-legal on its own. What the durability *surface* has to keep promising:
+`write()` promises that other readers see the data, not that it survives a
+crash, so delaying the commit is allowed. The calls that do promise durability
+must keep their promises:
 
-1. **`fsync` reaches the daemon.** `ec_fsync` and `ec_flush` send an IPC
-   request and block on it. `close()` sends a flush, so a program that never
-   calls `fsync` still publishes before its descriptor goes away. `fsyncdir`
-   reaches the daemon too: namespace operations commit before they are
-   acknowledged and are never deferred, but the parent directory's *timestamp*
-   is queued rather than committed per entry, and `fsyncdir` publishes that
-   queue.
-2. **A failed flush does not discard the buffer.** Dropping dirty state after a
-   failed writeback is the Postgres fsyncgate failure — it makes the *retry*
-   succeed with the data gone. A flush that fails for a transient reason keeps
-   its buffer and every later `fsync` on that inode returns `EIO` until one
-   commits. The buffer is discarded only when it can never be published:
-   the lock key is gone, or the node is fenced. Both free the blocks back to
-   the arena and log loudly, and neither can lose data another node could see,
-   because nothing buffered was ever published. A rejection is also what a
-   committed flush whose reply was lost looks like — the retry re-proposes
-   comparisons the first attempt already invalidated — so before anything is
-   kept or discarded the flush checks whether its transaction is in fact
-   already in etcd, and adopts it if so. Only this node can have written those
-   keys, since it holds the lock, so a key carrying exactly the value the flush
-   proposed is proof that it landed.
-3. **`O_SYNC`/`O_DSYNC` disable deferral for that write.** The decision is made
-   per write, from the write request's own flags, not latched at open. It has
-   to be: a file opened with `FOPEN_DIRECT_IO` is written through
+1. **`fsync` and `close()` reach the daemon.** `ec_fsync` and `ec_flush` send a
+   request to the daemon and wait for the reply. `close()` sends a flush, so a
+   program that never calls `fsync` still publishes its writes before its
+   descriptor closes. `fsyncdir` reaches the daemon too: namespace changes are
+   committed before they are acknowledged, but the directory's timestamp is
+   queued, and `fsyncdir` publishes it.
+2. **A failed flush keeps its buffer.** Throwing away unwritten data after a
+   failed flush is the PostgreSQL "fsyncgate" bug: the application's retry of
+   `fsync` then succeeds although the data is gone. A flush that fails for a
+   temporary reason keeps its buffer, and every later `fsync` on the inode
+   returns `EIO` until a flush succeeds.
+   - The buffer is discarded only when it can never be published: the lock key
+     is gone, or the node is fenced. The blocks go back to the arena and the
+     loss is logged. No other node can lose anything, because none of it was
+     ever published.
+   - A flush that committed but whose reply was lost looks like a rejection,
+     because the retry repeats comparisons the first attempt already made
+     false. Before keeping or discarding anything, the flush therefore checks
+     whether its transaction is already in etcd, and if so treats it as
+     committed. Only this node can have written those keys, since it holds the
+     lock, so a key holding exactly the proposed value proves the commit.
+3. **`O_SYNC` and `O_DSYNC` make that write synchronous.** The decision is made
+   for each write from the flags sent with it, not at open time. It has to be:
+   on a file opened with `FOPEN_DIRECT_IO`, the kernel writes through
    `fuse_direct_write_iter`, which never calls `generic_write_sync`, so a
-   synchronous open produces no `FUSE_FSYNC` at all and waiting for one would
-   wait forever. The flags arrive on every write instead — `fuse_send_write`
-   sets `inarg->flags = fuse_write_flags(iocb)`, and libfuse surfaces it as
-   `fi->flags`. Measured on a real mount for every submission path, including
-   the asynchronous direct-IO one that AIO and io_uring use — see
-   [Design Decisions](../../design-decisions.md#o_sync-and-o_dsync-are-read-from-each-write-not-latched-at-open)
-   for the numbers — so the guarantee is not limited to synchronous writes.
-4. **`fsync` publishes both halves, in order.** It puts the buffered payload on
-   the device and then commits the extents naming it, and returns only once
-   both have happened. Without `O_DIRECT` the bytes are in this node's page
-   cache rather than on the volume even after the device write, so it flushes
-   the device as well.
-5. **A write that drops the file's set-user-ID bits is never deferred.**
-   Deferring the bytes trades durability; deferring that trades privilege. A
-   peer reading the inode during the flush interval would be told the file is
-   still setuid, so a write that changes the mode commits before it is
-   acknowledged, exactly as every write did before.
+   synchronous open never produces a `FUSE_FSYNC` to wait for. The flags arrive
+   with every write instead (`fuse_send_write` sets
+   `inarg->flags = fuse_write_flags(iocb)`, and libfuse passes it as
+   `fi->flags`). This was measured on a real mount for every submission path,
+   including the asynchronous direct I/O that AIO and io_uring use; see
+   [Design Decisions](../../design-decisions.md#o_sync-and-o_dsync-are-read-from-each-write-not-latched-at-open).
+4. **`fsync` publishes both parts, in order.** It writes the buffered data to
+   the device, then commits the extents pointing to it, and returns only after
+   both. Without `O_DIRECT`, the data can still be in this node's page cache
+   after the device write, so `fsync` also flushes the device.
+5. **A write that clears the set-user-ID bits is never delayed.** Delaying data
+   risks durability; delaying this would risk privilege. Another node reading
+   the inode during the delay would still see the file as setuid, so a write
+   that changes the mode commits before it is acknowledged.
 
 ### One transaction for many inodes
 
-An inode's proposal asserts only things about that inode: the keys it is
-rewriting are where this node last saw them, and its own lock key still exists.
-Nothing in it refers to any other inode, so several inodes' proposals
-concatenate into one transaction that means what the separate ones
-meant. The interval sweep (`Service.flushExpired`) and the shutdown flush do
-exactly that through `Service.flushEntries`: every inode whose buffer has aged
-past the interval is published together, for one Raft commit rather than one
-each.
+An inode's proposed transaction only states things about that inode: the keys
+it rewrites are as this node last saw them, and its own lock key still exists.
+Nothing in it refers to another inode, so several inodes' proposals can be
+combined into one transaction with the same meaning. The interval sweep
+(`Service.flushExpired`) and the shutdown flush do this through
+`Service.flushEntries`: every inode whose buffer has waited past the interval is
+published together, in one Raft commit.
 
-The sweep takes inodes in chunks of `flushBatchInodes` (64), and the etcd
-transaction op cap splits a chunk further when its inodes carry large buffers.
-Chunking is what bounds the wait it imposes: the sweep holds an inode's local
-lock from the moment it claims it until the transaction has committed, so an
-operation on a claimed inode waits one commit however many inodes the sweep
-finds.
+The sweep takes inodes in groups of 64 (`flushBatchInodes`), and etcd's limit on
+operations per transaction splits a group further when its buffers are large.
+The groups bound how long the sweep delays other operations: it holds each
+claimed inode's local lock until its transaction has committed, so an operation
+on that inode waits for one commit, however many inodes the sweep found.
 
-A batch is all-or-nothing, which is the wrong shape for a rejection — one inode
-whose lock key was lost would hold every other inode's writes unpublished. So a
-rejected batch is not diagnosed as a batch. Each member is retried alone through
-`flushLocked`, which has the per-inode handling a rejection needs: a commit
-whose reply was lost, a key the lease dropped, a key still held while a
-comparison failed anyway. The batch is the fast path; the single flush stays the
-one that decides what a failure meant.
+A transaction succeeds or fails as a whole, so one inode whose lock key was lost
+would keep every other inode in the batch unpublished. A rejected batch is
+therefore retried one inode at a time through `flushLocked`, which knows how to
+handle each kind of rejection: a commit whose reply was lost, a key removed with
+its lease, or a comparison that failed while the key is still held.
 
-**`close()` is not batched, and deliberately so.** Deferring the publication a
-`close()` forces is what would let a single-threaded archive's closes share a
-commit, and it was measured to break close-to-open consistency: a peer's `stat`
-does not take the inode's lock, so nothing recalls this node's on its behalf,
-and a peer reading a size etcd has not been told about stops at the old one. The
-commit at `close()` is not the durability POSIX declines to promise there — it
-is what makes a file closed on one node readable in full on another.
+**`close()` is not batched.** Batching it would let an archiver's closes share a
+commit, but it breaks close-to-open consistency: another node's `stat` does not
+take the inode's lock, so nothing makes this node publish, and that node would
+see the old size and read only that far. The commit at `close()` is not for
+durability, which POSIX does not promise at `close()`; it makes a file closed on
+one node readable in full on another.
 
 ### What makes it safe
 
-The flush carries the comparisons the buffered writes were planned against —
-each key asserted to be where this node last saw it — plus the fencing guard
-and **this node's own lock key, by exact holder token**. A prefix check would
-be satisfied by the key of the peer that took the inode away, which is
-the case the comparison exists to reject. A flush arriving after a
-lost lease or a recall therefore cannot commit, and its blocks go back to the
-arena unreferenced.
+A flush carries three kinds of condition:
 
-Ordering follows from the same rule. A recall publishes before the key is
-yielded, and refuses to yield if it cannot — making the peer wait is the safe
-direction to fail in. A flush is also forced before any operation that plans
-against what etcd holds rather than against the cached snapshot: `truncate`,
-`setattr` with a size, `fallocate`, `lseek`, and any namespace operation naming
-the inode, so `write(); close(); rename()` cannot publish a name for data that
-is not there — the ext4 delayed-allocation trap.
+- the comparisons its buffered writes were planned with (each key is where this
+  node last saw it);
+- the fencing guard;
+- **this node's own lock key, by its exact holder token.** Checking only that
+  some lock key exists under the prefix would also be satisfied by the key of
+  the node that took the inode away.
+
+A flush that arrives after a lost lease or a recall therefore cannot commit, and
+its blocks go back to the arena, referenced by nothing.
+
+The same rule decides ordering. A recall publishes before giving up the key, and
+does not give it up if publishing fails, so the other node waits instead of
+reading incomplete data. A flush is also forced before any operation that works
+from etcd's state rather than the cached copy: `truncate`, `setattr` with a
+size, `fallocate`, `lseek`, and any namespace operation naming the inode. So
+`write(); close(); rename()` cannot publish the new name before the data,
+which is the problem ext4's delayed allocation had.
 
 ### What it costs
 
-Cross-node, a peer's `stat` of an inode this node is writing lags by up to the
-flush interval; this node's own `getattr`, `lookup` and `readdirplus` serve the
-size from the buffer, so `write(); stat()` is coherent locally. Cross-crash, it
-costs unfsynced writes. It costs nothing to correctness, because a stale node
-cannot commit: quorum, the fencing guard and the lock-key comparison all stand
-in the way.
+- **Between nodes:** another node's `stat` of a file this node is writing can
+  lag by up to the flush interval. This node's own `getattr`, `lookup` and
+  `readdirplus` report the size from the buffer, so `write(); stat()` on one
+  node is consistent.
+- **Across a crash:** writes not yet published or `fsync`ed are lost.
+- **Correctness:** unaffected. A stale node cannot commit, because the quorum,
+  the fencing guard and the lock-key comparison all stop it.
 
 ## Why Caching Is the Only Way Past the Device Ceiling
 
-With metadata reads removed and the commit deferred, a read and a write are
-each one device I/O. Nothing removes that except not performing it, which means
-serving from RAM.
+With metadata reads served from cache and commits delayed, a read and a write
+each cost one device I/O. The only way to avoid that I/O is to serve from
+memory.
 
-This matters when reading benchmark numbers: any figure above the volume's
-provisioned IOPS is, by construction, not touching the volume. Caching raises
-the peak, never the sustained average — a working set larger than RAM is still
-device-bound, and a cold random read is device-bound for every filesystem.
+This matters when reading benchmarks: a figure above the volume's provisioned
+IOPS cannot be coming from the volume. Caching raises peak throughput, not the
+sustained average. A working set larger than memory is still limited by the
+device, and a cold random read is limited by the device on every filesystem.
 
-The lock makes data caching legitimate for the same reason it makes metadata
-caching legitimate, and both directions are taken. Buffering write data in RAM
-ahead of the device is described above, and it inverts nothing because the flush
-writes bytes to the device *before* committing their extents. Kernel page
-caching for inodes this node holds is the read-side counterpart: the pages are
-invalidated before the lock is yielded, and a failure to invalidate them stops
-the yield rather than being logged and ignored.
+The lock makes data caching safe for the same reason it makes metadata caching
+safe, in both directions. Writes are buffered in memory ahead of the device, as
+described above, and the flush still writes bytes before committing their
+extents. Reads can use the kernel page cache for inodes this node holds, and the
+pages are dropped before the lock is given up; if dropping them fails, the lock
+is kept.
 
-Neither shows up in a benchmark whose client opens with `O_DIRECT`, which
-bypasses the client page cache and reaches the daemon for every read.
+A benchmark that opens files with `O_DIRECT` measures neither, because it
+bypasses the page cache and reaches the daemon for every read.
 
 ## Comparison with NFS
 
-NFS caches file data in the kernel and EtcFS does not, which invites the
-question of why. NFS has a server: a single arbiter every read and write
-passes through, which can order operations, track what each client holds, and
-*initiate* a callback. A block device does none of these.
+NFS has a server: every read and write passes through it, so it can order
+operations, track what each client has cached, and start a callback itself. A
+block device can do none of this.
 
-NFS then offers two models. Its default is close-to-open consistency —
-validate at open with a `GETATTR`, cache freely until close, accept staleness
-in between. That is **weaker** than what EtcFS gives for file contents today.
-Its strong model is delegations: the server grants one, the client caches, and
-`CB_RECALL` takes it back on conflict. That is structurally identical to the
-lock cache here, with etcd and want-keys standing in for the server and its
-callback channel.
+NFS offers two consistency models:
 
-One asymmetry worth keeping straight: NFS caches in the kernel because a server
-can validate or recall. EtcFS long did not, because nothing could invalidate a
-cached page — not because the hardware forbids it. The lock turned out to be
-that missing protocol, and the recall path is the callback channel, so kernel
-page caching is now enabled for a held inode and invalidated before the lock is
-yielded. The difference that remains is who initiates: NFS's server can call
-back unprompted, while a peer here has to ask by writing a want-key.
+- **Close-to-open** (the default): a client checks a file's attributes with
+  `GETATTR` when opening it, caches freely until it closes it, and accepts stale
+  data in between. This is **weaker** than what EtcFS gives for file contents.
+- **Delegations**: the server grants a client the right to cache a file, and
+  takes it back with `CB_RECALL` when another client needs it. The lock cache
+  works the same way, with etcd and want-keys in the roles of the server and
+  its callback.
 
-NFS's throughput above its backing store comes from RAM in three forms:
-client page cache on reads, server page cache, and asynchronous writes that
-are not durable until `COMMIT`. The third is the same durability trade
-described above — NFS makes it by default.
+NFS can let the kernel cache file pages because its server can check or recall
+them. EtcFS does the same for an inode it holds a lock on, because the lock
+recall is the callback and the pages are dropped before the lock is given up.
+The difference is who starts the recall: an NFS server can call back on its own,
+while here the other node must ask by writing a want-key.
+
+NFS gets throughput beyond its backing store from memory in three places: the
+client page cache for reads, the server page cache, and asynchronous writes that
+are not durable until `COMMIT`. The third is the same durability trade as
+EtcFS's delayed commits, and NFS makes it by default.
 
 ## Summary Table
 
-Current behaviour unless marked planned.
 
 | Question | Answer |
 |---|---|
