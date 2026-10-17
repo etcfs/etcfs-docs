@@ -1,219 +1,182 @@
 # Autoscaling (ASG)
 
-An alternative to [Infrastructure (Terraform)](terraform.md)'s fixed
-`node_count` cluster: `infra/terraform-asg` (module:
-`infra/terraform/modules/etcfs-asg`) runs EtcFS nodes in an EC2 Auto Scaling
-Group instead of a fixed set of `aws_instance` resources. Use this when the
-cluster needs to grow and shrink on its own rather than through
+The `terraform-asg/` root module in
+[etcfs-terraform-modules](https://github.com/etcfs/etcfs-terraform-modules)
+(module `terraform/modules/etcfs-asg`) runs EtcFS nodes in an EC2 Auto Scaling
+Group, instead of the fixed `node_count` of [Infrastructure (Terraform)](terraform.md).
+Use it when the cluster should grow and shrink by itself rather than through
 `scripts/infra/add-compute-node.sh`.
 
-Everything below happens without an operator SSHing into a node — the ASG
-launches an instance, the instance bootstraps itself, and a Lambda cleans up
-etcd membership before an instance is terminated.
+No operator logs in to a node at any point. The ASG launches an instance, the
+instance configures itself and joins the cluster, and when an instance is
+terminated a Lambda function removes it from etcd first.
 
-## What changes vs. the fixed-node module
+## Differences from the fixed-node module
 
-- Nodes install from the GitHub release (see [Binaries](binaries.md)) via a
-  launch template's user-data script, not by SSHing in — that's the same
-  install-from-release path a real operator would use, and the only one
-  that works when nothing external has SSH access to a freshly-launched
-  instance. **`etcfuse` itself is the one exception, and only through
-  v0.35.0**: that release's `etcfuse` RPM was built on `ubuntu-latest` and
-  needs `GLIBC_2.38`, which no Amazon Linux 2023 AMI ships (AL2023 tops out
-  at glibc 2.34) — it fails to even start with `GLIBC_2.38' not found`.
-  Found running this exact deployment path against a real AL2023 instance,
-  not by inspection; `scripts/infra/bootstrap-cluster.sh` and the chaos
-  scripts never hit it because they always compile `etcfuse` on-node from a
-  local checkout, never install the release package. Fixed at the source in
-  `.github/workflows/ci.yml` (`etcfuse` now builds inside an
-  `amazonlinux:2023` container, matching `deploy/docker/Dockerfile.etcfuse`),
-  but until a release is cut *after* that fix, user-data still builds
-  `etcfuse` from the release tag's source instead of installing its RPM —
-  see the `ponytail:` comment in `scripts/node-bootstrap.sh` for the
-  exact revert condition. `etcfuse-meta`/`etcfsctl` are Go,
-  `CGO_ENABLED=0`, unaffected either way.
-- The shared io2 Multi-Attach volume is attached by each node to *itself* in
-  user-data (`aws ec2 attach-volume` against its own instance ID) — Multi-Attach
-  allows this from every node concurrently, so there is no operator
-  attach step.
-- One EBS volume, one Availability Zone. Multi-Attach is AZ-scoped, so the
-  ASG's `vpc_zone_identifier` is pinned to a single subnet in `var.az`; there
-  is no multi-AZ option here.
+- **Installation from the release.** Each node installs `etcfuse`,
+  `etcfuse-meta` and `etcfsctl` from the GitHub release RPMs (see
+  [Binaries](binaries.md)) in its launch-template user-data script. Nothing
+  connects to the instance over SSH.
+- **Self-attachment.** Each node attaches the shared io2 Multi-Attach volume to
+  itself (`aws ec2 attach-volume` with its own instance ID). Multi-Attach
+  allows every node to do this at the same time.
+- **One availability zone.** A Multi-Attach volume can only be attached within
+  one availability zone, so the ASG is pinned to a single subnet in `var.az`.
 
 ## Scale-out: how a new node joins
 
-The launch template's user-data is the whole join protocol, run on the new
-instance itself. It is two pieces: a short preamble Terraform generates,
-exporting the cluster's settings as `ETCFS_*` environment variables, followed
-by `infra/terraform/modules/etcfs-asg/scripts/node-bootstrap.sh` included
-verbatim. The script is plain bash rather than a Terraform template so that
-`shellcheck` covers it in CI, `bash -n` parses it, it can be run directly
-against a test instance, and a launcher that is not Terraform can reuse it
-unchanged — at the cost of an unset value failing at boot rather than at
-`terraform plan`, which is why the four settings with no safe default are
-required and stop the node if missing. The steps:
+The whole join procedure runs on the new instance, from its user-data. The
+user-data has two parts:
 
-1. Read its own instance ID and private IP from IMDSv2.
-2. Install etcd and `etcfuse-meta`/`etcfsctl`; build `etcfuse` (see above).
-3. Attach the shared volume to itself.
-4. **Elect the cluster-forming seed** via a DynamoDB item
-   (`<cluster_name>-etcfs-seed`, one row keyed on cluster name), not by
-   guessing from EC2 tags. A first version used EC2 instance state
-   ("running peers" via tag search) and then SSM Parameter Store for the
-   election itself — both broke under an actual concurrent 3-node boot, not
-   in theory:
-     - EC2 "running" fires the instant a VM boots, well before its etcd is
-       listening, so every simultaneously-launched node picked a peer with
-       nothing on 2379 yet and all made the same mistake at once.
-     - SSM Parameter Store's `put-parameter` without `--overwrite` is an
-       atomic *create* (one winner), but its reclaim path for a dead seed
-       had no compare-and-swap, only an unconditional `--overwrite`.
-       Running the real 3-node race twice produced two different forks:
-       three nodes reclaiming within 12 seconds of each other and each
-       forming its own single-node cluster, and a live-but-slow seed having
-       its claim stolen out from under it by a joiner whose own timeout
-       fired first.
-   DynamoDB's conditional `PutItem` is true CAS: the atomic create is the
-   same primitive, and a reclaim of a seed that hasn't answered within a
-   generous 600-second staleness bar is conditioned on the exact
-   previously-read item, so concurrent reclaimers still converge on exactly
-   one winner. Verified clean over a real concurrent 3- and 5-node boot
-   after the fix.
+1. a short preamble generated by Terraform that exports the cluster's settings
+   as `ETCFS_*` environment variables;
+2. `terraform/modules/etcfs-asg/scripts/node-bootstrap.sh`, included unchanged.
 
-   **The row is a bootstrap hint, never a liveness oracle.** Nothing
-   refreshes it after cluster formation — not the seed, not the
-   graceful-leave Lambda — so a long-lived cluster whose original seed has
-   since been scaled in or replaced still carries a row naming a dead IP
-   with a `created_at` far past the staleness bar. Reclaiming on that alone
-   would clear the age check on the first attempt and form a second,
-   single-node etcd cluster beside a perfectly healthy quorum, both
-   attached to the same block device. The staleness bar only ever protected
-   the concurrent-boot window it was written for. So before any reclaim, a
-   joiner tag-discovers every other node and probes its `:2379/health`
-   directly: if any peer answers, the cluster is alive and the row is
-   merely out of date — join through that peer instead, and conditionally
-   repoint the row at it so the next joiner gets a live hint. Only when the
-   recorded seed is unreachable, past the staleness bar, *and* no peer is
-   serving does the reclaim run. The repoint is best-effort; losing its CAS
-   to another node doing the same thing is a correct outcome.
-5. **Won the election** → form a new etcd cluster
+The script is plain bash rather than a Terraform template. That way CI can run
+`shellcheck` and `bash -n` on it, it can be run by hand against a test
+instance, and the CloudFormation template can reuse it. The cost is that a
+missing setting is only noticed when the node boots, not at `terraform plan`.
+The four settings with no safe default are therefore required, and the script
+stops if any of them is unset.
+
+The script does the following:
+
+1. **Identify itself.** It reads its instance ID and private IP from IMDSv2.
+2. **Install.** It installs etcd and the three EtcFS packages.
+3. **Attach the volume** to itself.
+4. **Find or elect the seed.** The seed is the node that forms the etcd cluster
+   when none exists yet. The election uses one DynamoDB item per cluster
+   (table `<cluster_name>-etcfs-seed`):
+   - The first node to create the item with a conditional `PutItem` wins.
+     DynamoDB conditional writes are atomic, so exactly one node wins even
+     when several boot at once.
+   - If the recorded seed has not become reachable within 600 seconds, another
+     node may take over the item. The takeover is a conditional write against
+     the exact item it read, so when several nodes try at once, only one
+     succeeds.
+
+   Two simpler mechanisms fail under a concurrent boot:
+   - **Choosing a running peer by EC2 tag.** An instance is "running" as soon
+     as it boots, long before its etcd listens on port 2379. Nodes booting
+     together all pick a peer with nothing listening yet.
+   - **SSM Parameter Store.** Creating a parameter without `--overwrite` is
+     atomic, but taking over a dead seed's parameter can only be done with an
+     unconditional `--overwrite`. Two nodes taking over at once each form
+     their own single-node cluster.
+
+   The DynamoDB item is only a hint about where to join, not a record of who is
+   alive. Nothing updates it after the cluster forms, so in a cluster that has
+   run for a while it usually names a seed that has since been replaced, with
+   a timestamp far past 600 seconds. Taking over on age alone would then start
+   a second etcd cluster next to a healthy one, both using the same block
+   device. Before any takeover, the joining node therefore finds the other
+   nodes by tag and checks each one's `:2379/health`:
+   - if any peer answers, the cluster is alive; the node joins through that
+     peer and repoints the item at it (a conditional write, which may lose to
+     another node doing the same, and that is fine);
+   - only if the recorded seed is unreachable, the item is older than 600
+     seconds, and no peer answers does the node take over the item.
+5. **If it is the seed**, it starts a new etcd cluster
    (`--initial-cluster-state new`) with itself as the only member.
-6. **Lost the election** → before calling `etcdctl member add` against the
-   elected seed, clear any etcd member whose peer IP has no matching
-   running/pending EC2 instance in the cluster. This matters specifically
-   for a node that crashed rather than left through the graceful path
-   below: its etcd membership entry never gets removed on a bare crash, and
-   etcd's own operational guidance is explicit that adding a replacement
-   member *before* removing a dead one raises the quorum bar (3-of-4)
-   before the replacement is even up, which can wedge the config change.
-   Reproduced this for real by hard-killing a node with
-   `ec2:TerminateInstances` (bypassing the ASG lifecycle hook entirely) and
-   watching the next replacement's `member add` fail against the
-   dead-but-still-registered member; fixed by having every joiner clear
-   stale members first, which is safe to run redundantly since removing an
-   already-gone member ID is a harmless no-op. Then run `member add`,
-   parse the `ETCD_INITIAL_CLUSTER` string it returns, and start etcd with
-   `--initial-cluster-state existing`. Same retry-and-recover logic as
-   `add-compute-node.sh`'s `member add` step for a member that landed but
-   couldn't be read back.
-7. Start `etcd`, then `etcfuse-meta`. Where its settings go depends on the
-   binary that was installed: the script asks `etcfuse-meta --help` whether
-   it supports `--config` and passes everything as flags in the drop-in when
-   it does not. That check is not defensive dressing — `--config` landed
-   after the last release, and an older binary does not reject a config file
-   it cannot read, it never looks for one. A node that wrote the file anyway
-   came up *looking* healthy and was not: endpoints fell back to
-   `localhost:2379`, no block device was opened, and fencing dropped to
-   single-signal, so the FUSE mount succeeded and every write to it returned
-   EIO. Found by booting this exact path on AWS. Once a release carries the
-   flag, the same script starts using the file with no change. With
-   `--config` support present, settings are written to
-   `/etc/etcfs/etcfuse-meta.yaml` — endpoints, cluster name, lease TTL,
-   device and fencing volume, everything the cluster shares — leaving the
-   package's own flagless `ExecStart` untouched, so an upgrade cannot drop
-   them. Only this instance's identity (`--node-id`, `--ec2-instance-id`)
-   goes in a drop-in override, because no file shared by every node can
-   carry it. The split is forced rather than stylistic: a flag beats the
-   file, so anything left on the command line would override the same key
-   in the file without saying so. `etcfuse` is written as a full unit (no
-   package unit to override, since it's built from source — see above).
-8. Wait for the FUSE mount to come up; a failure dumps the last 60 lines of
-   both daemons' journals before exiting non-zero, so a stuck instance fails
-   its EC2 status check instead of silently sitting unmounted.
+6. **Otherwise it joins the existing cluster**:
+   1. It removes every etcd member whose peer IP belongs to no running or
+      pending instance of the cluster. A node that crashed, rather than leaving
+      through the scale-in path below, is still registered as an etcd member.
+      Adding a new member before removing the dead one raises the quorum (for
+      example to 3 of 4) before the new member is running, and the
+      configuration change can then stall. Removing a member that is already
+      gone does nothing, so every joining node can safely run this step.
+   2. It runs `etcdctl member add`, reads the `ETCD_INITIAL_CLUSTER` string it
+      returns, and starts etcd with `--initial-cluster-state existing`. If the
+      member was added but the response was lost, it recovers the same way as
+      `add-compute-node.sh`.
+7. **Start the daemons.** It starts `etcd`, then `etcfuse-meta`:
+   - The script runs `etcfuse-meta --help` to check whether the installed
+     binary supports `--config`. A binary without it does not reject a config
+     file; it never reads one. Writing settings to a file it ignores would
+     start a daemon that falls back to `localhost:2379`, opens no block
+     device, and fences with a single signal: the mount appears, and every
+     write returns `EIO`.
+   - With `--config` support, the settings every node shares (endpoints,
+     cluster name, lease TTL, device, fencing volume) go in
+     `/etc/etcfs/etcfuse-meta.yaml`, and the package's `ExecStart` is left
+     unchanged so an upgrade cannot drop them. Only this node's identity
+     (`--node-id`, `--ec2-instance-id`) goes in a systemd drop-in. Command-line
+     flags override the file, so any shared setting also left on the command
+     line would silently win over the file.
+   - Without `--config` support, every setting is passed as a flag in the
+     drop-in.
+8. **Wait for the mount.** If the FUSE mount does not appear, the script prints
+   the last 60 lines of both daemons' journals and exits non-zero, so the
+   instance fails its EC2 status check instead of running unmounted.
 
-No launch-side lifecycle hook: an instance that is still bootstrapping just
-isn't healthy yet under the default `EC2` health check.
+There is no lifecycle hook on launch: an instance that is still configuring
+itself simply is not healthy yet under the default `EC2` health check.
 
-Stress-tested on real AWS: two nodes hard-killed outright (crash, not
-graceful termination) with the cluster staying fully readable/writable
-throughout on the survivors; a scale-out 3→5 and a graceful scale-in 5→3
-layered on top; ended on a clean N-member etcd cluster and identical file
-checksums on every node.
+This path was tested on AWS by hard-killing two nodes (a crash, not a graceful
+termination) while the survivors kept reading and writing, then scaling out
+from 3 to 5 nodes and back in to 3. It ended with a clean etcd membership and
+identical file checksums on every node.
 
-## Scale-in: graceful etcd member removal
+## Scale-in: removing the etcd member
 
-Terminating an ASG instance is not the same as a clean cluster departure.
-Without intervention the ASG just kills the instance: EtcFS's own fencing
-handles the resulting crash safely at the application layer (self-fencing,
-the generation guard) immediately, but etcd's Raft membership is a separate
-concern — nothing removes the dead node's etcd member until the *next* node
-join runs the stale-member cleanup described above. A churn-heavy ASG with
-no scale-out in between would otherwise accumulate dead members and
-eventually cost real quorum.
+When the ASG terminates an instance, EtcFS treats it as a crash: self-fencing
+and the generation guard protect the filesystem straight away. etcd's own
+membership is separate, though. Without help, the dead node's etcd member stays
+registered until the next node joins and runs the cleanup above. An ASG that
+keeps scaling in without scaling out would accumulate dead members and
+eventually lose quorum.
 
-The module wires an `autoscaling:EC2_INSTANCE_TERMINATING` lifecycle hook to
-a Lambda (`infra/terraform/modules/etcfs-asg/lambda/graceful_leave.py`) via
-an EventBridge rule on `"EC2 Instance-terminate Lifecycle Action"`:
+The module therefore attaches an `autoscaling:EC2_INSTANCE_TERMINATING`
+lifecycle hook, which an EventBridge rule on `"EC2 Instance-terminate Lifecycle
+Action"` routes to a Lambda function
+(`terraform/modules/etcfs-asg/lambda/graceful_leave.py`):
 
-1. The Lambda looks up the terminating instance's `ClusterName` tag and
-   private IP.
-2. It finds one *surviving* peer (same tag search as the join path) — the
-   terminating instance itself may already be unreachable by this point.
-3. It runs `etcd member remove` on that peer via **SSM Run Command**
-   (`AWS-RunShellScript`), resolving the member's hex ID from
-   `member list` by matching the dying node's peer URL in the same script,
-   so there is no separate lookup call that could go stale.
-4. It always calls `autoscaling:CompleteLifecycleAction` with `CONTINUE`,
-   even if the member remove failed — a stuck lifecycle hook blocks
-   termination entirely, which is worse than a dangling etcd member the
-   next scrub/fsck pass will report.
+1. The Lambda looks up the terminating instance's `ClusterName` tag and private
+   IP.
+2. It finds one surviving node, by the same tag search as the join path. The
+   terminating instance may already be unreachable.
+3. It runs `etcd member remove` on that survivor through **SSM Run Command**
+   (`AWS-RunShellScript`). The same script finds the member's hex ID in
+   `member list` by the dying node's peer URL, so the ID cannot go stale
+   between two calls.
+4. It always calls `autoscaling:CompleteLifecycleAction` with `CONTINUE`, even
+   if the removal failed. A lifecycle action that never completes blocks the
+   termination, which is worse than a leftover etcd member.
 
-`default_result = "CONTINUE"` on the hook itself is the same fallback: if the
-Lambda never runs at all (throttled, cold-start timeout beyond the 180s
-heartbeat), the ASG still completes termination rather than hanging forever.
+The hook's `default_result = "CONTINUE"` covers the case where the Lambda does
+not run at all, for example if it is throttled or runs past the 180 s heartbeat:
+the ASG completes the termination instead of waiting forever.
 
 ## IAM
 
-Two roles are involved, both provisioned once per account by
-[`fencing-iam.sh`](terraform.md) plus this module:
+Two roles are involved:
 
-- **Node role** (`etcfs-nodes`, from `scripts/infra/fencing-iam.sh create`):
-  unchanged fencing permissions (`ec2:DetachVolume`/`AttachVolume`,
-  `Describe*`), **plus `AmazonSSMManagedInstanceCore`**, now attached by the
-  same script. That managed policy is what registers the node with SSM and
-  lets a surviving peer receive the graceful-leave Lambda's Run Command —
-  without it, scale-in still happens, just without the clean
-  `member remove` step.
-- **Lambda role** (`<cluster_name>-graceful-leave`, created by the
-  `etcfs-asg` module): `autoscaling:CompleteLifecycleAction`,
-  `ec2:DescribeInstances`, `ssm:SendCommand` + `ssm:GetCommandInvocation`,
-  and CloudWatch Logs write. Scoped to what the Lambda actually calls —
-  nothing else.
+- **Node role** (`etcfs-nodes`, created by `scripts/infra/fencing-iam.sh
+  create`). It holds the fencing permissions (`ec2:DetachVolume`,
+  `ec2:AttachVolume`, `Describe*`) and the managed policy
+  `AmazonSSMManagedInstanceCore`. That policy registers the node with SSM, so a
+  surviving node can receive the Lambda's Run Command. Without it, scale-in
+  still works but skips the `member remove`.
+- **Lambda role** (`<cluster_name>-graceful-leave`, created by the `etcfs-asg`
+  module). It allows only what the Lambda calls:
+  `autoscaling:CompleteLifecycleAction`, `ec2:DescribeInstances`,
+  `ssm:SendCommand`, `ssm:GetCommandInvocation` and writing to CloudWatch
+  Logs.
 
-Run `fencing-iam.sh create` (idempotent, safe to re-run) before the first
-`terraform apply` against `infra/terraform-asg`, same as the fixed-node
-path.
+Run `fencing-iam.sh create` before the first `terraform apply`. It is safe to
+run again.
 
 ## Usage
 
 ```bash
 ./scripts/infra/fencing-iam.sh create   # once per account
 
-terraform -chdir=infra/terraform-asg init
-terraform -chdir=infra/terraform-asg apply
+terraform -chdir=../etcfs-terraform-modules/terraform-asg init
+terraform -chdir=../etcfs-terraform-modules/terraform-asg apply
 ```
 
-Check cluster health once nodes are up:
+Check the cluster once the nodes are up:
 
 ```bash
 INSTANCE_IP=$(aws ec2 describe-instances \
@@ -223,7 +186,7 @@ INSTANCE_IP=$(aws ec2 describe-instances \
 etcfsctl --etcd-endpoints=http://$INSTANCE_IP:2379 status
 ```
 
-Scale out/in by changing desired capacity:
+Scale by changing the desired capacity:
 
 ```bash
 aws autoscaling set-desired-capacity --auto-scaling-group-name etcfuse-asg --desired-capacity 4
@@ -232,32 +195,30 @@ aws autoscaling set-desired-capacity --auto-scaling-group-name etcfuse-asg --des
 Teardown:
 
 ```bash
-terraform -chdir=infra/terraform-asg destroy
+terraform -chdir=../etcfs-terraform-modules/terraform-asg destroy
 ```
 
 ## CloudFormation
 
-[etcfs-cloudformation-template](https://github.com/etcfs/etcfs-cloudformation-template) builds
-this cluster from a CloudFormation stack. It reimplements none of the above:
-its user-data exports the stack's parameters as `ETCFS_*` variables,
-downloads `scripts/node-bootstrap.sh` from the Terraform module, and runs it
-— so the seed election, the `member add` and the stale-member cleanup have
-one implementation shared by both paths. It omits the graceful-leave Lambda,
-whose source is too long to inline; see that repository's `README.md` for
-what that costs.
+[etcfs-cloudformation-template](https://github.com/etcfs/etcfs-cloudformation-template)
+builds the same cluster from a CloudFormation stack. Its user-data exports the
+stack's parameters as `ETCFS_*` variables, downloads `node-bootstrap.sh` from
+this module and runs it. The seed election, `member add` and stale-member
+cleanup therefore have one implementation for both paths. The template does not
+include the graceful-leave Lambda, because its source is too long to inline;
+that repository's `README.md` describes the consequence.
 
-## What this does not cover
+## Limitations
 
-- **Cross-AZ resilience.** One AZ, by the Multi-Attach constraint above — a
-  full AZ outage takes the cluster down regardless of ASG size.
-- **Scaling policies** (CPU/queue-depth-driven `aws_autoscaling_policy`).
-  The module exposes `min_size`/`max_size`/`desired_capacity`; wiring a
-  scaling policy on top is unopinionated and left to the deployer, since
-  EtcFS itself has no metric that should drive it — this is capacity
-  management, not something the filesystem needs to react to.
-- **A dead member from a crash at `min_size` with no further scale-out.**
-  Stale-etcd-member cleanup runs when the *next* node joins; a cluster that
-  crashes down to `min_size` and never scales past it again keeps the dead
-  member registered indefinitely (harmless to correctness — Raft quorum
-  math still works off the live majority — but worth a manual
-  `etcdctl member remove` if it's going to stay that way).
+- **No cross-AZ resilience.** The cluster lives in one availability zone, so
+  an AZ outage takes it down whatever the ASG size.
+- **No scaling policies.** The module exposes `min_size`, `max_size` and
+  `desired_capacity`. Scaling on CPU or queue depth with an
+  `aws_autoscaling_policy` is left to the deployer; EtcFS has no metric that
+  should drive it.
+- **A crashed member can stay registered.** Dead etcd members are removed when
+  the next node joins. A cluster that crashes down to `min_size` and never
+  scales out again keeps the dead member. etcd counts it towards the cluster
+  size, so the cluster tolerates one fewer further failure than its live
+  member count suggests. Remove it with `etcdctl member remove` if the cluster
+  will stay that size.

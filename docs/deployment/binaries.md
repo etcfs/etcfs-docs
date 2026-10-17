@@ -1,9 +1,9 @@
 # Binaries and containers
 
-Every push to `main` that semantic-release decides is a release runs a
-`release-assets` CI job against the tag it just created
-(`.github/workflows/ci.yml`). It builds all three binaries, packages them,
-and publishes:
+When a push to `main` produces a release (semantic-release decides from the
+commit messages), the `release-assets` CI job in `.github/workflows/ci.yml`
+builds the three binaries for the new tag, packages them, and publishes these
+release assets:
 
 - `etcfuse-<version>-linux-amd64.tar.gz`, `etcfuse-meta-<version>-linux-amd64.tar.gz`,
   `etcfsctl-<version>-linux-amd64.tar.gz`
@@ -11,11 +11,10 @@ and publishes:
 - `etcfuse-<version>-1.x86_64.rpm`, `etcfuse-meta-<version>-1.x86_64.rpm`, `etcfsctl-<version>-1.x86_64.rpm`
 - `checksums.txt` (sha256, one line per artifact above)
 
-as assets on the GitHub release, and pushes three container images to
+It also pushes three container images, tagged `<version>` and `latest`:
 `ghcr.io/etcfs/etcfuse`, `ghcr.io/etcfs/etcfuse-meta` and
-`ghcr.io/etcfs/etcfs-csi` (the [CSI driver](kubernetes-csi.md))
-(tagged `<version>` and `latest`). `etcfsctl` has no image — it's a client
-tool, not something you run as a service.
+`ghcr.io/etcfs/etcfs-csi` (the [CSI driver](kubernetes-csi.md)). `etcfsctl`
+has no image, because it is a command-line client rather than a service.
 
 ## Install from a release
 
@@ -29,14 +28,13 @@ sha256sum --ignore-missing -c checksums.txt
 sudo apt install ./etcfuse-meta_${VERSION}_amd64.deb
 ```
 
-`.deb`/`.rpm` for `etcfuse` and `etcfuse-meta` install the binary to
-`/usr/local/bin/` and the matching unit from `deploy/systemd/` to
-`/usr/lib/systemd/system/`, then `systemctl daemon-reload`. Neither package
-enables or starts the service — both need cluster-specific flags filled in
-first. See [Configuration](configuration.md).
+The `etcfuse` and `etcfuse-meta` packages install the binary to
+`/usr/local/bin/`, install the matching systemd unit from `deploy/systemd/` to
+`/usr/lib/systemd/system/`, and run `systemctl daemon-reload`. Neither package
+enables or starts the service, because both need cluster-specific settings
+first; see [Configuration](configuration.md).
 
-`etcfsctl`'s package is the binary only, no unit — it's invoked directly
-against a running cluster's etcd endpoints.
+The `etcfsctl` package contains only the binary.
 
 RPM-based distros: `sudo dnf install ./etcfuse-meta-${VERSION}-1.x86_64.rpm`.
 
@@ -47,19 +45,21 @@ docker pull ghcr.io/etcfs/etcfuse-meta:latest
 docker pull ghcr.io/etcfs/etcfuse:latest
 ```
 
-Built from `deploy/docker/Dockerfile.etcfuse-meta` and
-`deploy/docker/Dockerfile.etcfuse` — see those files for the multi-stage
-build (Go image / Amazon Linux 2023 + `fuse3-devel`, each copied into a
-minimal runtime base). `docker compose` (`deploy/docker/docker-compose.yml`)
-builds these locally rather than pulling — point it at the published tags
-instead by replacing each service's `build:` block with `image:` if you want
-compose to use a released version.
+The images are built from `deploy/docker/Dockerfile.etcfuse-meta` and
+`deploy/docker/Dockerfile.etcfuse`. Each is a multi-stage build: the Go daemon
+compiles in a Go image and the C daemon in Amazon Linux 2023 with
+`fuse3-devel`, and each binary is then copied into a minimal runtime image.
+
+`deploy/docker/docker-compose.yml` builds these images locally instead of
+pulling them. To run a released version with compose, replace each service's
+`build:` block with an `image:` line naming the published tag.
 
 ## Package specs and local testing
 
-`packaging/nfpm/{etcfuse,etcfuse-meta,etcfsctl}.yaml` — one [nfpm](https://nfpm.goreleaser.com)
-spec per binary; `packaging/nfpm/scripts/postinstall.sh` (shared by the two
-daemon packages) just reloads the systemd unit cache.
+Each binary has an [nfpm](https://nfpm.goreleaser.com) spec in
+`packaging/nfpm/` (`etcfuse.yaml`, `etcfuse-meta.yaml`, `etcfsctl.yaml`). The
+two daemon packages share `packaging/nfpm/scripts/postinstall.sh`, which only
+reloads systemd's unit files.
 
 Build a package locally without CI:
 
@@ -76,6 +76,6 @@ make all      # bin/etcfuse, bin/etcfuse-meta, bin/etcfsctl
 make check    # lint + test — CI's entry point
 ```
 
-Needs `libfuse3-dev`/`fuse3-devel` for the C daemon; the Go binaries have no
-external build dependency (`CGO_ENABLED=0`, statically linked). See
-`Makefile` for the full target list.
+The C daemon needs `libfuse3-dev` (Debian) or `fuse3-devel` (RPM). The Go
+binaries are built with `CGO_ENABLED=0`, statically linked, and need nothing
+else. The `Makefile` lists every target.

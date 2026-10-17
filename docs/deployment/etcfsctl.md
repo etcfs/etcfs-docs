@@ -1,10 +1,12 @@
 # etcfsctl
 
-Operator CLI — a front door onto `pkg/fsck`, `pkg/fsinfo`, `pkg/membership`,
-`pkg/arena` and `pkg/fencing` that talks straight to etcd, no daemon
-involved. `--fsck`/`--info` exist as flags on `etcfuse-meta` too, but that
-means running the thing that mounts the filesystem just to check it;
-`etcfsctl` doesn't.
+`etcfsctl` is the operator's command-line tool. It connects directly to etcd,
+with no EtcFS daemon involved, and runs the code in `pkg/fsck`, `pkg/fsinfo`,
+`pkg/membership`, `pkg/arena` and `pkg/fencing`.
+
+`etcfuse-meta` also has `--fsck` and `--info` flags, but using them means
+starting the daemon that mounts the filesystem. `etcfsctl` can check a cluster
+without mounting anything.
 
 ```
 etcfsctl [flags] <command> [args]
@@ -26,33 +28,36 @@ etcfsctl [flags] <command> [args]
 
 ## Quotas are advisory
 
-A quota records a limit and `etcfsctl quota` reports usage against it. Nothing
-rejects a write for exceeding one: there is no enforcement on the write or
-create path, and a subtree may run past its limit until someone looks.
+A quota records a limit, and `etcfsctl quota` reports usage against it. No
+write or create is rejected for exceeding a limit, so a directory tree can grow
+past its quota until someone runs the report. The reported usage is as of the
+moment the report ran.
 
-That is a deliberate trade rather than a gap. An inode records no parent, so
-charging a write to its enclosing quota root as it happens would need either a
-parent pointer on every inode — a second source of truth to keep consistent
-with the directory entries — or another Raft round trip in the transaction that
-publishes the write. The write path is already bound by how many round trips it
-makes, and a policy limit is not worth paying that on every write. Usage is
-therefore as of the last time the report was run.
+Quotas are not enforced because an inode does not record its parent directory.
+Charging each write to its quota root as it happens would need one of two
+things:
 
-Both `quota set` and `quota` print a note saying so, so a limit that rejects
-nothing is not mistaken for one that does.
+- a parent pointer on every inode, which is a second record to keep consistent
+  with the directory entries;
+- an extra Raft round trip in the transaction that publishes each write.
+
+Writes are already limited by their round trips, and a quota is a policy limit,
+so neither cost is paid. See [Metadata Schema](../architecture/metadata/metadata-schema.md#quota-keys).
+
+`quota set` and `quota` both print a note that the limit is not enforced.
 
 ## Flags
 
-Go before the command — `flag.Parse` stops at the first positional argument,
-so anything after the subcommand except `--json` (see below) is passed
-through unparsed:
+Flags go before the command. `flag.Parse` stops at the first positional
+argument, so everything after the subcommand is passed to it unparsed, except
+`--json`:
 
 | Flag | Default | Notes |
 |---|---|---|
 | `--etcd-endpoints` | `http://localhost:2379` | Comma-separated. |
 | `--etcd-cert`, `--etcd-key`, `--etcd-ca` | unset | etcd client TLS. |
-| `--timeout` | `10s` | Bounds the etcd work behind one command — a partitioned cluster would otherwise hang it indefinitely. |
-| `--json` | `false` | Emit machine-readable JSON. Order-independent: stripped out of `os.Args` before subcommand parsing, so `etcfsctl status --json` and `etcfsctl quota set 10 --json --bytes=5` both work. |
+| `--timeout` | `10s` | Limits how long one command waits on etcd; without it, a partitioned cluster would hang the command. |
+| `--json` | `false` | Print JSON. Accepted anywhere on the line, because it is removed from the arguments before the subcommand parses them: `etcfsctl status --json` and `etcfsctl quota set 10 --json --bytes=5` both work. |
 
 ## Examples
 

@@ -1,16 +1,21 @@
 # Monitoring
 
-`etcfuse-meta` exposes Prometheus metrics when started with `--metrics-addr`
-(e.g. `--metrics-addr=:9090`); unset, the endpoint doesn't exist. The C
-daemon (`etcfuse`) has no metrics of its own — everything observable is on
-the Go side, since that's where etcd, the block device and fencing all live.
+`etcfuse-meta` serves Prometheus metrics when started with `--metrics-addr`,
+for example `--metrics-addr=:9090`. Without the flag there is no metrics
+endpoint. The C daemon, `etcfuse`, has no metrics of its own: etcd access, the
+block device and fencing are all in the Go daemon, so that is where the metrics
+are.
 
-The same address also serves `/healthz` and `/readyz` for orchestrators:
-`/healthz` answers 200 for as long as the process runs, `/readyz` answers 503
-with a reason while the daemon cannot serve I/O — still starting, membership
-lease not live, or self-fenced. Probe readiness to decide where to send work,
-liveness to decide whether to restart; a fenced node is unready but perfectly
-healthy, and restarting it fixes nothing. See
+The same address serves two health endpoints for orchestrators:
+
+- `/healthz` returns 200 as long as the process is running.
+- `/readyz` returns 503, with a reason, while the daemon cannot serve I/O: it
+  is still starting, its membership lease is not live, or it has fenced
+  itself.
+
+Use `/readyz` to decide where to send work and `/healthz` to decide whether to
+restart the process. A fenced node is not ready, but it is healthy, and
+restarting it does not help. See
 [Observability](../architecture/cluster-ops/observability.md#health-and-readiness).
 
 ## Prometheus
@@ -27,7 +32,7 @@ scrape_configs:
           - node3:9090
 ```
 
-`deploy/prometheus/etcfs-alerts.yml` — the alert rules, load as a
+The alert rules are in `deploy/prometheus/etcfs-alerts.yml`. Load them as a
 `rule_files` entry:
 
 ```yaml
@@ -43,9 +48,9 @@ rule_files:
 | `EtcFSArenaUtilizationHigh` | A node's arena utilization stayed above 90% for 10m | warning |
 | `EtcFSScrubStalled` | No completed scrub pass in over 5m | warning |
 
-`EtcFSScrubStalled` exists because the anomaly counters can't show a stalled
-scrubber on their own — they just stop rising, which looks identical to a
-healthy filesystem with nothing wrong.
+`EtcFSScrubStalled` is needed because a stalled scrubber produces no
+anomalies: its counters stop rising, which looks the same as a healthy
+filesystem.
 
 ## Grafana
 

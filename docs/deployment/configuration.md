@@ -1,9 +1,12 @@
 # Configuration
 
-Each node runs two processes: `etcfuse-meta` (Go, owns etcd and the block
-device) and `etcfuse` (C, mounts the filesystem, forwards VFS ops to
-`etcfuse-meta` over a Unix socket). `etcfuse-meta` must be up first —
-`etcfuse.service` depends on it.
+Each node runs two processes:
+
+- `etcfuse-meta`, in Go, talks to etcd and reads and writes the block device;
+- `etcfuse`, in C, mounts the filesystem and forwards each filesystem request
+  to `etcfuse-meta` over a Unix socket.
+
+`etcfuse-meta` must start first, and `etcfuse.service` depends on it.
 
 ## Where settings come from
 
@@ -15,27 +18,29 @@ Each setting can be given in three places. In decreasing precedence:
 3. A YAML file, keyed by the flag's own name without the dashes that
    introduce it — `metrics-addr: :9090`.
 
-Anything none of them sets keeps the default in the table below. There is
-one vocabulary throughout: the flag's name is also the environment
-variable's name and the file's key, so nothing needs a translation table.
+A setting given in none of these places keeps the default in the table below.
+The same name is used in all three places, so there is nothing to translate.
 
-The `.deb`/`.rpm` install a commented reference copy of every key at
-`/etc/etcfs/etcfuse-meta.yaml.example` and create `/etc/etcfs/` — copy the
-example to `etcfuse-meta.yaml` and delete what you do not need. The package
-deliberately does not own the live path: a package that did would overwrite
-a real configuration on upgrade.
+The packages create `/etc/etcfs/` and install
+`/etc/etcfs/etcfuse-meta.yaml.example`, a commented copy of every key. Copy it
+to `etcfuse-meta.yaml` and delete what you do not need. The package does not
+install `etcfuse-meta.yaml` itself, because a package that owned that file
+would overwrite your configuration on upgrade.
 
-The file is `/etc/etcfs/etcfuse-meta.yaml` unless `--config` (or
-`ETCFS_CONFIG`) names another. That default path is optional — a cluster
-that passes everything on the command line, as this repo's own scripts do,
-never creates one — but a file named explicitly and then missing is an
-error. So is a key that matches no flag, which would otherwise read as a
-setting that silently does nothing.
+The file read is `/etc/etcfs/etcfuse-meta.yaml`, unless `--config` (or
+`ETCFS_CONFIG`) names another one:
 
-`--config`, `--version`, `--fsck` and `--info` select what the process does
-rather than how it is configured, and are accepted only on the command
-line. A file that could turn on `--fsck` would leave a node that never
-starts its daemon, with nothing on the command line to explain why.
+- The default file is optional. A cluster that passes everything as flags, as
+  this repository's scripts do, never creates it.
+- A file named explicitly with `--config` must exist; a missing one is an
+  error.
+- A key that matches no flag is an error, so a misspelled key cannot be
+  silently ignored.
+
+`--config`, `--version`, `--fsck` and `--info` choose what the process does,
+not how it is configured, so they are accepted only on the command line. If a
+file could turn on `--fsck`, a node would run the checker instead of starting
+its daemon, and nothing on its command line would show why.
 
 ```yaml
 # /etc/etcfs/etcfuse-meta.yaml
@@ -51,9 +56,9 @@ metrics-addr: :9090
 metadata-flush-interval: 100ms
 ```
 
-Leaving `node-id` and `ec2-instance-id` out of the file is deliberate in
-that example: they differ per node, so they belong on the command line or
-in the environment, which lets one identical file be shipped to every node.
+The example leaves out `node-id` and `ec2-instance-id` on purpose. They differ
+from node to node, so they go on the command line or in the environment, and
+the same file can then be copied to every node.
 
 ## etcfuse-meta flags
 
@@ -63,35 +68,34 @@ in the environment, which lets one identical file be shipped to every node.
 | `--listen` | `/run/etcfuse/etcfuse.sock` | IPC socket the C daemon connects to. |
 | `--notify-socket` | `/run/etcfuse/etcfuse-notify.sock` | Cache-invalidation notifications to the C daemon. |
 | `--etcd-endpoints` | `http://localhost:2379` | Comma-separated. |
-| `--etcd-local-endpoint` | unset | Endpoint of the etcd member colocated with this node. Reads are served through it — otherwise the client round-robins and a serializable data-path read still crosses the network. Falls back to `--etcd-endpoints` if the local member cannot answer. Leave unset when no member runs on this node. |
-| `--etcd-cert`, `--etcd-key`, `--etcd-ca` | unset | etcd client TLS. Every cluster this repo's own scripts provision runs plaintext etcd (see `bootstrap-cluster.sh`'s header) — set these if yours does not. |
+| `--etcd-local-endpoint` | unset | The etcd member running on this node. Reads go to it, so a read does not cross the network; without it, the client spreads reads across all endpoints. If the local member does not answer, reads fall back to `--etcd-endpoints`. Leave unset when no etcd member runs on this node. |
+| `--etcd-cert`, `--etcd-key`, `--etcd-ca` | unset | etcd client TLS. The clusters this repository's scripts create run etcd without TLS (see the header of `bootstrap-cluster.sh`); set these if yours uses it. |
 | `--node-id` | hostname | |
 | `--cluster-name` | `etcfuse` | Namespaces this node's membership/fencing keys in etcd. |
-| `--lease-ttl` | `10s` | Membership lease TTL. Must clear `2× lease-ttl > 10s` (the request timeout) — `Parse` refuses a TTL that would let the self-fencing watchdog kill the daemon before a stalled request's own deadline could fail it cleanly. |
+| `--lease-ttl` | `10s` | Membership lease TTL. Twice this value must exceed the 10 s request timeout, or the daemon refuses to start. The watchdog stops the daemon after twice the TTL without a renewal, and a shorter window would stop it while a stalled request is still waiting for its own timeout to return an error. |
 | `--log-level` | `1` | 0=error, 1=info, 2=debug. |
-| `--block-device` | unset | Raw device path, e.g. `/dev/nvme1n1`. Prefer `--volume-id` — a literal device path doesn't survive a detach/reattach cycle. |
-| `--volume-id` | unset | Cloud volume ID (e.g. `vol-0abc...`); resolved to a device path on every start. Takes precedence over `--block-device`. |
-| `--metrics-addr` | unset | HTTP listen address for `/metrics`, `/healthz` and `/readyz`, e.g. `:9090`. Unset disables all three. |
-| `--pprof` | `false` | Serve Go's profiling endpoints under `/debug/pprof` on the metrics listener. Off by default because that listener is reachable by anything that can route to the node, and a profile is both expensive to produce and a description of what the process is doing. Turn it on to answer "where is the time going", and turn it off again. |
-| `--fsck` | `false` | Run the offline checker and exit — prefer `etcfsctl fsck`, which needs no daemon. |
-| `--info` | `false` | Print filesystem stats and exit — prefer `etcfsctl status`. |
-| `--ebs-volume-id` | unset | Enables dual-confirmed external fencing (detach + poll) via the AWS API. Needs the `etcfs-nodes` IAM instance profile — see [Terraform: Prerequisite](terraform.md#prerequisite-the-fencing-instance-profile). |
-| `--ec2-instance-id` | unset | This node's instance ID, recorded in its membership key so peers can detach the volume on expiry. |
-| `--nvme-reservations` | `false` | Device-enforced fencing: peers preempt an expired node's NVMe reservation key. Requires an NVMe reservation-capable device (an EBS io2 Multi-Attach volume qualifies) and either `--volume-id` or `--block-device`. Takes precedence over `--ebs-volume-id` when both are set — it is the stronger guarantee. |
-| `--allow-buffered-io` | `false` | Opens the data device without `O_DIRECT`. A correctness change, not a fallback, on a device shared by more than one node — a write served back out of this node's page cache never proves it reached the other attachers. For single-node mounts and file-backed test devices only. |
-| `--write-barriers` | `false` | Flush + range-sync + readback after every write, flush before every read. Off by default: against a volume that only acknowledges durable, visible O_DIRECT writes, these publish nothing the write hasn't already published. A device with a volatile write cache needs them; buffered mode (`--allow-buffered-io`) forces them on regardless. |
-| `--metadata-flush-interval` | `100ms` | How long a write's extent may stay buffered in memory before it is published to etcd. While this node holds an inode's exclusive lock no peer can read it, so deferring the commit costs no cross-node correctness — it costs a peer's `stat` freshness, and it costs any unflushed write in a crash. `fsync`, `close`, `O_SYNC`/`O_DSYNC` and a peer's recall all force a flush. `0` commits every write before acknowledging it: nothing is ever lost, and every write carries a Raft commit. See [Consistency and Durability](../architecture/consistency/consistency-and-durability-model.md#durability-under-write-delegation). |
-| `--write-data-cache` | `true` | Buffers a deferred write's *data* in memory alongside its extent, and puts it on the device at flush time. Only applies where it pays: a write continuing a contiguous device run (so the flush merges it into fewer device operations) or one of at least 64 KiB (where the device is latency-bound rather than rate-limited). Every other write puts its bytes down as it is served and defers only its extent. Ignored when `--metadata-flush-interval` is `0`. `false` restores a device write per write. See [Consistency and Durability](../architecture/consistency/consistency-and-durability-model.md#the-payload-is-buffered-too). |
-| `--entry-timeout` | `1m` | How long the kernel may answer a name's existence *or absence* from its own cache before asking the daemon again. Every node watches the whole `dirent:` prefix and pushes an `INVAL_ENTRY` for each change, so this is the backstop for a watch that could not be resumed, not the mechanism coherence rests on. It was one second, which is shorter than a walk of any real tree — a sweep of 80k files takes about eleven — so nothing was ever still cached when the walk came back to it. `0` disables the cache and sends every path traversal to the daemon. See [FUSE Cache Management](../architecture/fuse/fuse-cache-management.md#negative-cache). |
-| `--attr-timeout` | `1m` | How long the kernel may answer an inode's attributes from its own cache. Backed by a matching watch on the `inode:` prefix, which pushes an `INVAL_ATTR` for every inode a peer writes; an inode this node holds the lock key for is skipped, since that change can only be its own. Lowering it to `1s` restores the previous behaviour at the cost of every `stat` in a tree walk. `0` disables the cache. See [FUSE Cache Management](../architecture/fuse/fuse-cache-management.md#attribute-cache). |
-| `--page-cache` | `true` | Lets the kernel keep data pages for a file this node holds a lock on, so a re-read costs no FUSE upcall. Sound because the lock is the coherence protocol: the daemon drops the pages, and waits for the drop, before it yields the lock. Has no effect on a reader using `O_DIRECT`, which bypasses the page cache by definition. `false` returns to unconditional `direct_io = 1`, `keep_cache = 0`. See [FUSE Cache Management](../architecture/fuse/fuse-cache-management.md#data-page-cache). |
-| `--history-log` | unset | Appends every served operation to this file, as input for the offline consistency checkers. One line per operation — a measurable cost on a busy mount, meant for test runs. See [Porcupine](../verification/porcupine.md). |
-| `--read-only` | `false` | Rejects every mutating FUSE operation with `EROFS`. For a backup/inspection mount alongside a writer, or to run `--fsck` against a live volume. |
+| `--block-device` | unset | Raw device path, for example `/dev/nvme1n1`. Prefer `--volume-id`: the device path can change when the volume is detached and attached again. |
+| `--volume-id` | unset | Cloud volume ID, for example `vol-0abc...`, resolved to a device path at every start. Takes precedence over `--block-device`. |
+| `--metrics-addr` | unset | HTTP address for `/metrics`, `/healthz` and `/readyz`, for example `:9090`. Unset disables all three. |
+| `--pprof` | `false` | Serves Go's profiling endpoints under `/debug/pprof` on the metrics address. Off by default because anyone who can reach the node can reach that address, and a profile is expensive to produce and shows what the process is doing. Turn it on to find where time goes, then turn it off. |
+| `--fsck` | `false` | Runs the offline checker and exits. `etcfsctl fsck` does the same without a daemon. |
+| `--info` | `false` | Prints filesystem statistics and exits. `etcfsctl status` does the same. |
+| `--ebs-volume-id` | unset | Enables external fencing through the AWS API: a peer detaches the failed node from the volume and polls until the detach is confirmed. Needs the `etcfs-nodes` instance profile; see [Terraform: Prerequisite](terraform.md#prerequisite-the-fencing-instance-profile). |
+| `--ec2-instance-id` | unset | This node's instance ID. It is stored in the node's membership key so that a peer knows which instance to detach. |
+| `--nvme-reservations` | `false` | Fencing enforced by the device: a peer removes the failed node's NVMe reservation key, and the device then rejects that node's writes. Needs a device that supports NVMe reservations (an EBS io2 Multi-Attach volume does) and `--volume-id` or `--block-device`. Takes precedence over `--ebs-volume-id`, because the device enforces it. |
+| `--allow-buffered-io` | `false` | Opens the device without `O_DIRECT`. Only for single-node mounts and file-backed test devices. On a shared device it is unsafe: a write can be served back from this node's page cache without having reached the device, so other nodes may not see it. |
+| `--write-barriers` | `false` | After every write, flushes, syncs the range and reads it back; before every read, flushes. Not needed on a volume that acknowledges an `O_DIRECT` write only once it is durable and visible to other nodes. Needed on a device with a volatile write cache. Always on with `--allow-buffered-io`. |
+| `--metadata-flush-interval` | `100ms` | How long a write's extent can stay buffered in memory before it is published to etcd. No other node can read the file while this node holds its exclusive lock, so delaying publication does not let another node read stale data. It does mean another node's `stat` can show an older size, and a crash loses writes not yet published. `fsync`, `close`, `O_SYNC`/`O_DSYNC` and a lock recall from another node all publish immediately. `0` publishes every write before acknowledging it, so nothing is lost, and every write costs a Raft commit. See [Consistency and Durability](../architecture/consistency/consistency-and-durability-model.md#durability-under-write-delegation). |
+| `--write-data-cache` | `true` | Also buffers a delayed write's data in memory, and writes it to the device at publication time. Applies only where it helps: a write that continues a contiguous range on the device (the flush then merges it with its neighbours) or a write of 64 KiB or more. Other writes go to the device immediately and only their extent is delayed. Ignored when `--metadata-flush-interval` is `0`. `false` writes every write to the device immediately. See [Consistency and Durability](../architecture/consistency/consistency-and-durability-model.md#the-payload-is-buffered-too). |
+| `--entry-timeout` | `1m` | How long the kernel can answer whether a name exists, or does not exist, from its own cache. Each node watches all `dirent:` keys and invalidates the kernel's entry for every change, so this timeout only matters when that watch is interrupted and cannot resume. A walk of 80,000 files takes about 11 s, so a timeout of a few seconds would expire before a walk returned to an entry. `0` disables the cache. See [FUSE Cache Management](../architecture/fuse/fuse-cache-management.md#negative-cache). |
+| `--attr-timeout` | `1m` | How long the kernel can answer an inode's attributes from its own cache. A watch on `inode:` keys invalidates the kernel's attributes whenever another node changes an inode. Inodes this node holds the lock for are skipped, because only this node can change them. `0` disables the cache. See [FUSE Cache Management](../architecture/fuse/fuse-cache-management.md#attribute-cache). |
+| `--page-cache` | `true` | Lets the kernel keep data pages of a file this node holds a lock on, so reading it again needs no request to the daemon. Before the daemon releases the lock, it drops those pages and waits until they are gone, so another node never reads a stale page. Has no effect on a reader using `O_DIRECT`. `false` disables the page cache for every file (`direct_io = 1`, `keep_cache = 0`). See [FUSE Cache Management](../architecture/fuse/fuse-cache-management.md#data-page-cache). |
+| `--history-log` | unset | Appends every operation served to this file, one line each, as input to the offline consistency checkers. Slows a busy mount; meant for test runs. See [Porcupine](../verification/porcupine.md). |
+| `--read-only` | `false` | Rejects every modifying FUSE operation with `EROFS`. For a backup or inspection mount next to a writer, or to run `--fsck` on a live volume. |
 | `--version` | | Print version and exit. |
 
-See [Fencing](../architecture/fencing/self-fencing-watchdog.md) before
-choosing between `--ebs-volume-id` and `--nvme-reservations` — they are not
-interchangeable in what they guarantee.
+`--ebs-volume-id` and `--nvme-reservations` give different guarantees; read
+[Fencing](../architecture/fencing/self-fencing-watchdog.md) before choosing.
 
 ## etcfuse flags
 
@@ -106,13 +110,10 @@ interchangeable in what they guarantee.
 
 ## Quotas
 
-Advisory per-subtree quotas — a directory becomes a quota root with a byte
-and/or inode ceiling, and `pkg/quota` computes usage against it when the report
-is run. No write or create is rejected for exceeding a limit; charging a write
-to its enclosing root inline would cost a parent pointer on every inode or
-another Raft round trip on the write path, and neither is worth paying for a
-policy limit. See [etcfsctl](etcfsctl.md#quotas-are-advisory). Configured live
-via `etcfsctl`, not a daemon flag:
+A directory can be made a quota root, with a limit on bytes, inodes or both.
+`pkg/quota` computes usage when the report runs, and no write is rejected for
+exceeding a limit; [etcfsctl](etcfsctl.md#quotas-are-advisory) explains why.
+Quotas are set with `etcfsctl` on a running cluster, not with a daemon flag:
 
 ```bash
 etcfsctl quota set <inode> --bytes=10737418240 --inodes=100000   # 10 GiB, 100k inodes
@@ -122,17 +123,20 @@ etcfsctl quota clear <inode>
 
 ## Systemd units
 
-`deploy/systemd/etcfuse-meta.service` and `deploy/systemd/etcfuse.service`
-— installed by the `.deb`/`.rpm` packages to `/usr/lib/systemd/system/`
-(see [Binaries](binaries.md)), not enabled automatically.
+The packages install `deploy/systemd/etcfuse-meta.service` and
+`deploy/systemd/etcfuse.service` to `/usr/lib/systemd/system/` (see
+[Binaries](binaries.md)) but do not enable them.
 
-`etcfuse-meta.service` runs the binary with **no flags at all**, so
-everything it uses comes from `/etc/etcfs/etcfuse-meta.yaml` (or the
-environment). Put your cluster's settings there rather than editing the
-unit: a flag beats the file, so any flag added back to `ExecStart` silently
-overrides the file's value for that setting, and an edit to a packaged unit
-is lost on the next upgrade. For what differs per node — `node-id`,
-`ec2-instance-id` — use a drop-in, which survives upgrades:
+`etcfuse-meta.service` starts the binary with no flags, so every setting comes
+from `/etc/etcfs/etcfuse-meta.yaml` or the environment. Put the cluster's
+settings in that file rather than in the unit, for two reasons:
+
+- a flag overrides the file, so a flag added to `ExecStart` silently replaces
+  the file's value;
+- edits to a packaged unit are lost on the next upgrade.
+
+Settings that differ per node (`node-id`, `ec2-instance-id`) go in a drop-in,
+which survives upgrades:
 
 ```ini
 # /etc/systemd/system/etcfuse-meta.service.d/override.conf
@@ -141,9 +145,8 @@ ExecStart=
 ExecStart=/usr/local/bin/etcfuse-meta --node-id=node-3 --ec2-instance-id=i-0abc123
 ```
 
-`etcfuse` (the C daemon) has no config file — it takes its socket paths and
-its mountpoint on the command line, so edit its unit or drop in an override
-as usual.
+`etcfuse` has no configuration file. Its socket paths and mountpoint are
+command-line arguments, set in its unit or in a drop-in.
 
 Then:
 
@@ -153,5 +156,5 @@ sudo systemctl enable --now etcfuse-meta
 sudo systemctl enable --now etcfuse
 ```
 
-`etcfuse.service` declares `After=`/`Wants=etcfuse-meta.service`, so
-starting it alone brings up both, in the right order.
+`etcfuse.service` declares `After=` and `Wants=etcfuse-meta.service`, so
+starting it starts both, in the right order.
