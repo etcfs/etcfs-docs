@@ -229,15 +229,49 @@ The comparison in step 4 is what makes the pass safe without an inode lock. A pa
 
 The revision comparison does **not** cover a different case, and steps 3 and 5 are what do.
 
-A read on this node resolves an extent, then issues its device read. Between the two, its own lock key can be deleted by a lease expiry that etcd carried out and this node has not yet observed — etcd itself stays reachable, so nothing fails and nothing is logged. A peer takes the now-unguarded inode and buries that extent in an ordinary overwrite. This node's scrub pass sees the extent as dead, correctly, and frees its blocks; the allocator hands them to another file; and the read lands on that other file's data. The whole sequence has to fit inside one read, so the window is narrow, but nothing else excludes it.
+The case is this sequence, all within one read on this node:
 
-The revision comparison cannot help: the record really has moved, in a way the pass is right about, and the comparison exists to stop the same range being freed twice rather than to protect a reader who resolved it first.
+1. The read looks up an extent and is about to read the device.
+2. Its lock key is deleted by a lease expiry that etcd carried out but this node
+   has not noticed yet. etcd is still reachable, so nothing fails and nothing is
+   logged.
+3. Another node takes the inode and overwrites the range, which makes the old
+   extent dead.
+4. This node's scrub pass correctly finds the extent dead and frees its blocks.
+5. The allocator gives the blocks to another file.
+6. The read from step 1 returns that other file's data.
 
-What closes it is a question the scrubber can answer locally, with no round trip and no lock of its own: *does this node have an entry in its lock cache for that inode?* Every operation creates one before it reads any metadata, and an entry outlives the operation, so an in-flight read is always visible as one. The answer is a deliberate over-approximation — an inode this node merely touched recently reads as held — because a deferred reclaim costs a pass, and the opposite error costs a read of another file's data.
+The window is narrow, but nothing else prevents it. The revision comparison does
+not help: the record really did change, and the comparison exists to prevent
+freeing a range twice, not to protect a reader that looked the extent up first.
 
-Asking once, before the delete, leaves a window the width of the delete transaction: a read can begin inside it. So the question is asked again on the far side of the delete, where the record is already gone and leaving the blocks alone would leak them instead. Those ranges go on the held list and are freed as soon as the inode is quiet. Nothing can reach them in the meantime — no extent record names them — and a restart returns them anyway, because the allocator's bitmap is rebuilt from the records that remain.
+The scrubber can close it locally, without a round trip or a lock of its own, by
+asking: *does this node have a lock-cache entry for this inode?* Every operation
+creates an entry before reading any metadata, and entries outlive operations, so
+an in-progress read always shows up as an entry. The answer can be too cautious,
+since an inode used recently also counts as held, but a delayed reclaim costs one
+pass, while the opposite mistake returns another file's data.
 
-Entries leave the lock cache on eviction, which is driven by pressure (the cache holds 4,096 entries) rather than by liveness. An unlinked inode that kept its entry would therefore keep the scrubber from reclaiming its orphaned extents until 4,096 other inodes had pushed it out, and under churn that deletes files as fast as it writes them, allocatable space would reach zero — `No space left on device` — with almost nothing live in the filesystem. The two paths where an inode becomes permanently unreachable — an unlink with nothing on this node holding the file open, and the release of the last descriptor on a file whose names are gone — therefore give up the inode's cached lock and drop the entry outright (`yieldQuietCachedLock`). Neither can have a read of this node in flight, since in both the descriptor count is already zero. An inode with writes still buffered is left alone, since publishing them is a transaction that would put the deleted record back.
+Asking only before the delete would leave a gap the length of the delete
+transaction, in which a read could start. The question is therefore asked again
+after the delete. If the inode is now held, the record is already gone, and
+leaving the blocks would leak them, so the range goes on the held list and is
+freed once the inode is quiet. Nothing can reach those blocks meanwhile, because
+no extent refers to them, and a restart frees them anyway, because the bitmap is
+rebuilt from the remaining records.
+
+**Lock-cache entries must not keep orphans alive.** Entries leave the cache when
+it is full (4,096 entries), not when they stop being used. An unlinked inode
+that kept its entry would block the scrubber from reclaiming its extents until
+4,096 other inodes pushed it out. Under a workload that deletes files as fast as
+it writes them, free space would then reach zero (`No space left on device`)
+with almost no live data. Two operations make an inode permanently unreachable:
+an unlink when no descriptor on this node has the file open, and the release of
+the last descriptor of a file with no names left. Both give up the inode's
+cached lock and remove its entry (`yieldQuietCachedLock`). No read can be in
+progress on this node in either case, because its descriptor count is already
+zero. An inode with buffered writes is left alone, because publishing them would
+recreate the deleted record.
 
 ### The ownership rule
 
@@ -245,9 +279,9 @@ Step 2 is what keeps reclamation from leaking across nodes:
 
 > **Only the arena's owner may delete or shorten an extent record.**
 
-The free list is per-process and in-memory, and it is rebuilt from the live `extent:` keys — so deleting the record of a range inside a *peer's* arena would remove the only reference that peer's bitmap is derived from, and those blocks would stay marked allocated there until it restarted. The record has to outlive the operation for its owner to find it.
+Each node's free list is in its own memory and is rebuilt from the `extent:` keys. If this node deleted the record of a range in *another* node's arena, that node would lose the only record its bitmap is rebuilt from, and the blocks would stay marked allocated there until it restarted. The record must stay until its owner removes it.
 
-The rule costs nothing, because every arena has exactly one owner and every owner runs the same pass. It is also why the FUSE truncate and overwrite paths reclaim only what they own, leaving the rest here. Correctness never depends on when the reclaim happens: the inode's size bounds what a read can reach past the end of a file, and the extent sequence decides which of two overlapping extents a read resolves to. A dead extent not yet collected costs space, never a wrong answer.
+The rule costs nothing, because every arena has exactly one owner and every owner runs the same pass. It is also why truncate and overwrite on the FUSE path reclaim only what this node owns and leave the rest to the scrubber. When the reclaim happens never affects correctness: the file size limits what a read can reach past the end of a file, and the sequence number decides which of two overlapping extents a read uses. An uncollected dead extent wastes space but never causes a wrong answer.
 
 An extent in an arena that currently sits in the free pool is left alone by the same rule, and is still cleaned up: whoever claims that arena next marks the range live from the record that is still there, and its own next pass then finds it unreachable, owns it, and reclaims it.
 
