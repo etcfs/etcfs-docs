@@ -1,7 +1,10 @@
 # Lock Caching and Recall
 
-How an inode's etcd lock key outlives the operation that took it, what still
-enforces mutual exclusion once it does, and how a blocked peer gets it back.
+A node keeps an inode's lock key in etcd after the operation that took it, so
+later operations on the same file need no etcd round trip. This page explains
+what still provides mutual exclusion when the key is kept, how another node
+gets the lock back, and what the held lock lets a node cache.
+
 Implementation: `internal/ipc/lockcache.go` (what a cached lock obliges this
 node to do), `internal/ipc/lockmap.go` (which inode holds which entry, and
 which entry to evict), `internal/ipc/retry.go` (`lockInode`),
@@ -24,34 +27,33 @@ which entry to evict), `internal/ipc/retry.go` (`lockInode`),
 
 ## Why
 
-Acquiring and releasing an inode lock in etcd around every single operation
-would put a Raft commit on every operation for the acquire. At etcd's measured
-~2.2 ms per commit that would be the dominant cost of both a read and a write,
-and it would not respond to storage provisioning — the chain is latency-bound, and
-provisioned IOPS buys parallelism, not latency (see
+Acquiring a lock is a Raft commit, about 2.2 ms on the measured clusters.
+Acquiring and releasing the lock around every operation would make that commit
+the largest cost of every read and every write. Provisioning a faster volume
+would not help, because each commit waits for the previous one: more IOPS
+allows more operations in parallel, not shorter waits (see
 [Performance Benchmarks](../reliability/performance-benchmarks.md)).
 
-The lock is acquired far more often than it is actually contended. Caching
-the key past the operation that took it removes the round trip from the case
-that dominates: a repeat acquisition on an uncontended inode is a map lookup,
-not an etcd call. An uncontended write is then one committed operation (the
-transaction that publishes it), and an uncontended read is none.
+Most acquisitions are not contended: the same node takes the same lock again
+and nobody else wants it. Keeping the key after the operation turns those
+repeated acquisitions into a lookup in a local map. An uncontended write then
+costs at most one commit (the one that publishes it), and an uncontended read
+costs none.
 
-This is a write delegation in the NFSv4 sense, scoped to the lock rather than
-to an open file descriptor.
+This is the same idea as an NFSv4 write delegation, applied to the lock rather
+than to an open file.
 
-One acquisition is removed rather than cached: the *first* one on a file this
-node has just created. The lock key rides the create transaction — see
-[Atomic Create](namespace-operations.md#the-files-lock-rides-the-same-transaction)
-— so the write that follows the create finds it already held, and the entry is
-seeded with the record the create published. A file an archive creates and
-immediately writes therefore reaches etcd once, for the create, and not again
-until the extent is published.
+The first acquisition on a newly created file is not needed at all: the create
+transaction takes the lock (see
+[Atomic Create](namespace-operations.md#the-files-lock-rides-the-same-transaction))
+and fills the cache with the new record. A file that an archive creates and
+then writes therefore contacts etcd for the create and then only when its
+extents are published.
 
 ## What Caching Does Not Touch
 
-Caching touches only *how often the daemon asks etcd who holds a lock*. It
-does not touch anything the lock's safety argument depends on:
+Caching changes how often the daemon asks etcd for a lock. It does not change
+anything the safety of the lock depends on:
 
 - The **fencing generation guard** wraps every metadata mutation,
   cached lock or not — a fenced node's commits are rejected regardless of
@@ -69,31 +71,27 @@ Caching decides only *when* the etcd key is taken and released.
 
 ## Node-Local Exclusion
 
-Because the etcd key is reused, it does not exclude this node's own
-threads — every thread asking for the same inode finds the same cached key.
-What provides that exclusion is a per-inode `sync.RWMutex` (`lockEntry.rw`
-in `lockcache.go`): a read lock for a shared request, a write lock for an
-exclusive one.
+A cached key is shared by every thread on the node, so it does not keep two
+threads on the same node apart. A per-inode `sync.RWMutex` does
+(`lockEntry.rw` in `lockcache.go`): a read lock for a shared request, a write
+lock for an exclusive one.
 
-The wait for it is bounded, not blocking — `lockLocal` in `retry.go` spends
-the same retry budget every other contended operation on the data path uses
-(`lockAttempts` attempts, `TryLock`/`TryRLock` each time), and gives up with
-`ErrConflict` rather than waiting forever. A thread that cannot get the local
-lock in budget produces the same `EAGAIN` an etcd-side conflict produces.
+Waiting for the mutex is limited. `lockLocal` in `retry.go` tries `TryLock` or
+`TryRLock` up to `lockAttempts` times, with the same delays as other retries on
+the data path, and then gives up with `ErrConflict`. The application gets
+`EAGAIN`, as for a conflict with another node.
 
-The mutex and the etcd key have to name the same inode for the same reason a
-DLM lock resource is a singleton per resource: every caller of that inode
-must land on the one cache entry, or the exclusion splits in two. That
-invariant — that the entry a caller is holding is still the cache's current
-entry for the inode — is checked explicitly (`Service.isCurrent`) after the
-local lock is taken, not assumed; see
+Every thread working on an inode must use the same cache entry, and therefore
+the same mutex; two entries for one inode would mean two mutexes, and no
+exclusion. After taking the mutex, the caller therefore checks that its entry
+is still the cache's current entry for the inode (`Service.isCurrent`). See
 [Correctness Invariants](#correctness-invariants).
 
 ## Recall Protocol
 
-A cached key sits under the node's session lease, renewed for as long as the
-process lives, so a blocked peer cannot simply wait it out the way it could
-wait out a lock's own TTL. Instead:
+A cached key is written under the node's session lease, which is renewed as
+long as the process runs, so a blocked node cannot wait for it to expire.
+Instead it asks for it:
 
 1. The blocked node fails its `AcquireLock` CAS with `ErrConflict` and writes
    a want key, `lock_want:<ino>/<node_id>` (`AnnounceLockWant`), under its own
@@ -118,13 +116,12 @@ wait out a lock's own TTL. Instead:
 This is a DLM blocking AST: the same callback GFS2 fires on a holder when a
 peer's request conflicts with a glock it is holding.
 
-**The recall demotes, it does not remove.** The cache entry doubles as the
-node-local mutex, so deleting it out from under a running operation would
-leave that operation holding a mutex nobody else looks up any more, and the
-next caller on this node would build a *second* entry for the same inode and
-take a *different* mutex — the node-local exclusion split in two, silently.
-Only eviction removes an entry from the map, and only while holding its
-write lock, so nothing is using it at the moment it goes.
+**A recall gives up the key but keeps the cache entry.** The entry holds the
+node-local mutex. If a recall deleted the entry while an operation was using
+it, the next caller on this node would create a second entry for the same inode,
+with a different mutex, and the two would no longer exclude each other. Only
+eviction removes an entry from the map, and only after taking its write lock,
+so no operation is using it at that moment.
 
 `lock_want:` is a prefix of its own, not nested under `lock:`, because an
 exclusive acquisition's CAS compares the whole of `lock:<ino>/` against
@@ -133,49 +130,43 @@ acquisition it exists to unblock.
 
 ## Hold Time
 
-A freshly acquired lock is held for at least `minHoldTime` (10 ms) before a
-recall is honoured, even if a want key arrives sooner. Without that floor,
-sustained cross-node contention on one inode turns *every* operation into a
-recall plus a want-key commit — two extra commits where the per-operation
-acquire this cache replaced cost exactly one, making the contended case
-worse than the case the cache exists to fix.
+A node keeps a newly acquired lock for at least `minHoldTime` (10 ms) before
+honouring a recall, even if the request arrives sooner. Without this, two nodes
+using the same file at once would hand the lock back and forth on every
+operation, and each handover costs a recall and a want-key commit. That would
+be two extra commits per operation, more than the single acquisition per
+operation that caching replaced. GFS2's `gl_hold_time` makes the same trade: the
+other node waits a little longer, and the lock changes hands less often.
+Nothing is lost when there is no contention, because nobody recalls the lock.
 
-This is GFS2's `gl_hold_time`, and it makes the same trade: a bounded extra
-wait for the peer, paid for by a bound on how often the lock can change
-hands. It costs nothing when uncontended, since nothing ever recalls it.
+**The hold time adapts.** A fixed minimum does not help when every handover is
+contended, for example several nodes writing different ranges of one file, where
+each node gets one operation before the lock is recalled again. The hold time
+therefore:
 
-**The hold adapts.** A floor answers a recall that arrives moments after an
-acquisition, but not a workload where every handover does — several nodes
-writing disjoint ranges of one file, where the inode changes hands continuously
-and each turn buys one operation before the next recall. So the hold doubles
-whenever a request arrives inside the current one, up to `maxHoldTime` (100 ms),
-and halves whenever one arrives after it, back down to the floor. The state
-lives on the cache entry, which survives a recall, so it is the inode's own
-recent history that decides.
+- doubles when a request arrives during the current hold, up to `maxHoldTime`
+  (100 ms), so a contended file is not handed over after every operation;
+- halves when a request arrives after the hold has ended, down to the minimum,
+  so a file that was contended once does not keep making other nodes wait.
 
-Each direction answers a real failure. Doubling is what stops a contended file
-paying a round trip per operation. Halving is what stops an inode that was
-fought over once from making every later peer wait for a contention that has
-ended.
+The value is stored on the cache entry, which survives a recall, so it follows
+each inode's own recent history.
 
-What the growth spends is the waiting peer's latency, which is why the ceiling
-is not open-ended: a peer waits at most `maxHoldTime` per handover, against an
-acquisition budget that runs to the request deadline, and 100 ms is also the
-flush interval that a recall already has to wait out. `etcfuse_lock_handover_hold_seconds`
-is the distribution — pinned at the ceiling means an inode is being fought over
-continuously and the waiters are paying for it; pinned at the floor means
-recalls are arriving after the holder had finished anyway.
+The longer hold is paid by the waiting node, so it is capped. 100 ms is also the
+default flush interval, which a recall may already have to wait for. The
+`etcfuse_lock_handover_hold_seconds` histogram shows the effect: values at the
+cap mean an inode is constantly contended and other nodes are waiting; values
+at the minimum mean recalls arrive after the holder has finished.
 
 ## Explicit Publish
 
-The recall protocol above is reactive: the lock stays with whoever took it
-until somebody asks for it back, and the asking is what costs three etcd round
-trips on the *consumer's* critical path. For a producer/consumer pipeline that
-is the wrong node to charge. The producer knows when it has finished writing;
-the consumer only knows that the file it wants is locked by someone else.
+With the recall protocol, the lock stays with its holder until another node
+asks for it, and the asking costs that other node three etcd round trips. In a
+producer–consumer pipeline, the consumer pays: it only knows that the file is
+locked, while the producer knows when it has finished writing.
 
-A writer can therefore hand the file over itself, by setting the
-`user.etcfs.publish` extended attribute on it:
+The producer can therefore hand the file over itself, by setting the
+`user.etcfs.publish` extended attribute:
 
 ```sh
 setfattr -n user.etcfs.publish -v 1 /mnt/etcfs/output.bin
@@ -185,200 +176,184 @@ setfattr -n user.etcfs.publish -v 1 /mnt/etcfs/output.bin
 os.setxattr("/mnt/etcfs/output.bin", "user.etcfs.publish", b"1")
 ```
 
-That publishes the node's buffered writes — bytes to the device, extents to
-etcd — and then gives up the inode's cached lock key without waiting for anyone
-to want it. A consumer on another node then finds a free lock and committed
-extents, and reads the same physical blocks the producer wrote: only the extent
-map crossed the network, and the data moves at device bandwidth rather than
-over it.
+The node then writes its buffered data for the file to the device, publishes
+the extents to etcd, and gives up its cached lock, without waiting for a
+request. A consumer on another node finds the lock free and the extents
+committed, and reads the same blocks the producer wrote. Only the extent map
+crosses the network; the data is read from the shared device.
 
-It is an extended attribute rather than a new operation because it needs no new
-wire opcode, no C-side handler and no client library — `setfattr`, `os.setxattr`
-and every language's equivalent already reach it, which is what an application
-in a pipeline actually has to hand. The `user.` namespace because the caller is
-an ordinary process rather than an operator. The name is an *action*: it is
-carried out and deliberately not stored, so it never appears in a listing and
-reading it back gives `ENODATA`. Only that exact name is intercepted; anything
-else in the namespace is stored as usual.
+**Why an extended attribute.** It needs no new opcode, no C-side handler and no
+client library: `setfattr`, `os.setxattr` and their equivalents in every
+language already reach it. It is in the `user.` namespace because ordinary
+processes call it, not only administrators.
 
-Publishing an inode this node holds no lock for succeeds and does nothing,
-which is what lets an application call it unconditionally when it closes a file
-without tracking whether it wrote anything.
+**It is a command, not a stored value.** It never appears in a listing, and
+reading it back returns `ENODATA`. Only this exact name is treated this way;
+other `user.` attributes are stored normally.
 
-Two things it deliberately does not do. It does not flush the block device: a
-shared device is opened with `O_DIRECT`, so the write to it was the
-publication, and the buffered fallback exists only for an unshared device where
-there is no other node to hand anything to. And it does not fence out a
-concurrent writer on the same node — a write racing the publish lands in a
-buffer that has already been published and waits for the next flush. Publishing
-is a statement that the writer has finished, and it is the caller's to make
-truthfully.
+**Publishing a file this node holds no lock for succeeds and does nothing**, so
+an application can call it on every file it closes without tracking whether it
+wrote anything.
+
+Two things it does not do:
+
+- **It does not flush the device.** A shared device is opened with `O_DIRECT`,
+  so data is on the device as soon as it is written.
+- **It does not stop another writer on the same node.** A write that races the
+  publish goes into a new buffer and is published by the next flush. Setting the
+  attribute declares that the writer has finished; the application must only
+  do so when that is true.
 
 ## Mode Upgrades
 
-An exclusive lock satisfies a request for a shared one — it already excludes
-every peer a shared lock would, so a read proceeding under it is at least as
-safe (`covers` in `lockcache.go`). The cache never downgrades in response to
-a later shared request, which is what stops a read-modify-write sequence
-flapping the key between modes at a Raft commit each way.
+A cached exclusive lock also serves a request for a shared one, because it
+already keeps out every node a shared lock would (`covers` in `lockcache.go`).
+The cache never downgrades an exclusive lock for a shared request. Otherwise a
+read-modify-write sequence would switch the key between modes, at one Raft
+commit each time.
 
-The one direction that does cost something: a cached *shared* key must be
-released before this node can take the inode *exclusively*, because the
-exclusive acquisition's CAS rejects any holder in `lock:<ino>/`, including
-one this same node wrote.
+The other direction does cost something. To take an exclusive lock, this node
+must first release its own cached shared key, because an exclusive acquisition
+requires `lock:<ino>/` to be empty, including of this node's own keys.
 
 ## Cache Bound and Eviction
 
-The cache holds at most `lockCacheMax` (4096) inodes. Past that,
-`lockMap.evictLocked` takes the `lockEvictBatch` (64) least-recently-used
-entries with no operation currently in flight, publishes anything they have
-buffered, and gives up all of their etcd keys **in one transaction**
-(`Store.ReleaseLocks`). An entry an operation is using is skipped, never waited
-for — a cache full of busy inodes is allowed to grow past the target rather than
-block a request trying to make room, and an entry whose writes cannot be
-published is left in place for the same reason a recall leaves one.
+The cache holds up to `lockCacheMax` (4096) inodes. When it is full,
+`lockMap.evictLocked` picks the 64 (`lockEvictBatch`) least recently used
+entries that no operation is using, publishes anything they have buffered, and
+releases all their keys **in one transaction** (`Store.ReleaseLocks`).
 
-A batch rather than one victim because a release is a Raft commit and one
-transaction of 64 deletes costs what one delete costs. It matters for a workload
-whose working set is far larger than the cache: an unpacking archive touches
-80,000 inodes against 4,096 entries, so it evicts one inode for every new one
-and would otherwise pay that commit per file. Between sweeps the cache sits
-under its bound by up to a batch, which is 1.6% of it; the bound is a target
-rather than an invariant in both directions.
+- An entry in use is skipped, not waited for. A cache full of busy entries may
+  grow past its limit rather than make a request wait for room.
+- An entry whose buffered writes cannot be published keeps its key, as with a
+  recall.
 
-One rule makes the batch safe to hold at all: an entry's `keyMu` is only ever
-taken by a caller that already holds that entry's `rw`, and every path that
-wants a *second* entry takes its `rw` with `TryLock` — the eviction sweep when
-it claims its victims, and `drainBuffers` when it publishes another inode's
-buffer under memory pressure. Two such callers therefore cannot each end up
-waiting on what the other holds: whichever claimed an entry first, the other
-skips it. The rule matters because of batching: a single release holds one
-entry at a time, a batch holds up to 64.
+Entries are evicted in batches because a release is a Raft commit, and one
+transaction with 64 deletes costs about the same as one with a single delete.
+This matters when the working set is much larger than the cache: extracting an
+archive touches 80,000 inodes with room for 4,096, so every new file evicts an
+old one, and evicting one at a time would cost a commit per file. Between
+sweeps the cache can be up to one batch (1.6%) below its limit.
 
-Batching changes nothing about what a key stands for. Each key is still deleted
-individually, still by exact holder token, and everything owed before a key may
-be yielded is still discharged per inode and can still refuse: the buffer is
-published and the kernel's pages are invalidated, and an entry that fails either
-keeps its key and its place in the cache. The one thing that moves is the
-*recorded* hold: the batch's release is timed from the moment every one of its
-invalidations had finished, so a key's hold ends slightly later in the history
-than it did in reality. That is the safe direction for a mutual-exclusion
-checker, which can then only ever report overlaps that really happened.
+**Avoiding deadlock between batch holders.** An entry's `keyMu` is only taken
+by a caller that already holds that entry's `rw`. Every path that needs a
+*second* entry takes that entry's `rw` with `TryLock`: the eviction sweep when
+it picks its victims, and `drainBuffers` when it publishes another inode's
+buffer under memory pressure. If two such callers want the same entry, the one
+that gets it first keeps it and the other skips it, so neither waits for the
+other. This matters for batches because a batch holds up to 64 entries at once.
+
+Batching does not change what each key means. Each key is still deleted by its
+exact holder token, and each inode still has its buffer published and its kernel
+pages dropped first; an entry for which either fails keeps its key. Only the
+*recorded* release time moves: the history log records the batch's release at
+the moment its last invalidation finished, slightly after each key's real
+release. A checker of mutual exclusion can therefore only report overlaps that
+really happened.
 
 ## What the Lock Makes Cacheable
 
-A held lock is not only a mutual-exclusion token here: while this node holds
-an inode's key, no peer can write that inode, so anything this node has read
-about it stays true. The daemon uses that directly — a `lockEntry` carries the
-inode's record and extent list alongside the lock, and an operation that finds
-them there answers with no etcd round trip at all. A read on a file this node
-already holds is pure device I/O.
+While this node holds an inode's lock, no other node can change the inode, so
+whatever this node has read about it stays correct. The daemon uses this
+directly: a `lockEntry` stores the inode's record and extent list next to the
+lock, and an operation that finds them there needs no etcd request. A read of
+a file this node already holds a lock on only touches the device.
 
-The same argument runs in the other direction for writes. If no peer can read
-the inode while this node holds its exclusive key, the extent a write produces
-does not have to be in etcd until the key is given up — so it is buffered in
-the entry beside the snapshot and published in batches, and a write is pure
-device I/O too. That is a durability trade rather than a free win, and it is
-described in
-[Consistency and Durability](../consistency/consistency-and-durability-model.md#durability-under-write-delegation);
-what matters here is that the buffer and the snapshot are two halves of one
-statement about the inode and live under the same mutex, the same validity
-rule and the same obligations below.
+The same holds for writes. While this node holds the exclusive key, no other
+node can read the inode, so a write's new extent does not need to be in etcd
+until the key is given up. It is buffered in the entry next to the cached
+record and published later in batches, and the write too only touches the
+device. This trades some durability for speed; see
+[Consistency and Durability](../consistency/consistency-and-durability-model.md#durability-under-write-delegation).
+The buffer and the cached record describe the same inode and follow the same
+rules: same mutex, same validity, same obligations below.
 
-This is what a GFS2 glock does, and it brings the same obligation with it: the
-lock is what makes the cached data trustworthy, so giving the lock up means
-giving the data up in the same breath. Three rules discharge it.
+A GFS2 glock works the same way and has the same obligation: the cached data is
+only correct while the lock is held, so giving up the lock means giving up the
+data at the same time. Three rules enforce this.
 
-**Releasing the key publishes what is buffered under it, then clears what was
-cached under it.** Every path that gives the key back — a recall, an eviction,
-an upgrade from shared to exclusive, shutdown — goes through the same two steps:
-`prepareDropLocked` publishes the buffer and invalidates the kernel's pages, and
-`forgetKeyLocked` drops the snapshot as the key is given up. A single release
-and a batch of them differ only in how many deletes ride one transaction. A buffer that cannot be published because
-its key is already gone is discarded and its blocks returned to the arena,
-which loses nothing another node could ever have seen: nothing buffered was
-ever published. A re-acquired key carries a fresh holder token
-and the snapshot is tagged with the token it was read under, so a snapshot
-from before a recall cannot be mistaken for a current one even if it survived.
+**1. Releasing the key first publishes the buffer, then drops the cached
+record.** Every way of giving up the key (recall, eviction, upgrade from shared
+to exclusive, shutdown) runs the same two steps: `prepareDropLocked` publishes
+the buffer and drops the kernel's pages, and `forgetKeyLocked` drops the cached
+record as the key is released.
 
-**A mutation either publishes its outcome or invalidates.** The write path
-knows exactly what its transaction did, so it replays that transaction's own
-operations over the list it was built from and publishes the result — there is
-only one statement of what the write changed, and the cache is derived from it
-rather than described a second time. The transaction is decoded before the write
-is buffered or committed, since one the cache cannot account for has to take the
-committing path instead, and applied to the snapshot afterwards, in place: the
-list runs to tens of thousands of extents on a file under random overwrite, and
-rebuilding it per write cost more than everything else the write did. Every other mutation runs under the same
-exclusive lock and says nothing, and for those the default on release is to
-drop the snapshot. Being wrong in that direction costs one read; being wrong
-in the other serves a file's old extent list after it was rewritten.
+- If the key is already gone, the buffer cannot be published. It is discarded
+  and its blocks returned to the arena. No other node has seen that data,
+  because none of it was ever published.
+- A key acquired again gets a new holder token, and the cached record is tagged
+  with the token it was read under, so a record from before a recall can never
+  pass as current.
 
-**The lock session's identity bounds all of it.** A cached key is only as good
-as the lease it was written under. If that lease is gone — expired during a
-partition, or revoked — etcd deleted the key with it and a peer may already
-hold the inode, so `ensureLockKey` compares the lease this entry's key was
-written under against the session's current lease on every operation, and
-drops both the key and the snapshot when they differ (`keyLostLocked`). The
-entry itself stays in the cache, demoted exactly as a recall leaves it; its
-buffered writes are discarded and their blocks returned to the arena, and the
-operation that noticed goes on to acquire a fresh key. That check is a mutex
-and a channel poll, no round trip, and it is what bounds how long a
-partitioned node can answer from its own caches: the lock session's 2-second
-TTL, not the self-fencing watchdog's much longer window.
+**2. A change either updates the cached record or drops it.** The write path
+knows exactly what its transaction does, so it applies the transaction's own
+operations to the cached extent list. The cache is thus derived from the same
+description that etcd receives, not from a second description that could
+disagree. The transaction is decoded before the write is buffered or committed:
+a transaction the cache cannot interpret makes the write commit directly
+instead. It is applied to the cached list in place, because a file under random
+overwrite can have tens of thousands of extents, and rebuilding the list on
+every write took longer than the rest of the write.
 
-It compares identity rather than liveness, and the distinction is the whole
-guarantee. A dead session is replaced lazily, by whichever inode next needs a
-lock, so "is a session alive" answers yes again the moment any other operation
-acquires one — while this entry's key, written under the previous lease and
-deleted with it, is already gone. Checking liveness would let through exactly
-the stale holder the check exists to catch. A node that
-still holds a live session still holds its locks, and a peer that cannot take
-the lock cannot have changed what the snapshot describes — which is why a
-stale read needs the session to be gone, and the session being gone is what
-clears the cache.
+Every other change made under the exclusive lock drops the cached record. That
+costs one extra read if it was unnecessary; keeping a record that was wrong
+would serve an old extent list after the file had been rewritten.
 
-The kernel's own caching of file data is governed by the same lock. An open
-— or a create, which hands back an open descriptor — is answered with `keep_cache = 1` and `direct_io = 0` when this node can
-guarantee it will be able to take those pages back — which means page caching is
-enabled and a client is connected to carry the invalidation — and the daemon
-issues `FUSE_NOTIFY_INVAL_INODE` and waits for it before yielding the key. So a
-cached page is subject to exactly the rule the metadata snapshot is: valid only
-while this node has held the lock continuously. `--page-cache=false` returns to
-unconditional `direct_io = 1`, `keep_cache = 0`. See
+**3. A cached key is only valid under the lease it was written with.** If that
+lease is gone (it expired during a partition, or was revoked), etcd has deleted
+the key, and another node may already hold the inode. On every operation,
+`ensureLockKey` compares the lease the entry's key was written under with the
+session's current lease. If they differ, it drops the key and the cached record
+(`keyLostLocked`), discards the buffered writes and returns their blocks to the
+arena. The entry stays in the cache, as after a recall, and the operation goes
+on to acquire a new key.
+
+The check costs a mutex and a channel poll, no round trip. It limits how long a
+partitioned node can answer from its cache to the lock session's 2-second TTL,
+much less than the self-fencing watchdog's window.
+
+The check compares *which* lease, not *whether* a lease is alive. A dead session
+is replaced when the next operation on any inode needs a lock. From then on,
+"is a session alive?" answers yes, yet this entry's key, written under the old
+lease, was deleted with it. A liveness check would therefore let through exactly
+the stale entry it is meant to catch. Conversely, while the original session is
+alive, the node still holds its locks, so no other node can have changed what
+the cached record describes.
+
+The kernel's cached file pages follow the same rule. An OPEN or CREATE is
+answered with `keep_cache = 1` and `direct_io = 0` only when the daemon can
+later remove those pages: page caching is enabled and the C side is connected
+for invalidations. Before giving up the key, the daemon sends
+`FUSE_NOTIFY_INVAL_INODE` and waits for it to complete. A cached page is
+therefore valid only while this node has held the lock without interruption,
+like the cached record. `--page-cache=false` disables page caching
+(`direct_io = 1`, `keep_cache = 0`). See
 [FUSE Cache Management](../fuse/fuse-cache-management.md#data-page-cache).
 
-Attribute and directory-entry caching are governed separately, by their own
-timeouts and the `dirent:` watch (see
-[Cache Coherence](../consistency/cache-coherence.md)), and were never tied to
-lock acquisition.
+Cached attributes and directory entries are not tied to the lock. They have
+their own timeouts and are invalidated by the `dirent:` and `inode:` watches
+(see [Cache Coherence](../consistency/cache-coherence.md)).
 
 ## Fencing and Shutdown
 
-A cached lock key is the one piece of state the fencing generation guard
-does not neutralise on its own: the guard stops a fenced node's *writes*,
-but a lock key it is still holding blocks a healthy peer for as long as it
-takes that process to actually exit. So a self-fence
-(`stopOnSignalOrFence` in `cmd/etcfuse-meta/main.go`) drops every cached lock
-immediately, ahead of the rest of the shutdown sequence, rather than waiting
-for the process to exit. A fenced node's buffered writes cannot be published —
-the guard rejects them, which is exactly the point — so they are discarded and
-their blocks released rather than held hostage until the process exits, and it
-is logged as the data loss it is. A partitioned node
-that never gets the chance to self-fence loses the same keys within the
-lock's 2-second TTL regardless, the same guarantee lease expiry always
-provided.
+**After a self-fence.** The generation guard rejects a fenced node's commits,
+but a lock key the node still holds keeps blocking healthy nodes until the
+process exits. A self-fence (`stopOnSignalOrFence` in
+`cmd/etcfuse-meta/main.go`) therefore drops every cached lock first, before the
+rest of the shutdown. The node's buffered writes cannot be published (the guard
+rejects them), so they are discarded, their blocks are released, and the loss
+is logged. A partitioned node that cannot even self-fence loses its keys
+anyway when the 2-second lock session expires.
 
-A graceful shutdown is the ordinary case and does publish: `ReleaseCachedLocks`
-flushes each entry before dropping it, so a peer that takes an inode next sees
-every write this node acknowledged. A flush that fails there discards, because
-the process is exiting and the buffer dies with it either way — better to
-return the blocks to the arena than leave them for the next incarnation to
-reconstruct.
+**At a graceful shutdown**, `ReleaseCachedLocks` publishes each entry's buffer
+before dropping its key, so the next node to take an inode sees every write
+this node acknowledged. If a publish fails at this point, the buffer is
+discarded and its blocks returned to the arena, since the process is exiting
+and the buffer would be lost anyway.
 
-`leaveCluster` runs it before closing the lock session, and only then does
-`CloseLockSession` end the lease, which would otherwise have cleared the keys
-anyway but only after the process had already stopped answering.
+`leaveCluster` releases the cached locks before closing the lock session.
+`CloseLockSession` then ends the lease. Ending the lease would delete the keys
+too, but only after the process had already stopped answering.
 
 ## Correctness Invariants
 

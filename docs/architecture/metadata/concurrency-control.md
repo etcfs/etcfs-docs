@@ -1,6 +1,8 @@
 # Concurrency Control
 
-Lock operations, lease-backed lock expiry, fencing generations, and the safety protocol that prevents stale nodes from corrupting data.
+How EtcFS orders concurrent access to a file: the per-inode lock, the lease that
+frees a dead node's locks, and the fencing generation that stops a node which
+has lost its locks from changing metadata.
 
 ## Table of Contents
 
@@ -9,144 +11,233 @@ Lock operations, lease-backed lock expiry, fencing generations, and the safety p
 - [Lock Caching](#lock-caching)
 - [Lease-Backed Expiry](#lease-backed-expiry)
 - [Lock Release](#lock-release)
-- [Lock Watching](#lock-watching)
 - [Fencing Generations](#fencing-generations)
 - [Generation-Guarded Operations](#generation-guarded-operations)
 - [Self-Fencing Integration](#self-fencing-integration)
 
 ## Lock Model
 
-EtcFS provides two distinct lock classes:
+EtcFS uses locks only for file data. Namespace changes use no locks at all.
 
-**Data locks** are per-inode locks that serialise concurrent access to file data. They support shared (read) and exclusive (write) modes. A lock is represented by one key *per holder* — `lock:<ino>/<mode>/<holder>` — where the holder token is the node's session lease paired with a counter.
+### Inode locks
 
-A key each is what makes a shared lock possible at all: a single key holding many readers would be dropped for all of them the moment any one released. The holder token has to distinguish two holders on the same node, which the lease alone does not — every lock a node takes is written under one shared session lease. Putting the mode in the key rather than the value also lets a transaction ask "is any writer holding this?" as a range comparison, with no value to parse.
+An inode lock orders access to one file's data. It has two modes, shared (for
+reading) and exclusive (for writing). It is held by a node, not a process, and
+is unrelated to POSIX `fcntl()` and `flock()` locks (see
+[POSIX Lock Operations](posix-lock-operations.md)).
 
-Every operation that rewrites a file's extents or republishes its size takes the exclusive lock, not only the write path: `setattr` with a size change (which is `truncate` and `ftruncate`), an `open` carrying `O_TRUNC`, and both served `fallocate` modes. They read the extent list, decide what to rewrite from what they read, and commit — the same read-decide-commit shape a write has, and unlocked they race a concurrent write the same way. A read takes the shared lock. Everything else on an inode is settled by the compare-and-set the record's own transaction carries.
+Each holder has its own key, `lock:<ino>/<mode>/<holder>`. The holder token is
+the node's session lease plus a counter. One key per holder is needed for three
+reasons:
 
-The scrubber is the one deliberate exception. It runs over the whole key space rather than one inode, so locking would mean taking and dropping a lock per file in the filesystem; instead its reclaiming delete is made conditional on the extent record still being at the revision the scan read it at. That is the property the lock would have bought here — that nothing has rewritten the record in between — at the cost of re-finding the extent on the next pass rather than blocking. Without it, a truncate that reclaimed the extent between the scan and the delete would have its blocks freed twice, and the second free could hand a live file's blocks to another allocation.
+- **Shared locks need it.** If all readers shared one key, the first reader to
+  release would delete it for all of them.
+- **The token must tell two holders on one node apart.** All of a node's locks
+  use the same session lease, so the lease alone cannot.
+- **The mode in the key makes "is there a writer?" a range check.** A
+  transaction can test `lock:<ino>/exclusive/` without parsing any value.
 
-**Namespace operations** — file creation, deletion, rename — do not use locks at all. No directory is ever locked. Instead, every namespace mutation is a single atomic etcd transaction that succeeds or fails atomically. Two nodes simultaneously creating different files in the same directory execute independent transactions on different keys; neither blocks the other.
+**Which operations take the exclusive lock.** Every operation that rewrites a
+file's extents or changes its size: WRITE, a SETATTR that changes the size
+(`truncate`, `ftruncate`), an OPEN with `O_TRUNC`, and both supported
+`fallocate` modes. Each of them reads the extent list, decides what to change,
+and commits, and without the lock two of them would race in the same way two
+writes do. READ takes the shared lock. Every other change to an inode is
+protected by the comparison in its own transaction.
 
-This design eliminates directory-level lock contention entirely. The only serialisation point is the etcd Raft log, which serialises all transactions in a globally consistent order.
+**The scrubber does not take locks.** It scans every file, and locking would
+mean taking and dropping a lock per file. Instead, each delete it makes requires
+the extent record to be unchanged since the scan read it. That gives the
+guarantee the lock would give (nothing rewrote the record in between). If the
+condition fails, the scrubber finds the extent again on its next pass. Without
+the condition, a truncate that freed the extent between the scan and the delete
+would have its blocks freed twice, and the second free could hand blocks of a
+live file to another allocation.
+
+### Namespace changes
+
+Creating, deleting and renaming names never take a lock, and no directory is
+ever locked. Each change is one etcd transaction. Two nodes creating different
+files in the same directory write different keys, so neither waits for the
+other. The only ordering point is etcd's Raft log.
 
 ## Lock Acquisition
 
-`AcquireLock` writes this holder's key in a single transaction guarded by one range comparison: the range that must be empty for the acquisition to be allowed.
+`AcquireLock` writes the holder's key in one transaction, conditional on one
+range being empty:
 
-**Exclusive lock.** The range is `lock:<ino>/` — every holder in any mode. A writer is blocked by anyone.
+- **Exclusive:** the range is `lock:<ino>/`, every holder in any mode. A writer
+  waits for everyone.
+- **Shared:** the range is `lock:<ino>/exclusive/`. A reader waits only for a
+  writer, so any number of readers can hold the lock at once.
 
-**Shared lock.** The range is `lock:<ino>/exclusive/`. A reader is blocked only by a writer, so any number of readers hold the inode at once, each under its own key.
+etcd evaluates a comparison over a range as "true for every key in it", which
+is true for an empty range. `CreateRevision == 0` over the range therefore
+means "no blocking holder exists". Checking this inside the transaction, rather than
+with a read beforehand leaves no gap for another node to acquire the lock in
+between.
 
-Etcd evaluates a comparison over a range as "true for every key in it", and an empty range is vacuously true, so `CreateRevision == 0` over the range reads as "no blocking holder exists". Deciding it inside the transaction rather than by a preceding read is what closes the window a competing acquisition would otherwise slip through.
+If the range is not empty, the acquisition fails with `ErrConflict` and writes
+nothing. The caller asks the current holder to give the lock up (see
+[Lock Caching](#lock-caching)), waits, and retries, or reports the conflict.
 
-If the comparison fails, the acquisition fails with `ErrConflict` and writes nothing, leaving nothing behind. The caller retries with backoff, having first asked the current holder to yield (see [Lock Caching](#lock-caching)), or reports the conflict to the application.
-
-The backoff (`retryDelay` in `internal/ipc/retry.go`) is a linear ramp — 10 ms plus 40 ms per attempt — jittered by up to a quarter of the delay in either direction. The jitter is not about the contended inode; it is about the cluster. Every node retries against the same etcd cluster, and a leader election stalls all of them simultaneously, so an exact schedule brings the whole cluster back in lockstep: each wave arrives together, contends, and fails together. Jitter spreads the waves while leaving the mean untouched, which is what keeps the attempt budgets sized against this ramp valid. Plain etcd calls get five attempts rather than three for the same reason — three spanned about 100 ms, and an election outlasting that surfaced as EIO on every node at once. The ceiling in every case is the request deadline, which the retry loop aborts on.
+**The retry delay** (`retryDelay` in `internal/ipc/retry.go`) grows linearly,
+10 ms plus 40 ms per attempt, with a random variation of up to a quarter of the
+delay either way. The randomness matters for the cluster, not for one inode.
+All nodes use the same etcd cluster, and an etcd leader election stalls all of
+them at once. With exact delays, every node would retry at the same moment, all
+attempts would collide, and all would fail again. Plain etcd calls get five
+attempts, not three, for a similar reason: three attempts span about 100 ms,
+which is shorter than a typical leader election. The request deadline is the
+upper limit in every case.
 
 ### The session lease
 
-Every lock a node holds is written under one lease, granted on the node's first acquisition and renewed for the life of the process. A lock acquisition is therefore a single Raft commit rather than three: granting a lease per lock and revoking it on release would put two further commits on the critical path of every write, and those commits would be the dominant cost of a write (see [Performance Benchmarks](../reliability/performance-benchmarks.md)).
+All of a node's lock keys are written under one lease, the lock session,
+granted at the node's first acquisition and renewed for the life of the
+process. Its TTL is fixed at 2 s (`inodeLockTTL` in `internal/ipc/retry.go`).
 
-The safety argument is unchanged by the sharing. What releases a dead holder's lock is the lease TTL elapsing without a renewal, and that is equally true of a lease granted once as of one granted per operation: a node that stops renewing holds nothing, because expiry deletes every key written under the lease at once. The lock itself is still scoped to a single operation and released at the end of it, so no waiter is ever made to wait on another node's `close()` — the delegation is of the lease, not of the lock.
+A per-lock lease would add two Raft commits to every lock (grant and revoke),
+which would dominate the cost of a write (see
+[Performance Benchmarks](../reliability/performance-benchmarks.md)). Sharing the
+lease does not weaken safety: a dead node's locks are freed because its lease
+stops being renewed and expires, and that is the same for one shared lease as
+for many.
 
-Two consequences follow from the sharing, and both are handled explicitly. A holder is not identified by its lease, so the key carries a per-acquisition counter alongside it; without that, two concurrent readers on one node would write the same key and one would release the other's lock. And a release must delete its own key rather than revoke the lease, since revoking would drop every other lock the node holds.
+Sharing has two consequences, both handled:
 
-The production data path (`internal/ipc/datapath.go`, both the read and write handlers) acquires through the lock cache described below, with a fixed 2-second TTL (`inodeLockTTL` in `internal/ipc/retry.go`) — not a configurable default; every caller of `AcquireLock` in the running system passes the same constant. The first acquisition fixes the session's TTL; later ones reuse the session. If the session's lease is ever lost — expired during a partition, or revoked — the next acquisition grants a new one, which is safe because expiry has already removed every lock the old lease held.
+- The holder cannot be identified by the lease, so the key also carries a
+  per-acquisition counter. Otherwise two readers on one node would write the
+  same key, and one would release the other's lock.
+- A release must delete its own key, never revoke the lease, because revoking
+  would release every other lock the node holds.
+
+If the session lease is lost (it expired during a partition, or was revoked),
+the next acquisition grants a new one. This is safe because expiry has already
+deleted every lock the old lease held.
 
 ## Lock Caching
 
-The lock key an operation acquires now outlives that operation: the node
-keeps it in etcd and reuses it for later operations on the same inode, so a
-repeat acquisition costs no round trip. Mutual exclusion between this node's
-own threads moves to a per-inode mutex, and a blocked peer recalls a cached
-key with a `lock_want:<ino>/<node>` key the holder watches for — the same
-role a DLM's blocking AST plays.
+A node keeps a lock key after the operation that took it, and reuses it for
+later operations on the same inode, so repeated access costs no etcd round
+trip. Threads on the same node exclude each other with a per-inode mutex. A node
+that needs a lock another node has cached writes a `lock_want:<ino>/<node>` key;
+the holder watches for such keys and gives the lock up. This plays the same
+role as a blocking AST in a distributed lock manager.
 
-None of this touches the lease-based safety argument below, the fencing
-guard, or the extent CAS in the write transaction; caching changes only when
-the etcd key is taken and released. See
-[Lock Caching and Recall](lock-caching.md) for the full protocol, the
-recall sequence, and the two correctness invariants the implementation has
-to hold.
+Caching only changes when the key is taken and released. The lease, the
+fencing guard and the write transaction's comparisons are unchanged. See
+[Lock Caching and Recall](lock-caching.md) for the recall sequence and the
+invariants it must keep.
 
 ## Lease-Backed Expiry
 
-This is the core safety mechanism. When the lock-holding node crashes or is partitioned from etcd:
+When a node holding locks crashes or is cut off from etcd:
 
-1. The session's keepalive stops being renewed (or cannot reach etcd).
-2. After the lease TTL expires (2 seconds), etcd automatically deletes every key that lease holds, including that holder's.
-3. Any other node watching the lock key receives a DELETE event.
-4. The watching node can then attempt to acquire the lock.
+1. Its lock session is no longer renewed.
+2. After the TTL (2 s), etcd deletes every key written under the lease,
+   including the lock keys.
+3. Another node's next acquisition attempt finds the range empty and succeeds.
 
-The lease mechanism is fundamentally safer than a "release on crash" protocol because the release is guaranteed by etcd's own lease-expiry pipeline — it does not depend on the crashed node being able to communicate its release. A node that is still writing to the block device but cannot reach etcd will find its lock gone within TTL seconds.
+The lock is freed by etcd, not by the failed node, so it is freed even if that
+node cannot communicate. A node that is still running but cannot reach etcd
+loses its locks after the TTL like any other.
+
+The new holder does not wait for the old one to be fenced. If the old node is
+still running and tries to commit, its fencing generation stops it (see
+[Fencing Generations](#fencing-generations)).
 
 ## Lock Release
 
-`ReleaseLock` deletes one holder's key. Any watchers receive a DELETE event. A shared lock survives with its remaining holders — only the last one to leave actually unlocks the inode.
+`ReleaseLock` deletes one holder's key. A shared lock stays held by its other
+holders; the inode is unlocked when the last holder releases.
 
-On the data path a release is not issued at the end of the operation at all: the key is kept and reused (see [Lock Caching](#lock-caching)), and `ReleaseLock` runs only when a peer asks for the lock, when the cache evicts the entry, or on shutdown.
+On the data path, a lock is not released at the end of each operation. The key
+is kept (see [Lock Caching](#lock-caching)) and released only when another node
+asks for it, when the cache evicts it, or at shutdown.
 
-A release is retried, because a lock key outlives a failed release for as long as the node does: the session lease that would otherwise have expired it is the one this node keeps renewing. A graceful shutdown drops every cached lock and then ends the session (`CloseLockSession`), which clears anything a failed release left behind. The lock's own TTL (2 seconds) provides an upper bound on how long the lock itself can remain held after a crash. That is a different figure from the self-fencing watchdog's window: the watchdog gates on the node's *membership* lease (`gen:<node>`/`membership:<node>`, TTL configured separately via `--lease-ttl`, default 10 seconds — see `internal/config/config.go`) and fires at 2–3× that TTL, not the lock TTL. The two leases are independent and not proportional to each other; conflating them here previously understated the actual self-fence window by describing it as derived from the lock's 5-second TTL, a value that was itself wrong.
+A failed release is retried. The key would otherwise stay as long as the node
+runs, because the lease that would expire it is the one the node keeps
+renewing. At a graceful shutdown the node releases every cached lock and then
+ends the session (`CloseLockSession`), which also removes any key a failed
+release left behind.
 
-## Lock Watching
-
-`WatchLock` creates a prefix watch over `lock:<ino>/`, so it sees any holder arriving or leaving. This is used by blocking lock operations (SETLKW — "set lock, wait"). When a lock acquisition fails due to conflict, the caller can set up a watch and block until the lock is released or expired. The watch delivers an event when the key is deleted (lock released or expired), at which point the blocked caller can retry.
-
-The watch uses etcd's native prefix-watch mechanism. It is established after a failed lock attempt, not before — this avoids a race where the lock is released between the check and the watch establishment.
+After a crash, the lock TTL (2 s) bounds how long a lock stays held. This is
+separate from the self-fencing watchdog, which watches the node's membership
+lease (`--lease-ttl`, 10 s by default) and stops the daemon after twice that TTL
+without a renewal. The two leases are independent.
 
 ## Fencing Generations
 
-Fencing generations are the protocol that prevents a stale (partitioned but still running) node from corrupting data after its lock has been revoked and granted to another node.
+A fencing generation stops a node that was declared dead, but is still running,
+from changing metadata after its locks have been given to another node.
 
-### Generation Keys
+### Generation keys
 
-Each node has a `gen:<node_id>` key storing a monotonically increasing counter. The generation starts at zero (no fencing events) and is incremented by the fencing controller after confirming that the node has been successfully fenced.
+Each node has a key `gen:<node_id>` holding a counter that only increases. It
+starts at zero. The fencing controller raises it after confirming that the node
+has been fenced.
 
-### Generation Bump
+### Generation bump
 
-`BumpGeneration` atomically increments a node's fencing generation. It uses a CAS transaction that checks the current value matches the expected old generation. This prevents concurrent bumps — exactly one fencing event is recorded per epoch transition.
+`BumpGeneration` raises a node's generation with a compare-and-swap: the
+transaction requires the current value to be the one the controller read. Two
+controllers fencing the same node at once therefore record one increase, not
+two.
 
-The bump is the final step in the external fencing protocol:
-1. Fencing controller detects membership lease expiry.
-2. Controller issues a cloud API call to detach the shared block device from the fenced node.
-3. Controller polls until the detachment is confirmed (dual-confirmation).
-4. **Only then** does the controller call `BumpGeneration` to record the epoch transition.
+The bump is the last step of a fence:
 
-A generation bump is the signal to all other nodes that it is now safe to acquire locks previously held by the fenced node and to begin reclaiming its arenas.
+1. The fencing controller sees the node's membership lease expire.
+2. It cuts the node off from the shared device, by removing its NVMe
+   reservation or detaching the EBS volume through the EC2 API.
+3. It waits until the cut-off is confirmed.
+4. It calls `BumpGeneration`.
+5. If the cut-off was enforced by the device, it returns the node's arenas to
+   the free pool. Without a device-enforced fence, the node might still be
+   writing to those ranges, so the arenas are left unused instead.
 
-### Generation Guard
+### Generation guard
 
-`WithGenerationGuard` produces a transaction comparison that checks the writer's generation matches a known current value. Every metadata mutation that modifies extents must include this comparison in its transaction. If the generation has been bumped (the node was fenced), the transaction fails — the node's writes are silently rejected by etcd.
+`WithGenerationGuard` adds a comparison to a transaction: the writer's
+generation must still equal the value the writer read when it started. Every
+metadata change made by the daemon carries it (`metadata.Store.SetGuard`,
+installed at startup). After a fence has raised the generation, every
+transaction from the fenced node fails this comparison and changes nothing.
 
-This is the last line of defence: even if the self-fencing watchdog failed to close the block device, even if the external fence was delayed, any metadata commit from a fenced node will fail because the generation comparison will not match.
+This works even if the node never learns it was fenced, and even if the
+self-fencing watchdog and the device cut-off both failed.
 
-### Generation Precedence
+### Order of the fencing layers
 
-The generation protocol respects the following precedence chain:
-1. **Self-fencing** fires first (2× TTL margin, typically 10 seconds after lease loss).
-2. **External fencing** confirms detachment and bumps the generation (within ~30 seconds of lease expiry).
-3. **Generation-stamped extent writes** from the fenced node fail at etcd (perpetually, because the generation counter only increases).
-4. **Scrubber** detects any orphan bytes that were written to disk but never committed to etcd — harmless and reclaimable.
+1. **Self-fencing** stops the daemon after the membership lease has gone
+   unrenewed for twice its TTL (20–30 s with the default 10 s TTL).
+2. **External fencing** cuts the node off from the device and raises its
+   generation.
+3. **The generation guard** rejects every later metadata change from the
+   node, permanently, because the generation never decreases.
+4. **The scrubber** finds bytes the node wrote to the device but never
+   committed; they are referenced by nothing and are reclaimed.
 
 ## Generation-Guarded Operations
 
-The generation guard is most critical for extent-related operations:
-
-**Extent writes.** Before committing a new extent to etcd, the transaction includes a generation guard. The writer stores its current generation as a stamp in the extent entry itself, so the scrubber can later detect stale extents.
-
-**Lock re-grant.** Before granting a lock that was previously held by a fenced node, the new holder confirms that the generation has been bumped. This ensures the old holder's writes are definitively blocked before the new holder begins writing.
-
-**Arena reclamation.** Before reclaiming an arena from a fenced node, the reclaiming node checks that the generation has been bumped. Otherwise, the old node might still be writing to "its" arena range.
+- **Extent writes.** The transaction that publishes an extent carries the
+  guard, and the extent value records the writer's generation, so the scrubber
+  can compare the two later.
+- **Namespace changes and attribute updates** carry the same guard, so a fenced
+  node cannot create, delete or rename names either.
+- **Arena reuse.** A fenced node's arenas go back to the free pool only after a
+  device-enforced fence (step 5 above).
 
 ## Self-Fencing Integration
 
-The fencing generation system integrates with the self-fencing watchdog as follows:
+When the self-fencing watchdog finds that the membership lease has not been
+renewed for twice its TTL, it:
 
-When the self-fencing watchdog detects a lost etcd connection beyond the margin:
-1. It marks the node as self-fenced (sets a local flag).
-2. It closes the block device file descriptor — preventing further O_DIRECT writes.
-3. It invalidates all kernel FUSE caches via `FUSE_NOTIFY_INVAL_INODE`.
-4. It sets the filesystem to read-only (returning EROFS on new writes).
+1. marks the node as fenced, so the write path refuses to touch the device;
+2. signals the main process, which runs the same shutdown as for `SIGTERM`
+   (releasing arenas where it can) and exits with code 77.
 
-From this point, even if the node somehow recovers its etcd connection, any attempt to write will fail at the generation guard — the local generation is stale relative to the generation that the fencing controller will have bumped. The node must restart and rejoin with a fresh generation.
+After the generation has been raised, the node cannot commit anything with its
+old generation, even if it reconnects to etcd. It must restart, which reads its
+current generation again. See
+[Self-Fencing Watchdog](../fencing/self-fencing-watchdog.md).

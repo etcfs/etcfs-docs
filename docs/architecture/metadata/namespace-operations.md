@@ -1,6 +1,6 @@
 # Namespace Operations
 
-Inode lifecycle management, directory entry operations, and the atomic transaction patterns that keep the filesystem namespace consistent under concurrent mutation.
+How inodes and directory entries are created, changed and removed, and the etcd transactions that keep names and inodes consistent when several nodes change the same directory at once.
 
 ## Table of Contents
 
@@ -19,9 +19,14 @@ Every file and directory in EtcFS has an inode record stored at `inode:<ino>`. T
 
 ### Creation
 
-Inode creation is always paired with a directory entry that points to it — a file cannot exist without at least one name. Every creating operation writes both the `dirent:<parent>/<name>` key and the `inode:<ino>` key in a single transaction, checking that neither key exists (CreateRevision == 0 on both): `AtomicCreateFile` for regular files, `AtomicCreateDir` for directories, `AtomicCreateSymlink` for symlinks, and `AtomicCreateNode` for device nodes, FIFOs and sockets.
+An inode is always created together with a directory entry that points to it. Every creating operation writes the `dirent:<parent>/<name>` key and the `inode:<ino>` key in one transaction, which first checks that neither exists (`CreateRevision == 0` on both):
 
-An inode written without its name would be unreachable: no listing shows it, and the orphan check cannot see the space behind it, because that check looks for extents whose inode is *missing* rather than unreachable. The scrubber and `fsck` both report such an inode if one ever appears.
+- `AtomicCreateFile` for regular files;
+- `AtomicCreateDir` for directories;
+- `AtomicCreateSymlink` for symlinks;
+- `AtomicCreateNode` for device nodes, FIFOs and sockets.
+
+An inode without a name could not be reached by any path or listing. Its blocks would also never be reclaimed, because the orphan check looks for extents whose inode is *missing*, not for inodes nobody can reach. The scrubber and `fsck` both report such an inode.
 
 The inode is initialised with:
 - `Nlink = 1` for regular files (one directory entry points to it)
@@ -36,25 +41,39 @@ The inode is initialised with:
 
 ### Deletion
 
-An inode is deleted by the transaction that removes the last name referring to it. `AtomicUnlink` drops the link count and deletes the inode record in the same transaction as the dirent — and, for a symlink, the key holding its target. `AtomicRmdir` deletes a directory's record outright — a directory has exactly one name, so its count says nothing about how many refer to it — and lowers its parent's count by one in the same transaction. There is no standalone delete: an inode removed without its name, or a name removed without its inode, is exactly the inconsistency these transactions exist to prevent.
+An inode is deleted by the transaction that removes the last name pointing to it:
+
+- `AtomicUnlink` lowers the link count and, at zero, deletes the inode record (and a symlink's target key) in the same transaction as the directory entry.
+- `AtomicRmdir` deletes a directory's record outright, and lowers its parent's count by one in the same transaction. A directory has exactly one name, so its count does not say how many names point to it.
+
+There is no operation that deletes an inode or a name on its own, because either would leave the other behind.
 
 ### Attribute Updates
 
-Attribute changes are written by the `setattr` handler as a CAS transaction pinned to the revision the record was read at, so a concurrent update to a different field is not silently overwritten. Link counts are never adjusted on their own: they move as part of the transaction that adds or removes the name responsible for them, and so does the target inode's `ctime`, since adding or removing a name is a status change of the file itself.
+The `setattr` handler writes attribute changes with a transaction that requires the record to be unchanged since it was read, so a concurrent change to a different field is not overwritten.
+
+Link counts are never changed on their own. They change in the transaction that adds or removes the name, together with the inode's `ctime`, because adding or removing a name changes the file's status.
 
 ### Directory Timestamps
 
-POSIX requires an operation that adds or removes an entry to mark the containing directory's `mtime` and `ctime` for update. `Store.touchDir` does this *after* the namespace transaction commits, for both ends of a rename. Folding it into that transaction would mean pinning the parent's record in every create and unlink, so two nodes making unrelated entries in one directory would abort each other; a timestamp one commit late is the better trade, and a failure to record it is logged rather than failing an operation that already succeeded.
+POSIX requires an operation that adds or removes a directory entry to update the directory's `mtime` and `ctime`. `Store.touchDir` does this after the namespace transaction has committed, for both directories of a rename.
 
-The update is also **coalesced**. Committing one per entry made an unpacking archive pay two Raft commits per file — one to publish the file, one to say the directory it went into had changed, over and over for the same directory. `Store.StartDirTouchBatching` (`pkg/metadata/inodetimes.go`) queues the directory instead and writes it at most once per `--metadata-flush-interval`, so a stream of creates into one directory costs one timestamp commit per interval rather than one per create. Zero disables the queue and writes each one through, exactly as it commits every extent before acknowledging a write.
+**Why not in the same transaction.** Updating the parent's record inside every create and unlink would require the parent to be unchanged since it was read. Two nodes creating unrelated files in the same directory would then make each other's transactions fail. The timestamp is written one commit later instead, and a failure to write it is logged rather than failing a create that has already succeeded.
 
-The same queue carries the times a `setattr` assigns, and for the same reason: `tar` sets each extracted file's timestamps after writing it, one call per file, and each was a Raft commit of its own. A timestamp is the one attribute with no enforcement meaning, so a peer reading it an interval late costs nothing a permission check depends on — which is exactly why mode and ownership are **not** queued. A `setattr` that changes either commits before it returns, and publishes whatever that inode has queued first, so the older timestamps cannot land on top of the change that overtook them. A `setattr` naming mode or ownership *without moving either* — which is what `tar` sends, since it restores the mode the file was created with — is a status change and nothing more, and is queued like any other.
+**Queued, not written each time.** `Store.StartDirTouchBatching` (`pkg/metadata/inodetimes.go`) queues the directory and writes its timestamp at most once per `--metadata-flush-interval`. Extracting an archive into one directory would otherwise cost two Raft commits per file: one for the file, one for the directory's timestamp. With the queue it costs one per file, plus one timestamp commit per interval. A flush interval of zero turns the queue off and writes each timestamp immediately.
 
-`close()` does not publish them. It publishes the file's extents, because a peer opening the file next has to see the data, but a timestamp carries no such promise — and an archive sets each file's times on the descriptor and then closes it, so publishing them there would be a commit per file for a change nobody asked to be durable. `fsync` and `fsyncdir` do publish them: a caller that asked for durability is asking for the timestamps too.
+**`setattr` timestamps use the same queue.** `tar` sets each file's timestamps after writing it, which would otherwise be a Raft commit per file. Timestamps have no effect on access control, so another node seeing one an interval late changes nothing it enforces.
 
-The sweep publishes in batches rather than one inode at a time. A commit per inode is exactly what the queue exists to avoid, and an archive queues one update per file, so unbatched the sweep would hand back the commit the deferral removed. Each inode keeps its own comparison and its own put, so a shared transaction adds only atomicity between inodes, which nothing here depends on. A batch that is refused is retried one inode at a time — otherwise a single record that kept moving would take every other inode's timestamps down with it on every sweep.
+**Mode and owner are not queued.** A `setattr` that changes the mode or owner commits before it returns, and first publishes anything queued for that inode, so an older queued timestamp cannot overwrite the newer change. A `setattr` that sets the mode or owner to the value it already has (as `tar` does, restoring the mode the file was created with) changes no permission and is queued like a timestamp.
 
-Two ordering rules make the queue safe against operations that rewrite a record while it waits. The publish is a read-modify-write pinned to the record's revision, so it can only ever overwrite the fields it queued; and `ctime` is only moved forward, because unlike `atime` and `mtime` — which `utimes` may legitimately set into the past — a `ctime` is always the moment its call happened, so a queued one is older than anything committed since.
+**`close()` does not publish timestamps.** It publishes the file's extents, because the next node to open the file must see the data. Timestamps carry no such promise, and since `tar` sets each file's times and then closes it, publishing them at close would add a commit per file. **`fsync` and `fsyncdir` do publish them**, because a caller asking for durability expects the timestamps to be durable too.
+
+**The sweep publishes in batches.** Publishing one inode per transaction would bring back the commit per file that the queue removes. Each inode in a batch has its own comparison and its own write; sharing a transaction only makes the batch atomic, which nothing relies on. If a batch is rejected, it is retried one inode at a time, so one record that keeps changing cannot block every other inode's timestamps.
+
+**Two rules keep a queued timestamp from undoing a newer change:**
+
+- Publishing is a read-modify-write that requires the record to be at the revision read, so it only changes the fields it queued.
+- `ctime` only moves forward. `atime` and `mtime` may be set to the past with `utimes`, but `ctime` is always the time of the call, so a queued `ctime` is older than anything committed since.
 
 What the queue changes, and what it does not:
 
@@ -62,13 +81,13 @@ What the queue changes, and what it does not:
 - The node that made the change reads the new timestamp immediately: `Store.PendingDirTime` answers from the queue and the IPC handlers apply it to every `stat` (`Service.withPending`), so a create followed by a `stat` of its parent on the same node is never behind.
 - A peer sees the timestamp up to one interval late. Its cached listing is invalidated by the dirent watch, which fires on the entry itself rather than on the timestamp, so what actually lags is only the clock — the same lag deferred extent publication already gives a file's size.
 - A queued timestamp is only ever written forward. Something that folds the parent's `mtime` into its own transaction — `mkdir` does, through `adjustDirNlink` — may commit a newer one while a touch is still queued, and the flush skips its own value rather than taking the directory's clock backwards.
-- `fsync`, `fsyncdir` and shutdown publish the queue. `fsyncdir` used to be answered locally with success on the grounds that nothing was deferred; that is what makes it mean something now.
+- `fsync`, `fsyncdir` and shutdown publish the queue, which is what gives `fsyncdir` a meaning: it waits until the directory's queued timestamp is committed.
 
 ## Directory Entry Operations
 
 ### Lookup
 
-`LookupDirent` reads a single dirent key and returns the target inode number, or zero if the entry does not exist. This is a simple Get — no transaction needed, since reading a single etcd key is atomic in itself.
+`LookupDirent` reads one directory-entry key and returns its inode number, or zero if the entry does not exist. A single-key read needs no transaction.
 
 ### Create (Standalone)
 
@@ -84,63 +103,69 @@ What the queue changes, and what it does not:
 
 ## Atomic Create
 
-The atomic create for a regular file is the canonical example of the etcd transaction model. A single Txn performs:
+Creating a regular file is one transaction:
 
 1. **Comparison 1:** `CreateRevision(dirent:parent/name) == 0` — the name must not already exist in the parent directory
 2. **Comparison 2:** `CreateRevision(inode:ino) == 0` — the inode number must not already be allocated
 3. **Success operations:** Insert the dirent key with the inode number as its value; insert the inode key with the new inode record
 
-If either comparison fails (the name already exists, or the inode was concurrently allocated), the transaction does nothing and returns an error.
+If either comparison fails (the name exists, or another create took the inode number), nothing is written and an error is returned.
 
-Directory creation follows the same pattern but sets `Mode | S_IFDIR` and initialises `Nlink` to 2 (for `.` and `..`). A symlink adds a third operation to the same transaction — the `inode:<ino>/symlink` key holding its target — and a device node carries its `rdev` in the inode record it commits, rather than in a second write.
+The other creating operations differ only in what they add:
+
+- a directory has `S_IFDIR` and `Nlink = 2`, and its parent's count goes up by one;
+- a symlink adds its `symlink:<ino>` target key to the same transaction;
+- a device node carries its `rdev` in the inode record.
 
 ### The file's lock rides the same transaction
 
-Anything a create can assert in its own transaction costs no second Raft commit, and anything that cannot ride it costs one per file. `create()` folds in one more thing, through `metadata.CreateExtra`: **this node's exclusive lock on the file it is making.**
+`create()` also takes **this node's exclusive lock on the new file** in the same transaction, through `metadata.CreateExtra`. Anything added to the create's transaction costs no extra Raft commit.
 
-`Store.PrepareLock` mints a holder token and returns the comparison and the write an ordinary acquisition would have used — the blocking range `lock:<ino>/` must be empty, and the key is written under this node's lock session lease. Both join the create. Nothing about the lock is weakened by taking it this way; it asserts exactly what `AcquireLock` asserts, in a transaction that was already being committed.
+`Store.PrepareLock` creates a holder token and returns the comparison and the write that `AcquireLock` would use: nothing may exist under `lock:<ino>/`, and the lock key is written under this node's lock-session lease. Both are added to the create. The lock is exactly as strong as one taken with `AcquireLock`.
 
-What it removes is the acquisition the *first write* to the file used to pay for. An unpacking archive writes every file it creates, so that acquisition was one Raft commit per file. `Service.seedCreatedLock` also seeds the lock cache with the record the create just published and an empty extent list, which is a valid snapshot under exactly the usual rule — this node has held the key continuously since it was read — so the first write finds both the lock and the metadata already in hand and reaches the device without touching etcd.
+The first write to a new file therefore does not need to acquire the lock, which saves one Raft commit per file when extracting an archive. `Service.seedCreatedLock` also puts the new record and an empty extent list in the lock cache. That cached copy is valid by the usual rule, since this node has held the lock since the record was written, so the first write reaches the device without contacting etcd.
 
-Only `create()` does this. `mkdir`, `symlink` and `mknod` make inodes nothing is about to write, and a lock taken for them would only be a key to release later.
+Only `create()` does this. Nothing is about to write to the inode created by `mkdir`, `symlink` or `mknod`, so a lock would only have to be released later.
 
-**The failure that has to be handled** is a create whose transaction committed and whose reply was lost. It is reported as a failure, and it leaves a lock key standing under this node's session lease, held by a token no cache entry names — nothing would ever release it and every peer wanting that inode would block until this node exited. `Service.discardCreatedLock` deletes it rather than reasoning about it: the token names exactly one key and only that create ever had it, so the delete cannot touch a lock anyone else took, and a key that was never written costs one delete of nothing on a path that is already failing.
+**A create that committed but whose reply was lost** is reported as a failure, yet leaves a lock key under this node's session lease, with a token no cache entry knows about. Nothing would release it, and every other node needing the inode would wait until this node exited. `Service.discardCreatedLock` therefore deletes the key. The token names exactly one key that only this create wrote, so the delete cannot remove anyone else's lock, and if the key was never written the delete does nothing.
 
-The model checker shows why the delete is needed: the state it prevents breaks no safety property — a key nobody holds makes nobody a holder — but it leaves the inode unusable to every node in the cluster, because acquiring a lock needs the key free and every release starts from a node that believes it holds one. Taking the delete away is the `CachedLockNoOrphanDiscard` configuration in [TLA+](../../verification/tla-plus.md), and what it breaks is a liveness property. The lock session's lease is the only other thing that would ever clear such a key, which makes the delete the difference between a bounded window and one that lasts as long as the node does.
+The TLA+ model shows why the delete matters. Without it no safety property breaks (an unowned key makes nobody a holder), but the inode can never be locked again by any node, because acquiring needs the key gone and only a node that believes it holds the key would release it. The `CachedLockNoOrphanDiscard` configuration in [TLA+](../../verification/tla-plus.md) removes the delete and breaks a liveness property. Only the session lease's expiry would otherwise clear the key, so the delete turns an unavailability lasting as long as the node runs into a short one.
 
 ## Atomic Link
 
-`AtomicLink` adds a second name for an existing inode. The new dirent and the raised link count commit together: the transaction asserts that the new name is free and that the inode still stands at the revision its count was read at. A link that loses either race writes nothing, so a name refused with `EEXIST` cannot leave the count permanently inflated.
+`AtomicLink` adds another name for an existing inode. The new entry and the raised link count commit together, on two conditions: the new name is free, and the inode is unchanged since its count was read. If either fails nothing is written, so a link refused with `EEXIST` cannot leave the count too high.
 
-Hard links to directories are refused with `EPERM`. Allowing one would let the namespace form a cycle that no unlink can break, and POSIX reserves the right to refuse them.
+Hard links to directories are refused with `EPERM`. They would allow a cycle that no unlink could break, and POSIX allows filesystems to refuse them.
 
 ## Atomic Unlink
 
-Unlinking a file is more complex because two outcomes are possible depending on the link count:
+An unlink has two outcomes, depending on the link count:
 
-1. If `Nlink > 1` after decrement: the file still has other hard links. The transaction deletes the dirent and writes back the inode with `Nlink - 1`.
-2. If `Nlink == 1` before decrement (zero after): this is the last link. The transaction deletes both the dirent and the inode key — unless this node still has the file open, in which case the record survives with `Nlink = 0` and an `orphan:<node>/<ino>` key naming the node that must finish the job.
+1. **Other names remain** (`Nlink > 1` before the unlink): the transaction deletes the entry and writes the inode back with `Nlink - 1`.
+2. **This is the last name** (`Nlink == 1`): the transaction deletes the entry and the inode record. If this node still has the file open, the record is kept with `Nlink = 0`, and an `orphan:<node>/<ino>` key records which node must delete it later.
 
-POSIX requires a file to stay readable through an open descriptor after its last name is gone. The daemon counts this node's open descriptors per inode (it sees every `open` and every `release`), and the last release deletes the record, its attributes and the orphan key; a node that dies holding one reclaims it at its next startup. Only the unlinking node's own descriptors are counted — tracking them cluster-wide would cost a round trip on every open, so a *peer* unlinking a file this node holds open still takes it away.
+POSIX requires an open file to stay readable after its last name is removed. The daemon counts this node's open descriptors for each inode, and when the last one is released it deletes the record, its attributes and the orphan key. A node that crashes while holding such a file deletes it at its next start. Only the unlinking node's own descriptors are counted. Counting them across the cluster would cost a round trip on every open, so another node unlinking a file this node has open still deletes it.
 
-Both paths execute in a single Txn, so there is no intermediate state where a dirent exists pointing to a deleted inode, or an inode with nlink=0 but no dirent pointing to it.
+Either outcome is one transaction, so there is never an entry pointing to a deleted inode, or an inode with `Nlink = 0` that is not marked as an orphan.
 
-The transaction first reads the dirent and the inode to determine the current nlink, then constructs the appropriate operations based on the outcome. It pins **both** records to the revision each was read at:
+The transaction reads the entry and the inode first, and requires **both** to be unchanged when it commits:
 
-- the dirent must still stand where it was read, so a name replaced by a concurrent rename is not unlinked as if it were the original;
-- the inode must still hold the count the new one was computed from.
+- the entry must be the one that was read, so a name that a concurrent rename replaced is not removed by mistake;
+- the inode must still have the count that the new count was computed from.
 
-The second comparison is the one that makes concurrent unlinks correct. Proving only that the inode exists lets two unlinks of two names for the same inode both read `nlink = 2`, both write `nlink = 1`, and leave a file referenced by nothing that is never freed. Losing either comparison is contention rather than failure, so the operation is redone against fresh state, with a jittered backoff between attempts — without the jitter, callers that lost the same race retry in lockstep and collide again on the next tick.
+The second condition makes concurrent unlinks safe. Suppose a file has two names and two nodes unlink one each at the same time. Both read `nlink = 2` and both write `nlink = 1`, and the file ends up with no names and a count of 1, so it is never freed. With the condition, the second unlink fails, re-reads `nlink = 1`, and deletes the inode.
+
+A failed condition means contention, not an error: the unlink is retried from a fresh read after a random delay. Without the randomness, two callers that collided would retry at the same moment and collide again.
 
 The same pinning applies wherever a link count is read and written back: `AtomicLink` and the target replacement inside `AtomicRename`.
 
 ## Atomic Rmdir
 
-Removing a directory has to prove it is empty *inside* the transaction that removes it. etcd cannot compare "no keys under this prefix" as a value, but it can compare a whole range: every key under `dirent:<ino>/` having creation revision 0 is true only when the range holds no keys, since an existing key never has one. `AtomicRmdir` adds that comparison alongside the pins on the dirent and the inode, and deletes both keys.
+RMDIR must check that the directory is empty in the same transaction that removes it. etcd has no "this prefix is empty" comparison, but it can compare a whole key range: "every key under `dirent:<ino>/` has creation revision 0" is only true when there are no keys, because an existing key always has a non-zero creation revision. `AtomicRmdir` adds this comparison to the conditions on the entry and the inode, and deletes both keys.
 
-Listing the directory first and deleting afterwards would leave a window in which another node creates an entry: the parent's name disappears and the children become unreachable from the root, indistinguishable afterwards from ordinary data. The same range comparison guards the rename that replaces an empty directory.
+Checking emptiness with a listing first and deleting afterwards would leave a gap in which another node could create an entry in the directory. The directory's name would then disappear while that entry stayed, unreachable from the root. The same range comparison protects a rename that replaces an empty directory.
 
-A directory is deleted outright rather than decremented. Its link count is its own `.` plus the `..` of each subdirectory, not a count of the names referring to it, so the count says nothing about whether anything still refers to it.
+A directory's record is deleted outright rather than having its count lowered. Its count is its own `.` plus each subdirectory's `..`, not the number of names pointing to it.
 
 ## Atomic Rename
 
@@ -152,47 +177,51 @@ A directory is deleted outright rather than decremented. Its link count is its o
 4. Creates the destination dirent with the same inode number
 5. When the destination was already taken, unlinks what was there: its inode's link count drops, and the inode record is deleted once nothing points at it
 
-When the replaced inode is a symlink, its target key is deleted in the same transaction — nothing else references it, and no check looks for a stray one. Step 5 is what keeps a replaced file from being orphaned. Its extents are deliberately left behind as orphans, which the scrubber reclaims on the node owning their arena — the only node that may.
+If the replaced inode is a symlink, its target key is deleted in the same transaction, since nothing else refers to it. Step 5 keeps a replaced file from being left in etcd with no name. Its extents become orphans, and the scrubber on the node that owns their arena frees them; only that node may.
 
-Several renames are refused outright: `RENAME_EXCHANGE` (unimplemented, and an ordinary rename would lose the source's data rather than swap it), a directory over a non-directory or the reverse, a non-empty directory target, and a destination lying inside the directory being moved. The last would detach a whole subtree into a cycle no path reaches; the ancestor check walks up a reverse index built from one scan of the `dirent:` prefix, and only when a directory is the thing being moved. See [FUSE Write Operations](../fuse/fuse-write-operations.md#rejected-renames) for the errno each maps to.
+Some renames are refused: `RENAME_EXCHANGE`, a directory over a non-directory or the reverse, a non-empty directory as the target, and a destination inside the directory being moved. See [FUSE Write Operations](../fuse/fuse-write-operations.md#rejected-renames) for the error each returns and why.
 
-For cross-directory renames, every key is in the same transaction. Etcd serialises the transactions through Raft; exactly one succeeds and the other fails with a conflict error.
+A rename between directories changes every key in one transaction. If two renames conflict, etcd orders them; the first commits and the second fails its comparison.
 
 ## Directory Listing
 
-Directory listings use etcd's prefix-range scan over `dirent:<parent>/`. The lexicographic order of etcd keys means entries are naturally ordered by name, which matches POSIX expectations.
+A listing is a range read over `dirent:<parent>/`. etcd returns keys in sorted order, so entries come back sorted by name.
 
-A FUSE `readdir` asks for a *position* — "skip the first N names" — and etcd cannot skip. A range starts at a key, so serving position N by reading means reading the N keys before it and discarding them, and a listing that does that once per page reads the whole directory once per page. That is quadratic in directory size, and measurably so: served that way, a 5,000-entry directory took 209 readdirplus calls and just under three seconds, having read a million entries out of etcd to return five thousand.
+A FUSE `readdir` asks for a *position* ("start after the first N names"), but an etcd range read starts at a key, not a position. Reaching position N means reading and discarding the N keys before it. Doing that for every page reads the whole directory once per page, so the cost grows with the square of the directory size. Served that way, a 5,000-entry directory needed 209 READDIRPLUS calls and almost three seconds, and read a million entries from etcd to return five thousand.
 
-What makes paging possible is that a scan is sequential — the offset a `readdir` asks for is the one the previous reply ended on. The daemon remembers the last name it handed out for a directory and answers a request continuing from exactly there with `ListDirentsAfter`, an etcd range starting after that name with `WithLimit` sized to the kernel's buffer. One scan then costs one pass over the directory however many pages it takes; the same 5,000-entry listing does one full read instead of 209.
+A listing normally reads a directory from start to end, so each request continues where the previous reply ended. The daemon remembers, per directory, the last name it returned. A request continuing from that point is served by `ListDirentsAfter`: a range read starting after the name, with `WithLimit` set to what fits in the kernel's buffer. The whole listing then reads each entry once; the 5,000-entry directory takes one full read instead of 209.
 
-Anything that does not continue the previous reply — a `seekdir`, a second process scanning the same directory, a scan paused past the cursor's 60-second lifetime — misses and falls back to reading the directory and counting from the start. A miss is slower, and its offset is only a position: if a name before it was removed since the previous page, one unrelated name is skipped, and if one was added, one is returned twice. libfuse requires offsets that never skip or repeat entries unrelated to a change, so a miss does not meet that requirement; a listing that keeps hitting the cursor does.
+A request that does not continue the previous reply misses: after a `seekdir`, from a second process listing the same directory, or after a pause longer than the remembered name's 60-second lifetime. It falls back to reading from the start and counting. A miss is slower, and because its offset is only a position, it can be wrong after a change: if a name before the offset was removed since the previous page, one unrelated name is skipped; if one was added, one is returned twice. libfuse requires offsets that never skip or repeat unchanged entries, so a miss does not meet that requirement, while a listing that keeps continuing from the remembered name does.
 
-The cursor holds a *name*, not directory contents. It is used as the start of a fresh linearizable range read, so a page served from it cannot return a deleted name or hide an existing one before it; a name created or removed during the listing may or may not appear, which POSIX leaves unspecified. There is deliberately **no** revision pinning: pages are not a snapshot of one etcd revision, and a listing is not atomic against concurrent creates and unlinks.
+The remembered value is a name, not a copy of the directory. Each page is a fresh linearizable read starting after it, so a page cannot return a deleted name or hide an existing one before it. A name created or removed while the listing runs may or may not appear; POSIX leaves this unspecified. Pages are deliberately not tied to one etcd revision, so a listing is not a snapshot.
 
 `etcfuse_readdir_page_total` counts pages by whether they resumed or had to re-read, which is how an operator sees a workload defeating the cursor.
 
 ## Extent Maps
 
-Each inode's extent map is stored as one key per extent, of the form `extent:<ino>/<chunk>`. The value is the text form `logical_off,disk_off,length,generation`:
+An inode's extent map is stored as one key per extent, `extent:<ino>/<chunk>`, with the value `logical_off,disk_off,length,generation,sequence,node`:
 
-- **Logical offset** — the byte offset within the file where this extent begins
-- **Disk offset** — the byte offset on the shared block device
-- **Length** — the size of the extent in bytes
-- **Generation** — the fencing generation at the time the extent was written
+- **logical_off**: where in the file the extent starts, in bytes;
+- **disk_off**: where on the shared device its data is, in bytes;
+- **length**: its size in bytes;
+- **generation** and **node**: the writer's fencing generation and node ID;
+- **sequence**: orders writes to the same bytes (see [Metadata Schema](metadata-schema.md#extent)).
 
-One extent per key keeps every value far under etcd's 1.5 MiB request limit without any chunk-packing logic, and lets a single extent be rewritten (truncate) or deleted (scrub) without touching its neighbours.
+One extent per key keeps every value far below etcd's 1.5 MiB request limit without any packing, and lets one extent be rewritten (by a truncate or an overwrite) or deleted (by the scrubber) without touching the others.
 
-`pkg/metadata/extent.go` is the only place this format is written or parsed. `Store.GetExtents` returns an inode's extents **ordered by logical offset** — etcd returns keys lexicographically, so chunk 10 arrives before chunk 2 and key order is not file order. `Store.NextExtentChunk` returns one past the highest chunk in use, rather than a count, so that an extent deleted by truncate does not cause the next write to reuse a live chunk number.
+`pkg/metadata/extent.go` is the only code that writes or parses this format.
 
-Extents are the bridge between the metadata layer (etcd) and the data layer (block device). The scrubber cross-references every extent against its owning inode and arena to detect collision or orphan anomalies.
+- `Store.GetExtents` returns an inode's extents ordered by file offset. etcd returns keys in string order, where chunk 10 comes before chunk 2, so key order is not file order.
+- `Store.NextExtentChunk` returns one more than the highest chunk number in use, not the number of extents. After a truncate deletes an extent in the middle, a count would make the next write reuse a chunk number that still exists.
+
+The scrubber checks every extent against its inode and its arena to detect overlapping extents and orphans.
 
 ## Inode Number Allocation
 
-Inode numbers come from a single `inode_alloc_counter` key, CAS-advanced by `Store.ReserveCounter` (which also hands out arena IDs from `arena_alloc_log`, one at a time). The CAS retries with backoff under contention, so two nodes never receive the same number.
+Inode numbers come from one key, `inode_alloc_counter`, which `Store.ReserveCounter` advances with a compare-and-swap. (The same function hands out arena IDs from `arena_alloc_log`, one at a time.) A failed compare-and-swap is retried after a delay, so two nodes never get the same number.
 
-A node reserves a block of 1024 numbers and hands them out from memory, so a creation reaches etcd for its number only once per block. That leaves the create path with the single transaction that publishes the file, and it drops contention on the shared key by the same factor.
+A node reserves 1,024 numbers at a time and hands them out from memory. Only one create in 1,024 touches the counter, so the create itself stays a single transaction, and contention on the shared key drops by the same factor.
 
-The counter has a floor of `FirstUsableIno` (2): 0 is never a valid inode and 1 is `FUSE_ROOT_ID`, the root directory the C daemon answers for locally.
+The counter starts at `FirstUsableIno` (2): 0 is never a valid inode, and 1 is the root directory, `FUSE_ROOT_ID`.
 
-A node that stops holding a block strands the rest of it. Inode numbers are 64-bit and are never reused, so nothing reclaims them: the counter says how many numbers have been handed out, not how many files exist, which is the upper bound `statfs` already reports it as.
+When a node stops (or restarts), the unused rest of its block is lost. Inode numbers are 64-bit and never reused, so nothing reclaims them. The counter therefore counts numbers handed out, not files that exist, which is why `statfs` reports it as an upper bound.
