@@ -56,7 +56,7 @@ Metadata operations/second in one shared directory:
 > same-session re-measure below is the current build against GFS2 on one
 > instance class and one day, and it supersedes them.
 
-### Same-session re-measure, etcfs and GFS2 (2026-10-16)
+### Same-class re-measure (2026-10-16/17)
 
 Both backends swept 2/4/6 on `m5.large` (no CPU credits to exhaust), back to
 back on the same evening, with the suite's default 20 GB / 1000-IOPS volume. The
@@ -70,6 +70,18 @@ build is the current `etcfs` main.
 | gfs2 | shared-file write (MiB/s) | 223.56 | 444.87 | 443.41 | 1.98x |
 | etcfs | disjoint write (MiB/s) | 264.52 | 296.16 | 290.28 | 1.10x |
 | gfs2 | disjoint write (MiB/s) | 285.31 | 355.68 | 406.41 | 1.42x |
+| gluster | shared-directory metadata (ops/s) | 1017.64 | 1686.81 | 2010.27 | 1.98x |
+| nfs | shared-directory metadata (ops/s) | 956.63 | 1093.29 | 1522.84 | 1.59x |
+| gluster | shared-file write (MiB/s) | 123.92 | 131.58 | 140.81 | 1.14x |
+| nfs | shared-file write (MiB/s) | 203.94 | 237.13 | 262.09 | 1.29x |
+| gluster | disjoint write (MiB/s) | 132.94 | 140.68 | 161.91 | 1.22x |
+| nfs | disjoint write (MiB/s) | 196.54 | 221.92 | 257.89 | 1.31x |
+
+The gluster and nfs rows were taken the next day (2026-10-17) on the same
+instance class; JuiceFS could not be re-run (its MinIO binary is no longer
+downloadable). Both server-mediated backends scale on shared-directory metadata,
+as they did on `t3.medium`, and at six nodes etcfs is 3.7x behind GlusterFS and
+2.8x behind NFS. GFS2 is the only backend whose metadata curve falls.
 
 The shape survives the newer build and the steadier instance class. GFS2's
 shared-directory metadata falls by 44% from two nodes to six, and etcfs's climbs

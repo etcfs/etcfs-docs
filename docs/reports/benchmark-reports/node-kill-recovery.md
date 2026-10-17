@@ -139,6 +139,19 @@ times, each on a fresh `m5.large` cluster, same scenario and probes:
 | survivor's shared probe silent at end of run | 6–15 s (probe wind-down) | **~152 s, all three** |
 | failed operations after the death | 1 in one run, 0 otherwise | 0 |
 
+GlusterFS and NFS were repeated the next day (2026-10-17) on the same class:
+
+| | gluster (3 runs) | nfs (2 runs) |
+|---|---|---|
+| takeover of the dead node's file | 22.3–22.7 s | never |
+| survivor's worst stall after the death | 76.7–78.1 s | 0.02 s, then silent |
+| survivor's shared probe silent at end of run | 6–7 s (probe wind-down) | ~137 s, both runs |
+
+Both reproduce the single `t3.medium` run: GlusterFS takes over in about 22 s
+with a stall of over a minute on the shared file, about 7x slower than etcfs,
+and NFS serves nothing once its server is gone. JuiceFS could not be re-run,
+because its MinIO binary is no longer downloadable.
+
 The etcfs takeover is narrow rather than spread across a lease period: the dead
 node's inode lock lives under a 2 s session lease (`inodeLockTTL`), and the
 measured 3.0–3.5 s is that lease plus detection and acquisition backoff. The

@@ -49,6 +49,47 @@ that means a 4-node cluster, since node0 is their server and never mounts.
 
 Zero failed operations on every backend, in both phases.
 
+### Re-measure on a non-burstable class (2026-10-17)
+
+The four backends that could still be provisioned, one run each on `m5.large`:
+
+| Backend | baseline (MiB/s) | leave: max stall (s) | leave: bandwidth lost | join time (s) | join: max stall (s) | join: bandwidth lost |
+|---|---|---|---|---|---|---|
+| etcfs | 260.29 | 0.080 | 6.8% | 4.313 | 0.110 | 11.5% |
+| gfs2 | 284.11 | 0.021 | 19.2% | 3.467 | 0.220 | 23.8% |
+| gluster | 139.10 | 0.060 | 1.5% | 0.285 | 0.065 | 2.2% |
+| nfs | 222.66 | 0.021 | 17.6% | 0.297 | 0.032 | 17.4% |
+
+The ordering and the bands match the table above: no backend stops, GlusterFS
+loses the least bandwidth, and GFS2 loses about twice what etcfs loses. JuiceFS
+was not re-run, because its MinIO binary is no longer downloadable.
+
+### GFS2 admitting a node that has no journal (2026-10-17)
+
+GFS2 needs one journal per mounting node. `bench-gfs2-journal-add.sh` formats
+the filesystem with two journals on three nodes, confirms that the third node's
+mount is refused, and then admits it the way an operator would: `gfs2_jadd -j 1`
+on a mounted survivor, then the mount. The two survivors write and run the 4 KiB
+probe throughout. Three runs on `m5.large`:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| mount without a free journal | refused | refused | refused |
+| `gfs2_jadd -j 1` (online) | 1.248 s | 1.119 s | 1.396 s |
+| mount after the journal exists | 2.953 s | 2.956 s | 3.025 s |
+| survivors' max stall | 0.228 s | 0.267 s | 0.267 s |
+| survivors' bandwidth lost | 23.6% | — | — |
+
+Runs 2 and 3 summed the earlier runs' fio files into their bandwidth figures
+(fixed in the script since), so only run 1's bandwidth loss is reported.
+
+A missing journal costs GFS2 an operator step of about 1.3 s, not a stall: the
+survivors keep writing, and the loss is the same as for an ordinary join. The
+joining node was already in corosync's nodelist; adding one that is not means
+editing that list on every node, which this scenario does not time. etcfs has no
+equivalent step — a joining node writes its membership key and claims its own
+arena.
+
 ## Reading these numbers
 
 **No backend stops the world for a *clean* leave.** That is the honest headline,

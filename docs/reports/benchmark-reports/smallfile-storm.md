@@ -72,7 +72,7 @@ tree in 1047.6 s (76.4 files/s), but no `m7i.large` number exists for the other
 four backends, so the two cannot be read against each other. Re-measuring the
 five-way comparison on current code is owed.
 
-### Same-session re-measure on a non-burstable class (2026-10-16)
+### Re-measure on a non-burstable class (2026-10-16/17)
 
 The table above mixes an etcfs run with exhausted CPU credits against competitor
 rows from the previous day. etcfs and GFS2 were re-run back to back on
@@ -82,11 +82,18 @@ rows from the previous day. etcfs and GFS2 were re-run back to back on
 |---|---|---|
 | gfs2 | 18.9 s | 4230.57 |
 | etcfs | 1452.5 s (24.2 min) | 55.08 |
+| gluster (2026-10-17) | 301.0 s (5.0 min) | 265.75 |
+| nfs (2026-10-17) | 1052.5 s (17.5 min) | 76.01 |
 
 **76.8x**, against the 76.6x published above. Both backends ran about 1.5x
 faster than on `t3.medium`, and the ratio did not move: the throttled run
 understated both absolute rates but not the gap between them, which is set by
 one Raft commit per create against a local journal write.
+
+GlusterFS and NFS ran the next day on the same class. Against them etcfs is
+4.8x and 1.4x slower; NFS barely moved from its `t3.medium` time, while
+GlusterFS ran 1.8x faster. JuiceFS was not re-run: its MinIO object store no
+longer has a downloadable community binary.
 
 ## Reading these numbers
 

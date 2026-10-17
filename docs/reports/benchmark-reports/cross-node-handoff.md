@@ -18,6 +18,22 @@ Same five isolated 3-node clusters as the earlier comparison report, each with i
 | juicefs | 116 | 101 | 80 | 90 | 333.33 | 412.90 | 427.74 | 195.57 |
 | gluster | 89 | 66 | 66 | 67 | 250.00 | 463.77 | 308.16 | 244.16 |
 
+### Re-measure on `m5.large` (2026-10-17)
+
+The four backends that could still be provisioned, one run each; JuiceFS was not
+re-run because its MinIO binary is no longer downloadable.
+
+| Backend | TTFB 1M (ms) | TTFB 64M (ms) | TTFB 1G (ms) | TTFB 8G (ms) | Read 1M (MiB/s) | Read 64M (MiB/s) | Read 1G (MiB/s) | Read 8G (MiB/s) |
+|---|---|---|---|---|---|---|---|---|
+| etcfs | 61 | 58 | 65 | 81 | 200.00 | 336.84 | 284.44 | 253.83 |
+| gfs2 | 62 | 61 | 62 | 62 | 500.00 | 507.94 | 282.64 | 228.03 |
+| gluster | 82 | 59 | 61 | 61 | 250.00 | 603.77 | 307.97 | 245.45 |
+| nfs | 63 | 53 | 53 | 57 | 333.33 | 1122.81 | 1135.25 | 226.75 |
+
+On the 8 GiB file etcfs reads fastest (253.8 MiB/s) and returns its first byte
+slowest (81 ms against 57–62 ms). NFS's 64 MiB and 1 GiB figures come from the
+server's page cache, not the device.
+
 ### etcfs re-run on a volume that does not cap it
 
 The table above was taken on a 1000-IOPS / 20 GB volume, which capped every

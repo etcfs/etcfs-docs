@@ -44,7 +44,7 @@ ceiling. By Little's law that alone puts the deep-queue backends' mean latency
 near 128 / 1000 s = 128 ms against etcfs's 4 ms, which is the gap the table
 shows. The throughput tie stands; the tail comparison does not.
 
-### Matched load, etcfs and GFS2 (2026-10-16)
+### Matched load (2026-10-16/17)
 
 Both backends re-run back to back on `m5.large` with an identical job: four
 jobs, one 8 MiB file each, `direct=1`, 60 s per stanza, at both queue shapes.
@@ -55,6 +55,17 @@ jobs, one 8 MiB file each, `direct=1`, 60 s per stanza, at both queue shapes.
 | etcfs | psync, 4 × 1 | 1011 | 12386 | 1004 | 9895 |
 | gfs2 | libaio, 4 × 32 | 1004 | 585728 | 1003 | 246784 |
 | etcfs | libaio, 4 × 32 | — | — | — | — |
+| gluster | psync, 4 × 1 | 1055 | 11072 | 1004 | 4512 |
+| gluster | libaio, 4 × 32 | 1055 | 148480 | 1004 | 132096 |
+| nfs | psync, 4 × 1 | 588 | 17957 | 20965 | 358 |
+| nfs | libaio, 4 × 32 | 748 | 227541 | 63582 | 2867 |
+
+The gluster and nfs rows were run the next day (2026-10-17) with the same job
+and instance class. At depth 1, GlusterFS's write tail (11.1 ms) is close to
+etcfs's (12.4 ms) and its read tail is tighter (4.5 ms); NFS's write tail is the
+widest (18.0 ms), and its reads come from the client cache, as in the table
+above. JuiceFS could not be re-run, because its MinIO binary is no longer
+downloadable.
 
 At equal load both backends saturate the device and **GFS2 has the tighter
 tail**: 8.1 ms against 12.4 ms on writes, 8.1 ms against 9.9 ms on reads. At

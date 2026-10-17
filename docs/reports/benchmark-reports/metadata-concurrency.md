@@ -34,7 +34,7 @@ unaffected by an etcfs-side change, but they are a different day's clusters.
 | gluster | 304.38 | 514.98 | 776.85 | 2.55x |
 | **etcfs** | **187.88** | **313.55** | **327.34** | **1.74x** |
 
-### Same-session re-measure (2026-10-16)
+### Same-class re-measure (2026-10-16/17)
 
 etcfs and GFS2 back to back on `m5.large`, current build, same evening:
 
@@ -42,6 +42,13 @@ etcfs and GFS2 back to back on `m5.large`, current build, same evening:
 |---|---|---|---|---|
 | gfs2 | 1630.43 | 2086.23 | 2063.27 | 1.27x |
 | **etcfs** | **212.40** | **331.67** | **405.19** | **1.91x** |
+| gluster (2026-10-17) | 698.32 | 1195.70 | 1629.25 | 2.33x |
+| nfs (2026-10-17) | 564.76 | 797.66 | 1368.61 | 2.42x |
+
+GlusterFS and NFS were run the next day on the same instance class; JuiceFS
+could not be, because its MinIO object store no longer has a downloadable
+community binary (`dl.min.io` answers 410). At three nodes etcfs is 4.0x behind
+GlusterFS and 3.4x behind NFS, against 2.4x and 3.7x in the older table.
 
 GFS2 is **5.1x** faster at three nodes, against the 4.6x in the table above, so
 the cross-day comparison did not flatter either side. Both curves keep their
