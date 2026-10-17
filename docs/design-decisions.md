@@ -57,12 +57,13 @@ them, so a handler tests one boolean before it acts. `safeDispatch` recovers
 anything the cursor cannot prevent into a single `EIO` rather than a dead
 daemon. Frames are capped at 1 MiB on both sides before allocation.
 
-## pool.c deleted rather than picked up
+## No asynchronous IPC worker in the C daemon
 
-The asynchronous IPC worker (245 lines) was never referenced. Concurrency on
-the mount needs a connection per FUSE worker thread, which the Go side already
-supports; a response demultiplexer would be the larger change, and neither
-needs the dead code kept around in the meantime.
+The C daemon has no separate IPC worker thread or response demultiplexer.
+Concurrency comes from a connection per FUSE worker thread, which the Go side
+already serves one goroutine per connection. A demultiplexer would be a larger
+change for the same result, so the unused asynchronous worker (`pool.c`, 245
+lines) is not kept in the tree.
 
 ## The fencing sweep is authoritative, with a per-node "already fenced" mark
 
@@ -144,30 +145,29 @@ place where the concurrency is lost.
 
 ## Write barriers are opt-in, and the readback is one sector
 
-Every write used to end with a `BLKFLSBUF` ioctl, a `sync_file_range`, and a
-readback of everything it had just written; every read began with another
-`BLKFLSBUF`. That is three device round trips added to a write and one to a
-read, on the critical path, to defeat caches that O_DIRECT and an io2
-Multi-Attach volume between them do not have: the page cache is bypassed on both
-nodes, and the volume acknowledges a write only once it is durable and visible
-to every attachment. They now sit behind `--write-barriers`, off by default and
-forced on without O_DIRECT, where the page cache is real.
+With barriers, every write ends with a `BLKFLSBUF` ioctl, a `sync_file_range`
+and a readback, and every read begins with another `BLKFLSBUF`: three device
+round trips added to each write and one to each read. They defend against
+caches that do not exist with `O_DIRECT` on an io2 Multi-Attach volume: the page
+cache is bypassed on every node, and the volume acknowledges a write only once
+it is durable and visible to every attached instance. The barriers are therefore
+behind `--write-barriers`, off by default, and forced on without `O_DIRECT`,
+where the page cache does hold data back.
 
-Keeping them as a flag rather than deleting them is deliberate. The claim being
-relied on is about a specific device, not about block devices in general, and a
-device that acknowledges into a volatile write cache still needs the barriers —
-that is a knob no amount of reading the code can replace. Where they are on, the
-readback is one sector rather than the whole run: nothing compares the bytes, so
-what is being bought is the round trip, and a sector buys it as well as 128 KiB
-does.
+They stay as a flag rather than being removed, because the assumption that makes
+them unnecessary is about one kind of device. A device that acknowledges into a
+volatile write cache still needs them, and only the operator knows which device
+is in use. When they are on, the readback is one sector rather than the whole
+write: nothing compares the bytes, so what matters is the round trip, and one
+sector gives that as well as 128 KiB does.
 
-## The write-ahead log was deleted rather than fixed
+## No write-ahead log for reserved blocks
 
-Its stated job was returning blocks that were allocated and written but never
-committed. `Reconstruct` already does that from the live extents in etcd, which
-have to be correct anyway, so the log was a second source of truth costing an
-fsync per write and growing without bound. Truncation and checksums would have
-made a redundant mechanism cheaper, not necessary.
+Blocks that were reserved and written but whose extent never committed must be
+returned after a crash. `Reconstruct` does that from the extents in etcd, which
+must be correct anyway. A separate write-ahead log would be a second record of
+the same thing, costing an `fsync` per write and growing without bound;
+truncating and checksumming it would make it cheaper, not necessary.
 
 ## Locks share one lease per node, not one per acquisition
 
@@ -178,25 +178,25 @@ removes both: what releases a dead holder's lock is the TTL elapsing without a
 renewal, and that is as true of a lease granted once as of one granted per
 operation.
 
-Sharing the lease costs two things, both handled rather than traded away. A
-holder can no longer be identified by its lease, so its key carries a
-per-acquisition counter as well — without it, two concurrent readers on one
-node would write the same key. And a release deletes its own key instead of
-revoking, since revoking would drop every other lock the node holds; the delete
-is retried, because a lock key now outlives a failed release for as long as the
-node does.
+Sharing the lease has two consequences, both handled. A holder cannot be
+identified by the lease alone, so its key also carries a per-acquisition counter;
+without it, two concurrent readers on one node would write the same key. And a
+release deletes its own key instead of revoking the lease, because revoking would
+drop every other lock the node holds. The delete is retried, because a lock key
+whose release failed would otherwise stay as long as the node runs.
 
-The lock itself stays scoped to a single operation. Holding it across a file's
-whole open lifetime would remove nothing further — the acquire and release are
-already one commit each — and would let one node's `close()` block another
-node's write, which is a fairness cost with no round trip to show for it.
+The key is kept after the operation that took it and reused, and released when
+another node asks for it (see [Lock Caching and Recall](architecture/metadata/lock-caching.md)).
+It is not tied to a file's open lifetime: that would let one node's `close()`
+decide when another node may write, while the recall already releases the lock
+as soon as someone needs it.
 
 ## ipc.Service keeps its concrete store
 
 The interface it would need is the whole store surface, with one implementation
 and one consumer — an abstraction that buys only harness reach into
 `NextCounter`. Concurrent inode allocation stays covered at the integration
-tier, which is now reliable because every test has its own etcd key space.
+tier, which is reliable because every test has its own etcd key space.
 
 ## fsck and the scrubber share one check library
 
@@ -259,46 +259,44 @@ metadata half being nearly free is what makes it look otherwise.
 cluster sizes this runs at, and the trigger condition and manual-vs-automatic
 posture would have to be decided before the mechanism means anything.
 
-## Verification runs so far
+## Verification runs
 
-The docker chaos suites are the regression gate used during this work, and all
-pass on the current tree: single-cluster scenarios 7/7, arena reclamation 6/6,
-arena collision 3/3, elastic scale 12/12, concurrent scale-out 9/9,
-fault-injection during join/leave 20/20, fencing reconciliation retry 10/10,
-namespace fencing guard 21/21, and a randomized fuzz run (28k ops, 13 injected
-faults) with no monotonic growth in memory, fd count or etcd DB size.
+The Docker chaos suites are the regression gate, and all pass on the current
+tree: single-cluster scenarios 7/7, arena reclamation 6/6, arena collision 3/3,
+elastic scale 12/12, concurrent scale-out 9/9, fault injection during join and
+leave 20/20, fencing reconciliation retry 10/10, namespace fencing guard 21/21,
+and a randomized fuzz run (28k operations, 13 injected faults) with no steady
+growth in memory, open file descriptors or etcd database size.
 
-An hour-scale fuzz run (279k ops, 158 injected faults) showed RSS settling at
-~40 MB and staying there, a flat fd count, and etcd's store flat at 15.4 MB once
-compaction began — which is also the evidence that the compaction setting works.
+An hour-long fuzz run (279k operations, 158 injected faults) showed memory
+settling at about 40 MB, a flat file-descriptor count, and etcd's store flat at
+15.4 MB once compaction started, which also shows that the compaction setting
+works.
 
-Three real bugs came out of them — a read that never reported EOF, extents
+These runs found three bugs (a read that never reported end of file, extents
 stamped one generation ahead of their writer, and etcd running without
-compaction — along with several harness assertions that had drifted from the
-system they were checking.
+compaction) and several test assertions that no longer matched the system.
 
-AWS runs were **not** performed for the fuzz/chaos suites above: `scripts/infra/create-infra.sh`
-provisions billable instances and a Multi-Attach volume, which is not something
-to leave running unattended. `scripts/infra/create-infra.sh && scripts/infra/setup-compute.sh
-&& scripts/infra/run-full-test.sh` is still owed before trusting the
-device-enforced fencing paths, which docker cannot exercise.
+Docker cannot exercise device-enforced fencing. That is tested on AWS by
+`scripts/test/chaos-fencing-detach.sh` (EBS detach) and
+`scripts/test/chaos-nvme-fencing.sh` (NVMe reservations); see the
+[chaos reports](reports/chaos-reports/external-fencing-detach.md).
 
-A live 3-node AWS run was performed to verify the `fuse_session_loop_mt` change
-(see the connection-per-worker entry below): 24 parallel workers across all 3
-nodes (8 threads per node), 60 seconds of concurrent create/write/append/read/
-rename/symlink/truncate/rmdir on a shared directory, plus a separate write on
-one node read back from the other two. Result: 0 errors out of ~2,900 ops, no
-daemon crash, `collisions=0` on every scrub pass throughout (the anomaly type
-that would indicate real corruption) — the orphan/dead-extent counts the
-scrubber did report are its normal self-healing response to files being
-renamed and truncated out from under it mid-run, not corruption.
+The multi-threaded FUSE loop was checked on a 3-node AWS cluster: 24 parallel
+workers (8 per node), 60 seconds of concurrent create, write, append, read,
+rename, symlink, truncate and rmdir in a shared directory, plus a write on one
+node read back from the other two. There were no errors in about 2,900
+operations, no daemon crash, and `collisions=0` on every scrub pass (the
+anomaly that would mean corruption). The orphan and dead-extent findings the
+scrubber reported are its normal cleanup after files renamed and truncated
+during the run.
 
 ## etcd compacts on revisions, and the fencing watch tolerates it
 
-Nothing configured compaction, so every superseded revision was kept forever
-and a filesystem writing metadata constantly would grow the store until the
-backend quota tripped and etcd went read-only — stopping the mount. All three
-deployments now run `--auto-compaction-mode=revision
+Without compaction, etcd keeps every superseded revision, and a filesystem
+that writes metadata constantly grows the store until the backend quota is
+reached and etcd becomes read-only, which stops the mount. All three
+deployments run `--auto-compaction-mode=revision
 --auto-compaction-retention=100000` with an 8 GiB quota. Revision mode over
 periodic: it bounds the store's size directly, which is the failure being
 avoided.
@@ -317,7 +315,7 @@ Every structural operation this filesystem performs is a Raft commit — a
 create, a lock acquisition, an extent publication — and a Raft commit is a WAL
 fsync. Left in `--data-dir`, those fsyncs queue behind snapshot writes and
 compaction I/O in the same directory, which is why etcd's own tuning guide puts
-the WAL somewhere else. All three deployments now pass `--wal-dir`.
+the WAL somewhere else. All three deployments pass `--wal-dir`.
 
 The default puts it in a second directory on the same volume, which separates
 the two workloads but not the device underneath them. Getting the rest means
@@ -332,45 +330,40 @@ rename onto a mount point fails with `EBUSY` — which panics the member on its
 first start and takes the whole compose cluster down with it. The compose file
 mounts the volume at `/etcd-wal` and passes `--wal-dir=/etcd-wal/wal`.
 
-## The AWS setup path was rewritten to match chaos-lib.sh's proven bootstrap, not fixed in place
+## The AWS setup path shares the chaos suite's bootstrap
 
-*Context:* `setup-compute.sh` (TLS + systemd, for a persistent hand-poked test
-cluster) had never actually finished a real multi-node bootstrap. Investigating
-it turned up five independent bugs: a cert-reuse check whose `grep` pattern
-never matched openssl's actual SAN format, so it silently re-signed a new CA on
-every run; `systemctl start` being a no-op on an already-active unit, so neither
-a new binary nor new certs were ever picked up on a re-run; a killed FUSE daemon
-leaving a stale mount that made the next `ExecStartPre=mkdir -p` fail with
-ENOTCONN; no `etcd member add` step before starting a joining node, so a staged
-bootstrap could never reach quorum; and, in the validation script, `((PASS++))`
-under `set -e` aborting after the first passing test (post-increment from 0
-evaluates to `((0))`, exit code 1). None of these are related to each other —
-they just all sat on a path nothing had exercised end to end before.
+*Context:* `setup-compute.sh` once set clusters up with TLS and systemd units, and
+kept them between runs. On a real multi-node bootstrap it showed five unrelated
+bugs:
 
-*Options considered:* (a) fix each bug in place, keeping the TLS+systemd model;
-(b) replace that model with the one `scripts/test/chaos-lib.sh`'s AWS path
-already uses — no TLS, no systemd, every node started fresh together, raw
-nohup'd processes — and share one implementation between the two.
+- a check for reusable certificates whose `grep` never matched openssl's SAN
+  format, so a new CA was created on every run;
+- `systemctl start` doing nothing on an already-running unit, so new binaries and
+  certificates were never used on a re-run;
+- a killed FUSE daemon leaving a stale mount, which made the next
+  `ExecStartPre=mkdir -p` fail with `ENOTCONN`;
+- no `etcd member add` before starting a joining node, so a staged bootstrap
+  never reached quorum;
+- `((PASS++))` under `set -e` in the validation script, which exits after the
+  first passing test (post-increment from 0 evaluates to `((0))`, status 1).
 
-*Chosen:* (b). Every bug above except the last was a symptom of the same
-thing: state left running between invocations that a re-run had to reconcile
-against, and TLS certs plus systemd units are exactly the state that needs
-reconciling. chaos-lib.sh's model has no such state — every run tears down and
-restarts everything itself — and it has been proven under real fault injection
-across many chaos runs. The shared implementation now lives in
-`scripts/infra/bootstrap-cluster.sh`; `setup-compute.sh` is a thin wrapper
-around it, and `chaos-lib.sh`'s AWS `provision_cluster()` calls it too instead
-of carrying its own ~80-line copy. `add-compute-node.sh` (joining a cluster
-that already has quorum, which does need `etcd member add`) was rewritten to
-match, mirroring chaos-lib.sh's own `add_node()`. `chaos-test.sh`, a separate,
-independently-proven harness with its own inlined bootstrap, was left
-untouched — out of scope, not broken, and re-verifying it costs a real AWS run.
+*Options:* (a) fix each bug in the TLS and systemd setup; (b) use the setup that
+`scripts/test/chaos-lib.sh` uses on AWS (no TLS, no systemd, every node started
+fresh together as plain processes) and share one implementation.
 
-Verified by clearing the partially-bootstrapped nodes and running the new
-`setup-compute.sh` → `run-full-test.sh` end to end (16/16 passed, first time
-that script has run to completion), and by running `chaos-test-single-cluster.sh
-aws` — real scenario S1 — against the refactored `chaos-lib.sh` to confirm the
-shared script didn't change its proven behavior.
+*Chosen:* (b). All but the last bug come from state left running between runs
+that the next run must reconcile, and certificates and systemd units are exactly
+that state. The chaos setup keeps no such state, since every run stops and
+starts everything, and it has been used under fault injection in many runs.
+`scripts/infra/bootstrap-cluster.sh` is the shared implementation:
+`setup-compute.sh` wraps it, and `chaos-lib.sh`'s AWS `provision_cluster()`
+calls it. `add-compute-node.sh`, which joins a node to a cluster that already
+has quorum and therefore needs `etcd member add`, follows `chaos-lib.sh`'s own
+`add_node()`. `chaos-test.sh` has its own inlined bootstrap and is separate.
+
+Checked by running `setup-compute.sh` and then `run-full-test.sh` end to end on
+cleared nodes (16/16 passed), and by running scenario S1 of
+`chaos-test-single-cluster.sh aws` against the shared script.
 
 ## Coordination stays in etcd; the device is used only for bytes
 
@@ -379,7 +372,7 @@ data, (b) per-inode locking on the device itself, using NVMe fused
 compare-and-write as the atomic primitive, (c) a hybrid — an on-device
 metadata index that peers read directly, with etcd only for locking.
 
-*Chosen:* (a), and it is now settled rather than open.
+*Chosen:* (a).
 
 A block device offers no atomicity beyond a sector, no compare-and-swap, no
 way to notify another attacher that something changed, and no cache coherence
@@ -492,39 +485,34 @@ is what the shared-directory numbers of this design depend on, so trading it for
 the wrong direction. The crash window would be the easy part; the exclusion is
 the whole cost.
 
-## The create-time lock key was reverted, then restored once its channel was fixed
+## The create transaction takes the new file's lock
 
 *Options:* (a) write the inode's exclusive lock key inside the create
 transaction, so the first write to a new file needs no acquisition of its own,
-and batch the eventual releases one transaction per eviction sweep; (b) leave
-both alone.
+and release evicted locks in batches, one transaction per eviction sweep; (b)
+acquire the lock on first write and release evictions one at a time.
 
-*Chosen:* (a) — but only after it was reverted, the failure it exposed was
-fixed, and it was measured again. The reasoning behind (a) always looked right:
-the inode number is known when the name is published, no peer can be contending
-for a number nobody has been told about, and the create transaction asserts
-exactly what `AcquireLock` asserts. It passed the chaos suite, the TLA+ models
-and the Porcupine checkers on the first attempt too. What killed it then was a
-measurement, and what brought it back is a different one — with a fix in
-between, in a component it had nothing to do with.
+*Chosen:* (a). The inode number is known when the name is published, no other
+node can want a lock on a number nobody has been told about, and the create
+transaction checks exactly what `AcquireLock` checks. It removes one Raft commit
+per created and written file, and batching turns the releases into one commit
+per 64 evictions.
 
-**What it did.** Nearly every eviction's page invalidation began to fail:
+**It depends on the notification channel's two-thread design.** (a) makes lock
+releases far more frequent during file creation, and each release must wait
+for the C daemon to drop the inode's kernel pages (`NOTIFY_INVAL_INODE`, which
+the Go daemon blocks on). With one thread handling both that and the
+unacknowledged `NOTIFY_INVAL_ENTRY` messages, an extracting archive produces one
+entry invalidation per file, and an inode invalidation waits behind thousands
+of them. The Go daemon's read deadline expires, the connection is dropped as out
+of step, page caching is turned off for the mount until the next open, and the
+cycle repeats. Batching makes this about four times worse, because a sweep sends
+its invalidations back to back, and it also livelocks: victims are picked
+oldest first, and a failed release leaves the same entries at the front.
 
-```
-WARN "no client to invalidate kernel pages"
-     error="read unix /run/etcfuse/etcfuse-notify.sock->@: i/o timeout"
-```
-
-Invalidating an inode's kernel pages is a synchronous round trip to the FUSE
-daemon, which then calls into the kernel. With the create-time lock in place the
-ack stops arriving in time, the notify connection is torn down, and page caching
-is disabled and re-enabled in a loop. Batching the releases made it about four
-times worse, because a sweep issues its invalidations back to back with no gap;
-it also livelocked, since victims are chosen oldest-first and a failed release
-leaves the same entries at the front of the queue forever.
-
-Measured over 5,000 files against a deliberately shrunken lock cache, which
-reaches the same eviction turnover as 80,000 files against the real one:
+Measured over 5,000 files against a deliberately small lock cache (the same
+eviction rate as 80,000 files against the real one), with one notification
+thread:
 
 | build | notify failures | files/s |
 |---|---|---|
@@ -533,65 +521,40 @@ reaches the same eviction turnover as 80,000 files against the real one:
 | both | 18,930 | 69.3 |
 | create-time lock removed, everything else kept | 0 | 63.0 |
 
-At full scale it stopped being a slowdown and became a failure: an 80,000-file
-copy died part way with `ENOENT`, and on AWS `m7i.large` the same workload took
-2325 s against 1698 s without the change.
+At full scale, an 80,000-file copy failed part way with `ENOENT`, and on AWS
+`m7i.large` the same workload took 2325 s against 1698 s without the change.
+This was head-of-line blocking between acknowledged and unacknowledged messages
+on one channel, not slowness; a faster daemon would not have fixed it.
 
-**Why it was not simply a bug to fix.** The cache-invalidation socket carried two
-kinds of traffic on one serial thread (`pkg/fuse/fuse.c`, `notify_thread`):
-`NOTIFY_INVAL_ENTRY`, fire-and-forget, one per create from the dirent watch; and
-`NOTIFY_INVAL_INODE`, which the backend **blocks on**, because it may not yield
-an inode's lock until the kernel's pages for that inode are gone.
+With the C daemon putting unacknowledged messages in a queue served by a second
+thread (see [Cache Coherence](architecture/consistency/cache-coherence.md#notification-channel)),
+an acknowledged invalidation never waits behind them. The full 80,000-file
+untar on `m7i.large`:
 
-An unpacking archive floods that thread with entry invalidations. An inode
-invalidation queues behind thousands of them, the backend's read deadline
-expires, and the connection is dropped as out of step — which disables page
-caching for the whole mount until the next open re-enables it, whereupon it
-happens again. It was head-of-line blocking between acknowledged and
-unacknowledged traffic sharing one channel, not slowness, and no amount of
-making the daemon faster would have fixed it.
-
-Eviction holding the lock cache's own mutex across the invalidation is what
-masked it. That mutex is taken by every operation on the node, so holding it
-throttled the create stream and kept the queue shallow. Releasing it — correct
-in isolation, and necessary before releases could be batched at all — removed
-the throttle and let the queue run away.
-
-That prerequisite has since been met: the notify thread now enqueues the
-fire-and-forget messages and a second thread makes their kernel calls, so an
-acknowledged invalidation no longer queues behind them.
-
-**Measured, 2026-08-26.** The full 80,000-file untar on `m7i.large`, the scale at
-which the original attempt died part way with `ENOENT`:
-
-| build | untar | files/s | locks not yielded for want of an invalidation |
+| build | untar | files/s | locks not released for want of an invalidation |
 |---|---|---|---|
-| create-time lock, before the channel split | 2325 s | — | nearly every eviction |
-| without it, before the channel split | 1698 s | — | 0 |
-| **without it, after the channel split** | **1439.8 s** | **55.6** | 0 |
-| **create-time lock, after the channel split** | **1159.1 s** | **69.0** | 0 |
+| create-time lock, one notification thread | 2325 s | — | nearly every eviction |
+| no create-time lock, one notification thread | 1698 s | — | 0 |
+| no create-time lock, two threads | 1439.8 s | 55.6 | 0 |
+| **create-time lock, two threads (current)** | **1159.1 s** | **69.0** | 0 |
 
-The copy completes and not one lock fails to yield, which is the evidence the
-revert asked for, and the lock is back on that basis.
+The copy completes, and no lock fails to be released.
 
-**The 1.24x is not claimed.** Five storm runs on `m7i.large` that day spanned
-1159 s to 1440 s, and four of them were the *same* build (1159, 1201, 1245,
-1407) — every run provisions its own three-node cluster, so the spread carries
-host-to-host variance as well as run-to-run. The difference between the last two
-rows sits inside it. What the change does with no such uncertainty is remove a
-Raft commit per created-and-written file and turn the release into one commit
-per sixty-four evictions; the commit counter is where that shows, and wall clock
-on this scenario is too noisy at n=1 to add anything.
+**The 1.24× speed-up is not claimed.** Five storm runs on `m7i.large` on the same
+day ranged from 1159 s to 1440 s, and four of them were the *same* build (1159,
+1201, 1245, 1407 s); each run provisions its own cluster, so the spread includes
+host-to-host variation. The difference between the last two rows is inside that
+range. What the change certainly does is remove one Raft commit per created and
+written file and batch the releases; the commit counter shows it, while wall
+clock at one run each is too noisy to add anything.
 
-It is also less than the commit count predicts, and that is the more interesting
-half. The change takes a create-and-write from four Raft commits per file to
-just over two, which predicts nearly 2x; the measurement is 1.24x. The earlier
-six-to-four reduction predicted 1.50x and measured 1.48x, so the model held
-then and does not now. What it means is that the create path has stopped being
-commit-bound — with two commits left per file, most of an untar's time is
-somewhere else, and nothing measured so far says where. The
-[Small-File Metadata Storm](reports/benchmark-reports/smallfile-storm.md) report
-carries the arithmetic.
+The speed-up is also smaller than the commit count predicts. The change takes a
+create-and-write from four Raft commits per file to just over two, which
+predicts nearly 2×; the measurement is 1.24×. Removing two of six commits
+earlier predicted 1.50× and measured 1.48×. So with two commits left per file,
+the create path is no longer limited by commits, and most of an untar's time is
+spent somewhere not yet identified. See the
+[Small-File Metadata Storm](reports/benchmark-reports/smallfile-storm.md) report.
 
 ## close() still publishes, and that is close-to-open consistency rather than durability
 

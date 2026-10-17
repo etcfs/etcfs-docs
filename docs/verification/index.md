@@ -52,7 +52,7 @@ What no column names is a cluster under load: the models check recorded
 histories and a specification, and neither will exercise two nodes contending
 for one inode, a node killed with a full write buffer, or a recall storm unless
 a chaos scenario produces one. `scripts/test/chaos-test-single-cluster.sh`
-now carries these as S8 (cross-node contention), S9 (crash with a full
+covers these with S8 (cross-node contention), S9 (crash with a full
 buffer), S10 (lease loss under sustained write load), S11 (flush failure
 injection), S12 (recall storm), and S13 (read-after-recall with the page
 cache on), runnable against both the docker and the AWS transport. On docker the suite

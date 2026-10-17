@@ -127,11 +127,11 @@ write path's internal serializable pre-read is retried linearizably on a
 stale answer before it commits, so nothing about it is externally visible.
 `verify.AllLinearizable` is the classifier for this model.
 
-Deferring writes changed what a write means here, and the model changed with
-it. A write is now acknowledged out of the node's own RAM: its bytes are on no
-device and in no etcd record until a flush publishes them, and a node that dies
-before that flush takes them with it. So each byte position carries not only a
-value but who still holds it unpublished, and three rules replace the single
+Because writes are buffered, a write can be acknowledged while its bytes are
+only in the writing node's memory, on no device and in no etcd record until a
+flush publishes them. A node that dies before the flush loses them. The model
+therefore records, for each byte position, not only its value but which node
+still holds it unpublished, and applies three rules instead of a single
 register:
 
 - a read never contradicts a write that was fsynced, from any node;
@@ -342,13 +342,12 @@ only the Go test suite: `etcfuse-meta --history-log`, mounted through the real
 C daemon, exercised from a shell — the recorded history checks clean against
 every model via `cmd/verify-history`.
 
-The models the caching work added — the fsync barrier and loss rules in the
-extent model, and the `lockkey`, `block` and `pagecache` checks — are checked
-by their own unit tests, by `cmd/verify-history` over recorded histories, and
-now by S8-S13, which are exactly the contended-inode and killed-with-a-full-buffer
-run this section used to say did not exist. S8-S13 also now run against the
-AWS transport, not only docker — 20/20 assertions, `STATUS: ALL PASS`; see
-`docs/reports/chaos-reports/caching-scenarios-on-aws.md`.
+The checks for caching (the fsync barrier and loss rules in the extent model,
+and the `lockkey`, `block` and `pagecache` checks) run in their own unit tests,
+in `cmd/verify-history` over recorded histories, and in chaos scenarios S8–S13,
+which produce contended inodes and nodes killed with a full write buffer.
+S8–S13 run on Docker and on AWS (20/20 assertions, `STATUS: ALL PASS`; see
+`docs/reports/chaos-reports/caching-scenarios-on-aws.md`).
 
 ## Next
 
