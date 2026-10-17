@@ -52,7 +52,7 @@ The safety argument is unchanged by the sharing. What releases a dead holder's l
 
 Two consequences follow from the sharing, and both are handled explicitly. A holder is not identified by its lease, so the key carries a per-acquisition counter alongside it; without that, two concurrent readers on one node would write the same key and one would release the other's lock. And a release must delete its own key rather than revoke the lease, since revoking would drop every other lock the node holds.
 
-The production data path (`internal/ipc/datapath.go`, both the read and write handlers) acquires through the lock cache described below, with a fixed 2-second TTL (`inodeLockTTL` in `internal/ipc/retry.go`) — not a configurable default; every caller of `AcquireLock` in the running system passes the same constant. The first acquisition fixes the session's TTL; later ones reuse the session. If the session's lease is ever lost — expired during a partition, or revoked — the next acquisition grants a new one, which is safe precisely because expiry has already removed every lock the old lease held.
+The production data path (`internal/ipc/datapath.go`, both the read and write handlers) acquires through the lock cache described below, with a fixed 2-second TTL (`inodeLockTTL` in `internal/ipc/retry.go`) — not a configurable default; every caller of `AcquireLock` in the running system passes the same constant. The first acquisition fixes the session's TTL; later ones reuse the session. If the session's lease is ever lost — expired during a partition, or revoked — the next acquisition grants a new one, which is safe because expiry has already removed every lock the old lease held.
 
 ## Lock Caching
 

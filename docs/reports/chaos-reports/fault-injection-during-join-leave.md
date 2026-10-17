@@ -58,7 +58,7 @@ Root cause, confirmed by direct testing: **AWS security groups are stateful.** S
 
 This is not a new gap the fencing design has — it's a gap in *this test's ability to produce a genuine partition on AWS*. It also means the pre-existing S3 scenario has a blind spot: it only asserts survivors keep working during a partition, never that the partitioned node's own operations are blocked, so it would not have caught this even if the underlying issue were real.
 
-**Docker's result stands as the reliable one for this scenario** (genuinely severed connection, confirmed empty network map). AWS's result for the write-succeeds portion specifically is recorded as inconclusive, not disproven — a true reproduction on AWS would need a partition technique that also flushes existing tracked connections (NACLs, or explicit conntrack manipulation), not just an SG swap.
+**Docker's result stands as the reliable one for this scenario** (severed connection, confirmed empty network map). AWS's result for the write-succeeds portion specifically is recorded as inconclusive, not disproven — a true reproduction on AWS would need a partition technique that also flushes existing tracked connections (NACLs, or explicit conntrack manipulation), not just an SG swap.
 
 ### 4. Arena release on graceful leave has no production implementation
 
@@ -83,7 +83,7 @@ Three of the four findings were fixed after the initial run. Untangling them too
 
 **Finding 2 (write hang) — symptom resolved, root cause still open.** With the watchdog firing, the daemon is gone before a write can hang on it, and the probe now fails in under a second (rc=1) rather than blocking past 7 minutes. But the original explanation in finding 2 was wrong, and tracing it produced finding 5: the hang was in `lockInode`'s unbounded-context `GrantLease`, not in `commitGuarded`, which the write never reached. The self-fence bounds the symptom by killing the process; the unbounded context that allows a FUSE request to block indefinitely is untouched and is now tracked in `docs/TODO-hardening.md` § 7.
 
-What `commitGuarded` itself does under a sustained partition remains genuinely untested — not because it might hang (it is bounded to ~6s by `retryEtcd`) but because no run ever reached it in that state, so whether it returns `ErrFenced` or a plain timeout error is unknown.
+What `commitGuarded` itself does under a sustained partition remains untested — not because it might hang (it is bounded to ~6s by `retryEtcd`) but because no run ever reached it in that state, so whether it returns `ErrFenced` or a plain timeout error is unknown.
 
 **Finding 3 (AWS test-harness bug) — fixed.** Partitioning now uses iptables DROP rules rather than a security-group swap. Two things were required, both verified on a throwaway AL2023 instance rather than assumed: stock Amazon Linux 2023 ships **neither** `iptables` nor `nft` (this was the cause of a silent `ERR:1` on the first iptables attempt — `runcmd` discards stderr, so the reason was invisible until stderr capture was added), so the script installs `iptables`/`iptables-nft` first; and the partition is now *verified* to have taken effect before the scenario proceeds instead of being assumed. That verification step is what caught the failure rather than letting it read as a product bug a second time.
 

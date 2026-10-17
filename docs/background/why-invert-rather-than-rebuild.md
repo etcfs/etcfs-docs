@@ -27,7 +27,7 @@ why it was the cheaper one.
 
 ## What "From Scratch" Would Have Cost
 
-A genuinely new cluster filesystem has to specify, implement and then *prove* a
+A new cluster filesystem has to specify, implement and then *prove* a
 set of things that already exist in working form elsewhere:
 
 - a replicated log with leader election, membership change and a compaction
@@ -57,7 +57,7 @@ filesystem that thirty years of shared-disk work settled: inodes, directory
 entries, extent maps, `nlink`, an allocator. Those are not the interesting part
 of the problem and they are not where a new design would have found headroom.
 
-What it discards is the part that was genuinely in the way — the on-disk format
+What it discards is the part that was in the way — the on-disk format
 and the lock manager that exists only to arbitrate access to it. With no on-disk
 format there is no journal to replay, no resource group, and no glock, and
 recovery reduces to a lease that stopped being renewed plus a generation counter
@@ -104,7 +104,7 @@ states both directions:
 Both cases fail into reclaimable garbage and never into a dangling reference.
 That property is available because the split exists — a design writing structure
 and bytes to one device has to reconstruct the same guarantee through journal
-sequencing, which is precisely the machinery the inversion removed.
+sequencing, which is the machinery the inversion removed.
 
 ## What the Inversion Does Not Buy
 

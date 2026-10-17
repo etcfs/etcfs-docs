@@ -37,7 +37,7 @@ etcfs's 611x and gfs2's 619x is inside run-to-run noise on a shared 1000-IOPS
 volume, and quoting 611x as an advantage over 619x — or over anything — would be
 quoting the cold column, not the warm one.
 
-The three shared-device backends score ~610–620x because all three are genuinely
+The three shared-device backends score ~610–620x because all three are
 device-bound when cold: ~1000 IOPS is exactly the volume's provisioned rate.
 nfs and juicefs score low ratios because their "cold" pass was never cold —
 both serve from caches `compare_drop_caches` cannot reach on the client

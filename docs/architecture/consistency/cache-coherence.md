@@ -28,7 +28,7 @@ Three independent cache layers can cause staleness:
 
 EtcFS addresses all three layers through O_DIRECT I/O and per-inode locking, and — on a device that needs them — device-level buffer flushes and a read-back round trip after every write.
 
-The last two are the `--write-barriers` flag, and they are off by default. O_DIRECT removes the first layer outright: neither the writer's nor the reader's page cache holds the bytes, so there is nothing on either node for a flush to push out or invalidate. The remaining two layers are properties of the device. An EBS io2 Multi-Attach volume acknowledges a write only once it is durable and visible to every attachment, which leaves the barriers as three device round trips per write that publish nothing the acknowledged write has not already published. A device that acknowledges into a volatile write cache is a different matter, and that is what the flag is for. Buffered mode (`--allow-buffered-io`) turns the barriers on regardless of the flag, because there the page cache genuinely does hold the bytes back.
+The last two are the `--write-barriers` flag, and they are off by default. O_DIRECT removes the first layer outright: neither the writer's nor the reader's page cache holds the bytes, so there is nothing on either node for a flush to push out or invalidate. The remaining two layers are properties of the device. An EBS io2 Multi-Attach volume acknowledges a write only once it is durable and visible to every attachment, which leaves the barriers as three device round trips per write that publish nothing the acknowledged write has not already published. A device that acknowledges into a volatile write cache is a different matter, and that is what the flag is for. Buffered mode (`--allow-buffered-io`) turns the barriers on regardless of the flag, because there the page cache does hold the bytes back.
 
 ## Write Protocol
 
@@ -181,7 +181,7 @@ The Go daemon accepts notification connections on that listener. Each connection
 
 `type=1` is `INVAL_ENTRY`, where `ino` is the parent directory; `type=2` is `INVAL_INODE`, which drops an inode's data pages; `type=3` is `INVAL_ATTR`, which drops its cached attributes and leaves the pages alone. The last two carry no name and so declare a length of zero.
 
-The name length is load-bearing rather than cosmetic. This is a stream socket, so two messages written back to back can arrive in a single read. A reader that recovered the name as "whatever came with the header" would swallow the following message as part of it and then read every subsequent header from the middle of a message — and there is no resynchronising a stream with no delimiters. The length lets the reader take exactly one message at a time; a declared length beyond `NAME_MAX` means the stream is already out of step, and the reader drops the connection and reconnects rather than acting on what it decoded.
+The name carries an explicit length because this is a stream socket: two messages written back to back can arrive in a single read. A reader that recovered the name as "whatever came with the header" would swallow the following message as part of it and then read every subsequent header from the middle of a message — and there is no resynchronising a stream with no delimiters. The length lets the reader take exactly one message at a time; a declared length beyond `NAME_MAX` means the stream is already out of step, and the reader drops the connection and reconnects rather than acting on what it decoded.
 
 ### Watch Setup
 
@@ -268,7 +268,7 @@ The etcd watch itself is also re-established whenever it ends, which it can do w
 
 It re-opens **from the revision after the last one it delivered**, so an ordinary reconnection replays the changes in the gap rather than skipping them. That is what makes a long `entry_timeout` or `attr_timeout` defensible: the timeout stops being the only thing between a stale name and a wrong answer.
 
-One case cannot be replayed — etcd compacting past the revision being resumed from, which discards the history the replay would have read. The loop reports that as a gap, restarts from current, and says in the log that every cache this watch keeps fresh is now trusted only until it times out. That is the single window in which the timeouts are load-bearing.
+One case cannot be replayed — etcd compacting past the revision being resumed from, which discards the history the replay would have read. The loop reports that as a gap, restarts from current, and says in the log that every cache this watch keeps fresh is now trusted only until it times out. Only in that window do the timeouts decide how long a stale entry survives.
 
 All three cluster-wide watches — dirents, inode records, and peers' lock requests — run on this one loop (`internal/ipc/watch.go`). The lock-request watch had the same hole and the same consequence: a peer's request to have a cached lock back would go unheard for the life of the daemon, and that peer would spend its acquisition budget and take an `EIO`.
 

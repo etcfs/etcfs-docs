@@ -16,7 +16,7 @@ locks until the new membership is agreed. etcfs has no lockspace to suspend —
 membership is an etcd key, a node claims its own arena, and a clean leave hands
 back its locks in the same transaction that removes it from membership — so the
 expected cost to the survivors is nothing. The server-mediated and replicated
-backends are run for the same event because for them a client mount is genuinely
+backends are run for the same event because for them a client mount is
 cheap, and showing that is better than assuming it.
 
 What "leave" and "join" mean per backend (`compare_leave_fs` / `compare_join_fs`):
@@ -92,8 +92,7 @@ arena.
 
 ## Reading these numbers
 
-**No backend stops the world for a *clean* leave.** That is the honest headline,
-and it is not the one the scenario was designed to find. GFS2's lockspace does
+**No backend stops the world for a *clean* leave.** GFS2's lockspace does
 suspend on a membership change, but on a three-node cluster with one departing
 node the suspension is short enough to hide inside a 0.063 s stall — the same
 order as etcfs's 0.110 s and gluster's 0.174 s. A clean unmount also lets GFS2

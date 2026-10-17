@@ -83,7 +83,7 @@ The mark is written before the intent is cleared. Between the two a sweep sees a
 
 Every survivor watches the same prefix and receives the same DELETE, so all of them begin fencing the same node simultaneously — observed on AWS on 2026-08-06, where two survivors fenced `n1` within 2 ms of each other. `fence_claim:<node_id>` is a create-CAS on an empty key, bound to a lease: exactly one controller wins it and proceeds, and the rest log and return.
 
-The claim is lease-bound precisely because the intent is not. A controller that crashes mid-fence must release its claim automatically, or the retry the intent exists to enable would be blocked forever by a claim nobody will ever drop. The lease TTL (120 s) must exceed the longest a single fence attempt can take — the EBS detach path polls for up to a minute — since a claim expiring under a live fencer would readmit the duplicate fence it exists to prevent. Erring long costs only retry latency after a crash.
+The claim is lease-bound because the intent is not. A controller that crashes mid-fence must release its claim automatically, or the retry the intent exists to enable would be blocked forever by a claim nobody will ever drop. The lease TTL (120 s) must exceed the longest a single fence attempt can take — the EBS detach path polls for up to a minute — since a claim expiring under a live fencer would readmit the duplicate fence it exists to prevent. Erring long costs only retry latency after a crash.
 
 ## Membership Watch
 
@@ -122,7 +122,7 @@ The departing node writes `departed:<node_id>`, and its peers skip the fence whe
 
 What the node does before writing the marker is the other half. `leaveCluster` runs only after the IPC server has stopped — a departing node is its own proof of quiescence, since no further write can be issued from it — and then gives back its cached locks, closes its lock session, and releases its arenas. Only if every arena actually came back is the departure announced; a partial release leaves the node recorded as an owner, and the only safe way for peers to reclaim that range is to fence it.
 
-The ordering is load-bearing rather than tidy. TLC breaks `ReleasedArenaHasNoLiveWriter` on a variant that publishes the marker from a node that gave its arenas back but has not stopped: the arena returns to the free pool while its previous owner can still write to it. Notably the arena check above does *not* catch that variant — the records are clean and the node is alive anyway — which is why quiescence has to come first rather than be inferred from the bookkeeping. See `specs/FencingDepartureNotQuiescent.cfg`.
+Quiescence comes before the marker because TLC breaks `ReleasedArenaHasNoLiveWriter` on a variant that publishes the marker from a node that gave its arenas back but has not stopped: the arena returns to the free pool while its previous owner can still write to it. Notably the arena check above does *not* catch that variant — the records are clean and the node is alive anyway — which is why quiescence has to come first rather than be inferred from the bookkeeping. See `specs/FencingDepartureNotQuiescent.cfg`.
 
 The marker describes one departure, not the node for ever: `Membership.grantAndRegister` deletes it as the node re-registers, alongside the stale fence intent and mark, so a node that leaves cleanly, comes back, and later dies badly is fenced like any other.
 

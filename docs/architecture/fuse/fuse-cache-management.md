@@ -109,7 +109,7 @@ The first makes invalidation prompt. The second is the fail-safe for a notificat
 - The re-read is still served from the attribute cache while that is valid, so the bound is `attr_timeout`, not zero.
 - `touchDir` is best-effort: it runs after the transaction that changed the namespace, and its failure is logged and retried on the next sweep rather than returned. A create whose timestamp has not yet been published leaves the parent's `mtime` unmoved on a peer for up to one flush interval, so for that window the fail-safe does not fire and the notification is the only invalidation.
 
-So the honest statement is: a cached listing is invalidated within an etcd round trip in the normal case, within `attr_timeout` plus one flush interval if the notification was lost, and — in the compound case where the notification was lost *and* the queued `mtime` could not be published at all — until the next change that moves the `mtime`.
+A cached listing is invalidated within an etcd round trip in the normal case, within `attr_timeout` plus one flush interval if the notification was lost, and — in the compound case where the notification was lost *and* the queued `mtime` could not be published at all — until the next change that moves the `mtime`.
 
 Root is excluded for the same reason. It has no inode record; its attributes are synthesised by the C daemon with a fixed `mtime`, so a cached listing of it would have only the notification to invalidate it. Root is listed uncached, and every directory below it is cached.
 

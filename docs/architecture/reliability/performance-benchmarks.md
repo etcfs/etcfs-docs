@@ -54,7 +54,7 @@ rate, and 32 deep at 100/s is intentionally saturating, not a defect.
 device. `direct=1` bypasses the *application's* buffer, not ext4's own
 block cache underneath, and the working set (1 GiB file) fits in the
 node's memory. This is one number in the table that isn't measuring what
-it looks like it's measuring — it's included because it's an honest result
+it looks like it's measuring — it's included because it is a result
 of the same job file, not because it's comparable to the other rows.
 
 **EFS at 5310 write IOPS / 25394 read IOPS is real, not a device ceiling
@@ -65,8 +65,8 @@ backend (many servers, replicated) rather than one volume's provisioned
 limit. It is also the only target here across a network filesystem
 protocol (NFSv4.1) rather than a local block device or FUSE-over-etcd, so
 it isn't apples-to-apples with the other three either — it answers "what
-does the managed alternative deliver," which is the whole point of
-including it.
+does the managed alternative deliver," which is why it is
+included.
 
 **EtcFS is the interesting case, and getting a usable number out of it took
 three false starts worth recording, because each one produced a run that
@@ -99,7 +99,7 @@ the final `psync` fio run. `benchmark.sh` now branches on the target:
 `libaio`/`iodepth=32`/`size=1G` for raw/ext4/EFS, `psync`/`iodepth=1`/`size=8M`
 for EtcFS. That was not a handicap when these numbers were taken: the FUSE
 daemon was then single-threaded end to end, one shared fd with no mutex, so
-`iodepth=1` and a syscall-blocking engine were the *honest* way to drive a
+`iodepth=1` and a syscall-blocking engine were the right way to drive a
 target with no internal concurrency to hide queuing behind, and a
 high-queue-depth run would have measured queue drain time (or, as above,
 file-layout time) rather than the server.

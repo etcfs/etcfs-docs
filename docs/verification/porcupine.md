@@ -204,7 +204,7 @@ daemon observes that revision's wall-clock instant, only the call and return
 around it. A lock left held by a node that was killed mid-hold is released by
 etcd when its session lease expires, which no code in the dead process can
 record; the checker synthesizes that release over `[the node's last event, +
-lease TTL]`, which still leaves a genuinely leaked lock a violation, since a
+lease TTL]`, which still leaves a leaked lock a violation, since a
 node that stayed alive keeps emitting events after it.
 
 **Generation** (`generation.go`) — the single most safety-critical property in
@@ -212,7 +212,7 @@ the codebase: once a node has been fenced at some generation, does any later
 commit ever succeed under it? Modelled per node as the highest generation
 known to have been fenced, over the real `[call, return]` interval of each
 `commitGuarded` attempt — several FUSE worker threads call it concurrently on
-one node, so their attempts genuinely overlap, and the model has to consider
+one node, so their attempts overlap, and the model has to consider
 every order the overlap allows rather than trust whichever order they happened
 to return in. Tracking the generation rather than a bare flag is what lets a
 node that restarts after being fenced, adopts the cluster's new generation,
@@ -331,8 +331,8 @@ on every node so the readdir checks are exercised, plus S8-S13 for the
 caching work: cross-node contention on one inode, a crash with a full write
 buffer, lease loss under sustained write load, flush failure injection, a
 recall storm, and read-after-recall with the page cache on): 20/20
-assertions passed, every model **consistent** across 7/7 model runs. S5 is
-the one worth noting from the original seven: it bumps `n1`'s fencing
+assertions passed, every model **consistent** across 7/7 model runs. Of the original seven, S5
+bumps `n1`'s fencing
 generation mid-run and confirms the next write is blocked, so the generation
 model is checked against a real fence, not only the synthetic ones in its
 unit tests.

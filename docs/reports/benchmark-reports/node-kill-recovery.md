@@ -85,7 +85,7 @@ file it had already been writing successfully, went silent too and stayed silent
 for the remaining 203 s. One node's death stopped the surviving node's
 filesystem entirely.
 
-This is worth stating carefully, because it is easy to overclaim. GFS2 is not
+GFS2 is not
 designed to be run without fencing; a production cluster has a fence device, and
 its recovery time would be *fence-device latency + journal replay*, which is a
 real number this harness does not measure. What the run does establish is the
@@ -119,10 +119,9 @@ survivor inside the window. With the fence confirmed at about ten seconds, the
 file that node had been writing stayed inaccessible for the remaining 180 s —
 any access to it blocked indefinitely, to the point that an unguarded `ls` on it
 hung the harness itself. Whether a further recovery step is missing from this
-setup or GFS2 genuinely takes longer than three minutes to release that
+setup or GFS2 takes longer than three minutes to release that
 lockspace is not established here; what is established is that the take-over did
-not happen inside the window, with fencing working. Against EtcFS's 2.19 s, the
-honest statement is that GFS2 with real STONITH keeps its survivors alive — the
+not happen inside the window, with fencing working. Against EtcFS's 2.19 s, GFS2 with real STONITH keeps its survivors alive — the
 unfenced cluster does not — and still did not recover the dead node's file in
 three minutes.
 

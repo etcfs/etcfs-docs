@@ -39,7 +39,7 @@ Each environment runs all 7 scenarios (21 assertions total) against one provisio
 
 ## Product defects found and fixed
 
-Unlike the elastic-scaling report, this round did find real product defects — the whole point of the exercise was to find the gap the existing S5 scenario couldn't see.
+Unlike the elastic-scaling report, this round found product defects, in the gap the existing S5 scenario couldn't see.
 
 1. **Namespace mutations bypassed the guard entirely.** `metadata.WithGenerationGuard` had exactly one caller in the whole request path (`Service.commitGuarded`, used only by the write handler). Every namespace handler — `AtomicCreateFile`, `AtomicCreateDir`, `AtomicUnlink`, `AtomicRename` — committed through `Store.Txn` without it. Fixed by moving the guard onto `Store` itself (`Store.SetGuard`, installed once at daemon startup) so `Txn` applies it to every caller rather than relying on each one to ask.
 2. **Several writes bypassed `Txn` altogether.** `setattr` (truncate), `symlink`, and `mknod` write inode records through a bare `Store.Put`, and the truncate path deletes/rewrites extent keys through `Store.Delete` — none of that went through `Txn`, so guarding `Txn` alone would have left them uncovered. `Put`, `Delete`, and `DeletePrefix` are now guarded the same way.

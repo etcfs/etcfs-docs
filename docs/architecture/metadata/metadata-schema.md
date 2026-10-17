@@ -113,7 +113,7 @@ Unlike the other records, an extent's value is ASCII: five comma-separated decim
 
 `sequence` orders writes to the same logical bytes. A write is never an in-place update — it allocates fresh blocks and appends an extent — so two extents can cover one range, and the higher sequence is the later write and the one a read resolves to. The chunk number in the key makes the key unique within the inode and nothing more.
 
-Keeping recency in the value rather than the key is what allows an extent to be split. Trimming an overwritten extent down to the pieces still readable can leave two records, and both must remain exactly as old as the extent they were cut from; a second key would instead assert the piece is newer, and it would then win over a genuinely newer extent overlapping it.
+Keeping recency in the value rather than the key is what allows an extent to be split. Trimming an overwritten extent down to the pieces still readable can leave two records, and both must remain exactly as old as the extent they were cut from; a second key would instead assert the piece is newer, and it would then win over a newer extent overlapping it.
 
 All six fields are required. EtcFS is pre-deployment, so the decoder rejects earlier forms outright rather than carrying a compatibility path for records nothing has written.
 

@@ -30,7 +30,7 @@ writing.
 A commit is the unit of cost in this filesystem, so 40.5 inodes per commit is
 the same publication work at one fortieth of the consensus cost. The batch cap
 is 64 inodes per transaction, so the sweep is running close to it: the buffers
-are genuinely arriving faster than the interval, which is the condition the
+are arriving faster than the interval, which is the condition the
 batch exists for.
 
 This answers the open question about the mechanism — it pays for itself where

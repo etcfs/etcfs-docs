@@ -58,7 +58,7 @@ same instance type in the same session
 handoff is now running at the device's own speed, so what binds is the
 t3.medium's EBS throughput allowance, not the volume's IOPS and not etcfs's
 coordination. Time-to-first-byte held at 69–112 ms across a 8000x range of file
-sizes, which is the property worth stating: on a shared device only the extent
+sizes: on a shared device only the extent
 map crosses the network, so handing over a file costs the same whether it is
 1 MiB or 8 GiB.
 

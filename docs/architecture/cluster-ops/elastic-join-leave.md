@@ -91,7 +91,7 @@ ReserveCounter(key="inode_alloc_counter", floor=FirstUsableIno, count):
   return error
 ```
 
-The `floor` is `FirstUsableIno = 2`, and it is load-bearing rather than cosmetic:
+The `floor` is `FirstUsableIno = 2` because
 inode 0 is not a valid inode and inode 1 is `FUSE_ROOT_ID`, the root directory
 that `seed-etcd` writes and the C daemon answers for locally. Handing out inode 1
 overwrites the root inode record and makes the entire mount return `EIO` — this

@@ -53,7 +53,7 @@ unconditional `direct_io = 1`, `keep_cache = 0`.
 
 ## What the Shared Device Does and Does Not Provide
 
-The volume is genuinely shared: a completed `O_DIRECT` write on one node is
+The volume is shared: a completed `O_DIRECT` write on one node is
 visible to a read on another. It is tempting to conclude that a shared device
 removes the coordination problem. It does not, because a block device offers
 only bytes:
@@ -265,7 +265,7 @@ acquisition path would reintroduce exactly that window.
 
 The single place local state decides is the cached fast path, which can only
 ever say "I already hold this" — never "nobody holds this". It cannot
-manufacture a lock, only continue to believe in one it genuinely took, which
+manufacture a lock, only continue to believe in one it took, which
 is the lease case above.
 
 Two related failure modes are handled explicitly: a node never deletes another
@@ -349,7 +349,7 @@ provisioned volume meters I/O operations per second rather than capping how
 many may be outstanding, so batching small scattered writes spends the same
 budget and only turns steady latency into a burst. Two cases escape that: a
 write that continues a contiguous device run, where the flush merges it with
-its neighbours into genuinely fewer operations; and a large write, where the
+its neighbours into fewer operations; and a large write, where the
 workload is bound by device latency at queue depth one and issuing the batch
 against the device's queue is pure gain. Anything else is written through as
 it was before, with only its extent deferred. The flush issues whatever it does
@@ -415,7 +415,7 @@ legal on its own. What the durability *surface* has to keep promising:
 An inode's proposal asserts only things about that inode: the keys it is
 rewriting are where this node last saw them, and its own lock key still exists.
 Nothing in it refers to any other inode, so several inodes' proposals
-concatenate into one transaction that means precisely what the separate ones
+concatenate into one transaction that means what the separate ones
 meant. The interval sweep (`Service.flushExpired`) and the shutdown flush do
 exactly that through `Service.flushEntries`: every inode whose buffer has aged
 past the interval is published together, for one Raft commit rather than one
@@ -450,7 +450,7 @@ The flush carries the comparisons the buffered writes were planned against —
 each key asserted to be where this node last saw it — plus the fencing guard
 and **this node's own lock key, by exact holder token**. A prefix check would
 be satisfied by the key of the peer that took the inode away, which is
-precisely the case the comparison exists to reject. A flush arriving after a
+the case the comparison exists to reject. A flush arriving after a
 lost lease or a recall therefore cannot commit, and its blocks go back to the
 arena unreferenced.
 

@@ -29,7 +29,7 @@ EBS Multi-Attach `io2` volumes have the NVMe equivalent, and EtcFS now uses it. 
 This is a fencing token validated at the resource, in Kleppmann's sense — not an approximation of one. Two things follow for the rest of this document:
 
 - **The classic hazard is closed on the data path when reservations are enabled.** A delayed writer whose key has been preempted cannot put bytes on the volume at all, no matter how long it was paused between its lease check and its write.
-- **The unreachability argument below is no longer the only line of defence, but it is still load-bearing.** Reservations require `--nvme-reservations` and a device that supports them; on `gp3`, on loopback devices, and in Docker the controller falls back to EBS detach or to single-signal fencing, and there the argument below is exactly what keeps the system safe. It also remains the reason a *failed* preempt is survivable rather than catastrophic.
+- **The unreachability argument below is no longer the only line of defence, but it is still required.** Reservations require `--nvme-reservations` and a device that supports them; on `gp3`, on loopback devices, and in Docker the controller falls back to EBS detach or to single-signal fencing, and there the argument below is what keeps the system safe. It also remains the reason a *failed* preempt is survivable rather than catastrophic.
 
 Where reservations are unavailable, the two weaker properties hold instead:
 
@@ -56,7 +56,7 @@ This is the fencing token, relocated. It is not validated by the storage that ho
 
 Put together: a delayed writer that loses its lease mid-write lands bytes in its own arena, fails the guarded commit, and leaves garbage that no reader can name. The failure direction is safe. The classic overwrite does not occur, because the two writers are never aimed at the same block.
 
-That last clause is the entire load-bearing assumption.
+The safety of the arena scheme rests on that last clause.
 
 ## Where the Hazard Actually Applies
 
@@ -66,7 +66,7 @@ So the hazard in EtcFS is **not** the textbook one. It is this:
 
 > Any mechanism that causes two live nodes to believe they own the same arena reintroduces Kleppmann's scenario in full — and reintroduces it in a *worse* form, because neither node is fenced, so the generation guard has nothing to reject and both commits succeed.
 
-This is worth stating precisely. In the classic scenario the losing writer has at least lost its lease, so a token check can catch it. In the arena-collision scenario both writers hold valid leases and current generations. Every guard in the system passes. Two files end up sharing bytes, each silently corrupting the other, and the only thing that notices is the scrubber's `CheckExtentCollisions`, which runs on the scrub loop's periodic pass (every 30s, `cmd/etcfuse-meta/main.go`) and reports damage after the fact rather than preventing it.
+In the classic scenario the losing writer has at least lost its lease, so a token check can catch it. In the arena-collision scenario both writers hold valid leases and current generations. Every guard in the system passes. Two files end up sharing bytes, each silently corrupting the other, and the only thing that notices is the scrubber's `CheckExtentCollisions`, which runs on the scrub loop's periodic pass (every 30s, `cmd/etcfuse-meta/main.go`) and reports damage after the fact rather than preventing it.
 
 The publish gate does not help here. It is designed to reject writes from *fenced* nodes; it has no opinion about two healthy nodes writing to the same offset.
 

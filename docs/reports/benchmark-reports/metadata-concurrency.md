@@ -89,8 +89,7 @@ The wider sweep in [Node-Count Scaling](node-count-scaling.md) carries the same
 measurement out to six nodes and is where GFS2's curve actually breaks: 1522 →
 1419 → 756 ops/s at 2, 4 and 6 nodes, against etcfs's 141 → 179 → 188. GFS2
 loses half its metadata throughput going from four nodes to six; etcfs gains 5%.
-That crossing is the honest form of the scalability claim, and it does not
-happen inside three nodes.
+That crossing does not happen inside three nodes.
 
 Those etcfs figures are from before the change measured here and were not
 re-run, so they are low by roughly the same factor this scenario moved. The

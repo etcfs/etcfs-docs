@@ -152,7 +152,7 @@ Deferral applies to one of the three: the timestamp `setattr` is queued and publ
 
 The profiled run took 1245.4 s (64.2 files/s) against 1159.1 s unprofiled, which is this scenario's run-to-run spread plus whatever the sampling costs. The per-operation shares are what it was run for, and those are ratios within one run.
 
-Commit 6 is worth noting for why it is there at all: the lock cache holds 4096 entries and this scenario creates 80,000 files, so every inode is evicted and every eviction pays a release.
+Commit 6 exists because the lock cache holds 4096 entries and this scenario creates 80,000 files, so every inode is evicted and every eviction pays a release.
 
 **One of the four is still removable, and it is not a design change.** The
 extent published at `close()` costs a transaction per file because each file's

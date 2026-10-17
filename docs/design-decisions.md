@@ -118,7 +118,7 @@ writer's current generation — so that is what the check reports.
 selects `OpenBuffered` for unshared devices. Detecting "is this device shared?"
 from configuration was the alternative, but none of the existing flags actually
 answer it — `--volume-id` is set on single-node runs too — so the safe default
-plus an explicit opt-out is the honest version.
+plus an explicit opt-out is the version that does not misreport it.
 
 ## A connection per FUSE worker, not a response demultiplexer
 
@@ -201,7 +201,7 @@ tier, which is now reliable because every test has its own etcd key space.
 ## fsck and the scrubber share one check library
 
 The checks live in `pkg/scrub` as functions over a `Snapshot`; `pkg/fsck` calls
-them and keeps only what is genuinely its own (undecodable records, dirents
+them and keeps only what is its own (undecodable records, dirents
 pointing at missing inodes, arena ownership). Two implementations had drifted to
 different thresholds and severities for the same invariant.
 
@@ -399,7 +399,7 @@ data path needs. Moving an index onto the volume does not add capacity, it
 splits it. Discovery needs something that can push, which is what an etcd
 watch is.
 
-The line the design holds to: the disk is used for what it is genuinely good
+The line the design holds to: the disk is used for what it is good
 at — durable, single-writer, sequential I/O — and consensus for what only
 consensus does, which is atomic exclusion and change discovery. NVMe
 reservations stay in use for fencing, where whole-namespace granularity is
@@ -471,7 +471,7 @@ if it still is.
 
 A batch therefore *can be rejected*, on a name a peer created while the batch
 sat in the queue. By then the `create()` has already returned success. There is
-no honest recovery: the caller holds a descriptor on an inode nothing names, and
+no recovery: the caller holds a descriptor on an inode nothing names, and
 the file it believes it made belongs to the other node. That is not a widened
 crash window, which is what deferring an extent trades. It is a wrong answer to
 a call that has already returned, and it is a wrong answer specifically in the
@@ -488,8 +488,7 @@ queue — a directory lock, with the recall, coherence and staleness machinery t
 inode lock already has, and with concurrent creates in one directory serialising
 across nodes where today they are independent transactions that contend on
 nothing. "No directory-level locking — namespace mutations via atomic etcd Txn"
-is a load-bearing property of this design and of the shared-directory numbers it
-produces, not an accident, so trading it for a create-batching optimisation is
+is what the shared-directory numbers of this design depend on, so trading it for a create-batching optimisation is
 the wrong direction. The crash window would be the easy part; the exclusion is
 the whole cost.
 
@@ -637,14 +636,14 @@ handover costs.
 *Chosen:* (b), for now: the hold time adapts under contention (see
 [Lock caching](architecture/metadata/lock-caching.md#hold-time)) so a contended
 inode is not handed over once per operation. Several nodes writing disjoint
-ranges of one file still serialise, and that remains the honest limitation.
+ranges of one file still serialise, and that remains a limitation.
 
 (a) is not rejected because it is unhelpful — it is the right answer for that
 workload — but because the range is not the only thing that would have to
 change. What makes every cache in the lock layer sound is one sentence, and it
 is the sentence `specs/CachedLock.tla` is written around: *a node holding an
 inode's key excludes every peer from that inode, so nothing it has cached can go
-stale underneath it.* A range lock is precisely the case where that stops being
+stale underneath it.* A range lock is the case where that stops being
 true, and three things rest on it:
 
 - **The metadata snapshot.** A held lock caches the inode record and the whole

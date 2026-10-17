@@ -33,7 +33,7 @@ an argument does not belong here.
 
 | # | Invariant | Enforced in | Caught by |
 |---|---|---|---|
-| 1 | No two nodes hold conflicting locks on one inode, and no lock decision is made from a read — only from a transaction, or from a cached key whose lease identity still matches the session's | `internal/ipc/retry.go` (`ensureLockKey`, `acquireLockKey`) | `lock` and `lockkey` models; `CachedLock.tla` `NoTwoHolders`, whose `CachedLockNoLeaseIdentity` variant is precisely the lease-liveness mistake |
+| 1 | No two nodes hold conflicting locks on one inode, and no lock decision is made from a read — only from a transaction, or from a cached key whose lease identity still matches the session's | `internal/ipc/retry.go` (`ensureLockKey`, `acquireLockKey`) | `lock` and `lockkey` models; `CachedLock.tla` `NoTwoHolders`, whose `CachedLockNoLeaseIdentity` variant is the lease-liveness mistake |
 | 2 | No node publishes an extent for an inode it does not hold the lock for, and no flush commits after the lock key is gone | `internal/ipc/delegate.go` (`flushLocked`, comparing the exact holder token) | `CachedLock.tla` `NoPublishWithoutLock` / `CachedLockNoFlushKeyCheck` |
 | 3 | Every block referenced by a live extent is owned by exactly one inode; no block is freed while an extent references it, and no block is freed twice | `pkg/arena` and the single release path `internal/ipc.freeBlocks`; the scrubber's orphan pass | `block` model; `fsck` |
 | 4 | A read never returns bytes from a block that was reallocated after the extent naming it was resolved | `internal/ipc/datapath.go` (`reclaimCovered`: metadata rewritten before the free) | `block` model (the reuse is visible as the double free that would allow it); `extent` model; `integrity-fuzz.sh` |

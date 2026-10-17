@@ -122,7 +122,7 @@ Fencing in GFS2 is **mandatory**, not optional. Without it, data corruption is c
 - Per-node journals isolate failure blast radius.
 - Resource groups with per-RG locking provide good concurrency for independent writers.
 - STONITH/fencing is taken seriously as a correctness requirement, not an afterthought.
-- The withdraw mechanism is an elegant safety valve.
+- The withdraw mechanism stops a node's I/O as soon as it detects inconsistent metadata.
 - Glock abstraction cleanly maps filesystem objects to DLM semantics.
 
 **Wrong:**
@@ -161,7 +161,7 @@ This is the recovery barrier — a synchronous, global pause whose latency scale
 - The application on Node A sees this as transparent but may experience stalls while pages are flushed and invalidated.
 - Shared writable mmap across nodes is effectively not supported — the glock ping-ponging makes it unusably slow, and the semantics of two nodes writing to the same memory-mapped region are undefined.
 
-**Relevance to EtcFS:** EtcFS's design acknowledges this limitation explicitly — shared-writable mmap across nodes is rejected as an error, and local mmap works when a node genuinely holds the file's exclusive lock. GFS2's experience validates that this is a reasonable restriction.
+**Relevance to EtcFS:** EtcFS's design acknowledges this limitation explicitly — shared-writable mmap across nodes is rejected as an error, and local mmap works when a node holds the file's exclusive lock. GFS2's experience validates that this is a reasonable restriction.
 
 ### 1.10 The gfs2_controld / dlm_controld Architecture
 
@@ -231,7 +231,7 @@ OCFS2 splits the disk into structured components:
 
 OCFS2 fencing differs from GFS2:
 
-- **Self-fencing by default:** If a node cannot write to its heartbeat slot, it considers itself isolated and **panics itself** (kernel panic or forced reboot). This is a crucial safety property — self-eviction on storage I/O timeout.
+- **Self-fencing by default:** If a node cannot write to its heartbeat slot, it considers itself isolated and **panics itself** (kernel panic or forced reboot). A node therefore evicts itself when storage I/O times out.
 - **External fencing via cluster stack:** When used with Pacemaker, external STONITH can be configured as a backstop.
 - **Disk heartbeat as fencing trigger:** Because the heartbeat is on the storage device itself, a storage-path failure is detected immediately — no dependence on network-only heartbeats (which can miss a partitioned node that still writes to disk).
 

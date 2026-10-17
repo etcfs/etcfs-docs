@@ -59,8 +59,6 @@ community binary; JuiceFS figures are from `t3.medium` only.
 
 ## The shape of it
 
-The pattern across twenty scenarios is consistent and worth stating plainly.
-
 **Anything that costs a Raft commit, etcfs loses badly** — creates, unlinks,
 synchronous small writes, per-file metadata walks. The multiples are 4.6x to 75x
 against GFS2: one commit per mutation, on a three-member etcd colocated with the
@@ -85,7 +83,7 @@ comparison has been evaluated — see
 one inode, where a lease-backed etcd key has to move where GFS2 sends a DLM
 message between kernels.
 
-**Anything involving failure, etcfs wins decisively.** A dead node's locks come
+**Anything involving failure, etcfs wins.** A dead node's locks come
 back in 3.0–3.5 s across eight runs, with no fence device, no operator and no
 journal replay, while the survivors keep working. GFS2's survivors stopped in
 every run measured, unfenced and fenced alike; whether that is GFS2 or this

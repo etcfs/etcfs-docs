@@ -195,7 +195,7 @@ Allocate(size):
   return not_enough_space_error
 ```
 
-The allocator returns a *list* of runs, not a single range. A file is already a list of extents, so its bytes never have to be contiguous on the device — one write simply becomes one extent per run, in logical order. Free space that is merely fragmented is therefore still usable space, and the allocator only reports failure when the arenas the node holds genuinely cannot cover the request, which is the caller's signal to acquire another arena.
+The allocator returns a *list* of runs, not a single range. A file is already a list of extents, so its bytes never have to be contiguous on the device — one write simply becomes one extent per run, in logical order. Free space that is merely fragmented is therefore still usable space, and the allocator only reports failure when the arenas the node holds cannot cover the request, which is the caller's signal to acquire another arena.
 
 This is why there is no defragmentation pass. Fragmentation costs an extra extent record per additional run, not a failed write; the classic reason to defragment — recovering contiguity so a large request can be satisfied — does not apply when the request never needed contiguity in the first place. The other classic reason, seek locality, does not apply either: the shared device is NVMe or EBS, where random access costs essentially what sequential access costs.
 
@@ -225,7 +225,7 @@ Space that falls through the cracks anyway — a released arena's ownership reco
 
 ### Free After Deletion
 
-Deleting a file returns its blocks the same way: the scrubber's orphan-extent pass (`pkg/scrub`) calls `Allocator.Free(diskOff, length)` after deleting the dangling `extent:<ino>/<chunk>` key — delete first, so the blocks stop being reachable through metadata before the range can be reissued. This is wired through the optional `scrub.Reclaimer` interface, so the scrubber degrades to metadata-only cleanup when no allocator is attached. The strategy is incremental (update the live bitmap directly, evaluated against periodic-rebuild and append-only alternatives) precisely because the free list is already in-memory and per-arena-owning-process — `Free` ignores ranges outside the calling node's own arenas, so no cross-node visibility is required for it to be safe.
+Deleting a file returns its blocks the same way: the scrubber's orphan-extent pass (`pkg/scrub`) calls `Allocator.Free(diskOff, length)` after deleting the dangling `extent:<ino>/<chunk>` key — delete first, so the blocks stop being reachable through metadata before the range can be reissued. This is wired through the optional `scrub.Reclaimer` interface, so the scrubber degrades to metadata-only cleanup when no allocator is attached. The strategy is incremental (update the live bitmap directly, evaluated against periodic-rebuild and append-only alternatives) because the free list is already in-memory and per-arena-owning-process — `Free` ignores ranges outside the calling node's own arenas, so no cross-node visibility is required for it to be safe.
 
 ## Block Deallocation
 
@@ -265,7 +265,7 @@ If the node has no arena records in etcd (it was fenced and its arenas were recl
 
 ### Why "own prefix only" is not optional
 
-Step 1 scans exactly `arena:<node_id>/`, not the whole `arena:` prefix. Reading the whole prefix was the actual behaviour until it was fixed (see [Kleppmann's Stale-Write Hazard in EtcFS](kleppmann-stale-write-analysis.md#the-allocator-channel) for the full analysis): every node's arena would be pulled into the restarting node's free-list, and step 4's `Allocate` calls would then hand out disk offsets inside a range another node was actively writing to. Both writers hold valid leases and current fencing generations in that scenario, so the generation guard on the metadata commit has nothing to reject — the corruption is silent, and only the scrubber's `CheckExtentCollisions` catches it, after the fact.
+Step 1 scans only `arena:<node_id>/`, not the whole `arena:` prefix, because reading the whole prefix (see [Kleppmann's Stale-Write Hazard in EtcFS](kleppmann-stale-write-analysis.md#the-allocator-channel)) would pull every node's arena into the restarting node's free-list, and step 4's `Allocate` calls would then hand out disk offsets inside a range another node was actively writing to. Both writers hold valid leases and current fencing generations in that scenario, so the generation guard on the metadata commit has nothing to reject — the corruption is silent, and only the scrubber's `CheckExtentCollisions` catches it, after the fact.
 
 Several related defects fed the same class of bug and are fixed alongside it:
 

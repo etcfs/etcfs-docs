@@ -76,7 +76,7 @@ With the default TTL of 10s, a node self-fences 20–30 seconds after losing its
 
 `IsAlive()` is not simply a flag the keepalive loop clears on failure. It requires **both** that the loop has not seen a terminal error **and** that the last successful keepalive is within one lease TTL.
 
-The second condition is load-bearing, not belt-and-braces. Under a total network partition the etcd client's `KeepAlive` channel is never closed — the client retries indefinitely and surfaces nothing — so the keepalive loop never reaches the reconnect path that would clear the flag. With only the flag to go on, a partitioned node believes itself alive indefinitely and the watchdog never fires at all — measured at 8+ minutes of partition with no self-fence, against a predicate carrying only the first condition. The lease TTL is the correct threshold because it is exactly when etcd expires the lease server-side, and the client renews at roughly TTL/3, so a healthy node retains ~3× margin and ordinary jitter cannot trip it.
+The second condition is required. Under a total network partition the etcd client's `KeepAlive` channel is never closed — the client retries indefinitely and surfaces nothing — so the keepalive loop never reaches the reconnect path that would clear the flag. With only the flag to go on, a partitioned node believes itself alive indefinitely and the watchdog never fires at all — measured at 8+ minutes of partition with no self-fence, against a predicate carrying only the first condition. The lease TTL is the correct threshold because it is exactly when etcd expires the lease server-side, and the client renews at roughly TTL/3, so a healthy node retains ~3× margin and ordinary jitter cannot trip it.
 
 ## The Self-Fence Trigger
 

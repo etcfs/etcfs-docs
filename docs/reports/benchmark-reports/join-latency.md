@@ -35,8 +35,7 @@ Single isolated 3-node etcfs cluster.
 daemons to a mount that answers a write.** That is slower than the previous
 run's 4.5 s despite no longer paying for an EBS reattach, so the reattach was
 evidently not the dominant term — daemon start, etcd membership registration and
-arena claim are. Both runs are in the same 4–7 s band, which is the honest
-statement about this number.
+arena claim are. Both runs are in the same 4–7 s band.
 
 **The survivor-impact percentage should not be read as a throughput claim in
 either direction.** The load here is 4 KiB random writes with `direct=1` on a

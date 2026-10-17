@@ -49,7 +49,7 @@ diverge, and that divergence is the hazard the whole protocol exists to
 prevent. Modelling ownership as one authoritative variable would have made
 `NoDoubleWriter` true by construction and proved nothing.
 
-Two further details of the real system are load-bearing and are modelled
+Two further details of the real system affect safety and are modelled
 exactly:
 
 - **`startGen` is cached at process startup and never re-read.** A write's
@@ -113,8 +113,8 @@ after being fenced: the guard holds even when the layer above it fails, which
 is the design's central claim about why it has three independent layers and
 not one.
 
-**`FencingDepartureNotQuiescent` is what makes the departure ordering
-load-bearing.** A node that leaves on purpose is not fenced, which is safe only
+**`FencingDepartureNotQuiescent` shows why the departure ordering
+matters.** A node that leaves on purpose is not fenced, which is safe only
 because it has already stopped serving before it gives anything back. This
 variant publishes the same departure marker from a node that returned its
 arenas but is still running and still believes it owns them — and the arena
