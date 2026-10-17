@@ -1,6 +1,6 @@
 # Self-Fencing Watchdog
 
-The local watchdog that monitors each node's etcd lease health and triggers a self-fence sequence when the lease cannot be maintained, preventing a partitioned node from continuing to write to the shared block device.
+A watchdog on each node checks whether the node's etcd membership lease is still being renewed. If it is not, for long enough, the watchdog stops the daemon, so that a node cut off from etcd stops writing to the shared device.
 
 ## Table of Contents
 
@@ -16,7 +16,7 @@ The local watchdog that monitors each node's etcd lease health and triggers a se
 
 ## Role in the Fencing Protocol
 
-The self-fencing watchdog is the first line of defence against split-brain in the EtcFS cluster. Its job is to detect when the local node has lost its etcd lease (the heartbeat) and, after a grace period, to shut down the node before it can corrupt data on the shared block device.
+Split-brain means two nodes each believing they may write the same data. The watchdog is the first protection against it: when the local node has lost its etcd lease (its heartbeat) for longer than a grace period, the watchdog shuts the node down.
 
 The fencing protocol has three layers:
 
@@ -24,7 +24,7 @@ The fencing protocol has three layers:
 2. **External fencing** — distributed detection, cloud API calls, fires second.
 3. **Generation guards** — metadata-layer CAS protection, prevents any residual writes from committing to etcd even if both previous layers failed.
 
-The self-fencing watchdog is the fastest responder. It lives in the same process as the FUSE daemon and the block device I/O engine. It does not depend on external services — only on the local etcd lease keep-alive stream.
+The watchdog runs inside `etcfuse-meta`, the process that does the device I/O, and depends on nothing outside it except the lease renewal stream to etcd.
 
 ## Watchdog Architecture
 
@@ -52,7 +52,7 @@ The watchdog is a polling loop that checks the health of the node's etcd members
 └─────────────────────────────┘
 ```
 
-The watchdog does not perform the full fencing sequence itself (it does not call cloud APIs or bump generations). It just detects the condition and exits the process. The external fencing controller, watching the etcd membership key, detects the deletion and executes the complete fencing protocol.
+The watchdog does not fence the node from outside: it calls no cloud API and changes no generation. It only stops its own process. The fencing controllers on the other nodes see the membership key disappear and carry out the external fence.
 
 ## Lease Health Monitoring
 
@@ -62,25 +62,29 @@ The polling interval is set to the lease TTL (configurable with `--lease-ttl`, d
 
 ### The Two-TTL Margin
 
-The watchdog does not trigger self-fence immediately when `IsAlive()` returns false. Instead, it waits for **2 × lease TTL** of confirmed lease death — `config.SelfFenceWindow`, which the daemon also uses at startup to reject a lease TTL whose window would close before a stalled request's own 10 s deadline could fire. This margin prevents false positives from transient network blips:
+The watchdog does not fence as soon as `IsAlive()` returns false. It waits until the lease has been dead for **2 × the lease TTL** (`config.SelfFenceWindow`), so a short network interruption does not stop the daemon. At startup the daemon also uses this window to reject a lease TTL whose window would end before a stalled request's own 10 s deadline:
 
 - **First TTL gap:** The keepalive stream is lost (network hiccup, etcd leader election). The lease TTL counter starts ticking down.
 - **Second TTL gap:** If the stream hasn't re-established within one full TTL, the lease is now past its expiry point in etcd. The etcd cluster will have deleted the membership key. The watchdog waits one more TTL to confirm the condition is persistent.
 - **After 2 × TTL:** The watchdog triggers self-fence.
 
-**Actual latency is 2–3 × TTL, not a flat 2 × TTL.** The 2 × TTL figure is the threshold the watchdog compares against, not the time at which it notices. `Run` polls on a `time.Ticker` of one lease TTL and can only evaluate the condition on a tick boundary, so a lease that crosses the threshold just after a tick is not detected until the next one — a further full TTL later. Measured on a partitioned node with TTL=10s: 22.98 s on one run, ~30 s on another, the difference being nothing but tick phase. Anything reasoning about the write-after-death window should use 3 × TTL as the bound, not 2 ×. Tightening this would mean polling more often than once per TTL; it has not been changed, because the generation guard (below) is what actually bounds the damage and a shorter poll only narrows an already-covered window.
+**The watchdog fires 2–3 × TTL after the lease is lost, not exactly 2 × TTL.** 2 × TTL is the threshold, but `Run` checks it only once per TTL, on a timer. A lease that passes the threshold just after a check is noticed one TTL later. On a partitioned node with a 10 s TTL, this took 22.98 s in one run and about 30 s in another; the difference is only where the check fell. Use 3 × TTL as the bound when reasoning about how long a dead node can keep writing.
 
-With the default TTL of 10s, a node self-fences 20–30 seconds after losing its lease. This window is the period during which the node could theoretically continue writing while already "dead" to the cluster. The generation guard on every etcd transaction (see Fencing Generation Protocol) is what closes this window at the metadata layer.
+Checking more often would shorten this, but the generation guard on every etcd transaction already rejects the node's metadata once it has been fenced (see [Fencing Generation Protocol](fencing-generation-protocol.md)), so a faster check would only narrow a window that is already covered.
+
+With the default 10 s TTL, a node fences itself 20–30 s after losing its lease. In that time it could still write to the device while the cluster already treats it as dead.
 
 ### How lease death is detected
 
 `IsAlive()` is not simply a flag the keepalive loop clears on failure. It requires **both** that the loop has not seen a terminal error **and** that the last successful keepalive is within one lease TTL.
 
-The second condition is required. Under a total network partition the etcd client's `KeepAlive` channel is never closed — the client retries indefinitely and surfaces nothing — so the keepalive loop never reaches the reconnect path that would clear the flag. With only the flag to go on, a partitioned node believes itself alive indefinitely and the watchdog never fires at all — measured at 8+ minutes of partition with no self-fence, against a predicate carrying only the first condition. The lease TTL is the correct threshold because it is exactly when etcd expires the lease server-side, and the client renews at roughly TTL/3, so a healthy node retains ~3× margin and ordinary jitter cannot trip it.
+The second condition is required. Under a complete network partition, the etcd client's `KeepAlive` channel is never closed: the client keeps retrying and reports nothing. The renewal loop then never reaches the code that would clear the flag. Checking only the flag, a partitioned node believes it is alive forever: a test with only the first condition ran for more than 8 minutes of partition without a self-fence.
+
+One lease TTL is the right threshold, because that is when etcd itself expires the lease. The client renews about every TTL/3, so a healthy node renews about three times per TTL, and normal delays cannot make it look dead.
 
 ## The Self-Fence Trigger
 
-When `IsAlive()` returns false for more than 2 × TTL margin, the watchdog calls `trigger()`. The trigger function is idempotent: if the node is already fenced, it returns immediately. This prevents repeated triggers from the polling loop.
+When `IsAlive()` has been false for more than 2 × TTL, the watchdog calls `trigger()`. Calling it again does nothing, so later checks do not trigger twice.
 
 ```
 trigger():
@@ -91,21 +95,30 @@ trigger():
   log: node_id, last_alive timestamp, dead_for duration
 ```
 
-Closing the `Fenced()` channel is the whole signal. `main` waits on it alongside SIGTERM and runs the same shutdown either way — stopping the IPC server, then releasing this node's arenas — before exiting with code 77.
+Closing the `Fenced()` channel is the only signal. `main` waits on it as well as on `SIGTERM`, and runs the same shutdown for both: it drops every cached lock, stops the IPC server and releases this node's arenas, then exits with code 77.
 
-The watchdog used to call `os.Exit(77)` itself, from inside the library. That skipped the shutdown entirely, so a self-fenced node never released its arenas; in single-signal mode the leak was permanent, because the fencing controller only reclaims a fenced node's arenas when a `Fencer` is configured.
+The watchdog does not exit the process itself. Exiting from inside the library would skip that shutdown, and a self-fenced node would never release its arenas. Without a device-enforced fence, the fencing controller does not release them either, so they would never be reused.
 
-Exit code 77 is a convention distinguishing self-fenced exits from crashes or normal shutdowns. The systemd unit can use this exit code to trigger a specific restart policy.
+Exit code 77 distinguishes a self-fence from a crash or a normal shutdown, so a systemd unit can give it its own restart policy.
 
 ## Trigger Sequence
 
-The trigger does not execute the full cleanup sequence locally — it simply exits the process. The reasoning:
+The self-fence shutdown is shorter than a graceful one:
 
-1. **No trust in local state after lease loss.** If the node cannot communicate with etcd, its local view of the world is untrustworthy. Attempting to flush in-flight writes or gracefully close open files may itself cause corruption (the writes might succeed on the block device but fail at the generation guard when the node restarts and tries to commit the metadata).
-
-2. **Process exit forces kernel cleanup.** When the process exits, the kernel closes the `/dev/fuse` file descriptor, which triggers the FUSE daemon's unmount at the kernel level. Any open file handles held by applications on the mount point receive EIO on their next access, which is the correct behaviour for a fenced node.
-
-3. **The external fencing controller handles the rest.** The process exit causes the membership lease keepalive to stop (the goroutine that was consuming the keepalive channel dies). The etcd lease expires, the membership key is deleted, the external fencing controller detects the deletion and executes the full fencing protocol (generation bump, arena reclamation, lock re-grant).
+1. **Buffered writes are discarded, not published.** A node that cannot reach
+   etcd cannot trust its own view of the cluster, and the generation guard
+   would reject a publish from a fenced node anyway. The buffers are dropped,
+   their blocks released, and the loss logged.
+2. **Cached locks are dropped first**, so the node stops blocking healthy nodes
+   as early as possible (see
+   [Lock Caching and Recall](../metadata/lock-caching.md#fencing-and-shutdown)).
+3. **The process exits.** `etcfuse-meta` exits; the C daemon's requests then
+   fail, and applications using the mount get errors on their next access.
+4. **The other nodes do the rest.** The membership lease is no longer renewed
+   and expires, its key is deleted, and the fencing controllers on the other
+   nodes carry out the external fence: cut the device off, raise the
+   generation, and release the arenas if the fence was device-enforced. The
+   node's lock keys have already expired with its lock session.
 
 ## IsFenced State
 
@@ -116,13 +129,7 @@ if svc.IsFenced():
     return EIO on all write operations
 ```
 
-The `Fenced()` method returns a channel that is closed when self-fence triggers. This channel can be watched by other goroutines that need to react to the fence:
-
-- The FUSE IPC handler can poll the channel to detect fence and return errors.
-- The arena allocator can use it to abort pending block writes.
-- The cache-invalidation watch can use it to tear down its etcd watch.
-
-In practice, the process exit (step 4 of the trigger) happens so quickly after the IsFenced flag is set that other goroutines may not have time to react. The channel is provided for future use cases where the daemon may need to coordinate a graceful shutdown before exiting.
+`Fenced()` returns a channel that is closed when the self-fence triggers. `main` waits on it to start the shutdown described above.
 
 ## Integration with the Membership Layer
 
@@ -134,7 +141,7 @@ The watchdog depends on the membership layer for two things:
 
 3. **`NodeID()` — identity for diagnostics.** Logged as context in the self-fence event.
 
-The membership layer does not stop the keepalive goroutine when the watchdog fires. The process exit does that implicitly.
+The membership layer keeps its renewal goroutine running when the watchdog fires; the process exit stops it.
 
 ## Interaction with the External Fencing Controller
 
@@ -145,13 +152,17 @@ The self-fencing watchdog and the external fencing controller form a two-layer d
 | Self-fencing (watchdog) | Local lease health poll | Exit process (code 77) | 2–3 × TTL (~20–30s at the default TTL=10s) |
 | External fencing (controller) | etcd watch on membership key deletion | Generation bump | TTL + watch latency |
 
-The self-fencing watchdog is faster and independent of external services. It does **not** close the block device file descriptor or remount anything — `trigger()` sets the fenced flag, closes the `Fenced()` channel, and logs; `main` does the rest. Process exit is what releases the descriptor, via the kernel. The distinction matters when reasoning about in-flight I/O: writes already handed to the kernel are not cancelled by the fence, they are simply no longer referenced once the generation guard rejects their metadata commit (see [Kleppmann's Stale-Write Hazard](../storage/kleppmann-stale-write-analysis.md)).
+The watchdog does not close the device descriptor or unmount anything itself. `trigger()` sets the flag, closes the channel and logs; `main` does the rest, and the descriptor is closed when the process exits. Writes already passed to the kernel are therefore not cancelled. They complete, but once the generation guard rejects their metadata commit, no extent refers to them (see [Kleppmann's Stale-Write Hazard](../storage/kleppmann-stale-write-analysis.md)).
 
-In the worst case (the self-fencing watchdog fails to fire — e.g., the daemon is stuck in an infinite loop), the external fencing controller still fences the node once the membership lease expires. The generation guard on every etcd transaction is the ultimate backstop: even if neither layer fires correctly, the fenced node's metadata commits are rejected because its generation is stale.
+If the watchdog does not fire (for example, the daemon is stuck in a loop), the external fencing controller still fences the node once its membership lease expires. If neither works, the generation guard still rejects every metadata commit from the node, because its generation is out of date.
 
-External fencing is device-enforced when the daemon was started with `--nvme-reservations`: a survivor preempts this node's NVMe reservation key on the shared namespace, and the device itself rejects its writes with `EBADE` from that moment on. Where that changes the watchdog's role, it is a demotion — the watchdog stops being the only thing standing between a partitioned node and the disk, and becomes a resource-cleanup measure that also bounds how long a wedged request can block. It is still the faster of the two signals, and still the only one that acts when the node's own kernel is the problem.
+**How strong the external fence is depends on the flags:**
 
-External fencing is dual-confirmed, but not device-enforced, when the daemon was started with `--ebs-volume-id` instead: the controller calls `ec2:DetachVolume`, polls `ec2:DescribeVolumes` until the attachment is actually gone, and only then bumps the generation. Without that flag (Docker, bare metal, or a node whose instance ID was never recorded) it falls back to bumping on lease expiry alone. See [External Fencing Controller](external-fencing-controller.md), `pkg/fencing/detach.go`, and the verification in `docs/reports/chaos-reports/external-fencing-detach.md`.
+- **`--nvme-reservations`:** another node removes this node's NVMe reservation key, and from then on the device itself rejects this node's writes with `EBADE`. The watchdog is then no longer the only thing between a partitioned node and the disk; it frees resources and limits how long a stuck request can block. It is still the faster of the two, and the only one that acts when the node's own kernel is the problem.
+- **`--ebs-volume-id`:** the controller calls `ec2:DetachVolume`, polls `ec2:DescribeVolumes` until the attachment is gone, and only then raises the generation. The detach is confirmed, but the device does not reject writes already in flight.
+- **Neither** (Docker, bare metal, or a node whose instance ID was never recorded): the controller raises the generation as soon as the lease expires.
+
+See [External Fencing Controller](external-fencing-controller.md), `pkg/fencing/detach.go`, and the [external fencing detach report](../../reports/chaos-reports/external-fencing-detach.md).
 
 ## Configuration
 

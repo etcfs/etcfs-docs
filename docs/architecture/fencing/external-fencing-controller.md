@@ -1,6 +1,6 @@
 # External Fencing Controller
 
-The distributed component that watches cluster membership, detects node failures, and executes the authoritative fencing protocol: bumping the failed node's generation counter after confirming it has been isolated from the shared block device.
+Every node runs a fencing controller. It watches cluster membership, and when a node disappears without leaving cleanly, it cuts that node off from the shared device, confirms the cut-off, and then raises the node's generation so that etcd rejects its metadata changes.
 
 ## Table of Contents
 
@@ -12,31 +12,36 @@ The distributed component that watches cluster membership, detects node failures
 - [Dual-Confirmation Model](#dual-confirmation-model)
 - [Generation Bump](#generation-bump)
 - [Leader Election](#leader-election)
-- [Integration with Lock Reclamation](#integration-with-lock-reclamation)
+
 - [Integration with Arena Reclamation](#integration-with-arena-reclamation)
 - [Integration with the Self-Fencing Watchdog](#integration-with-the-self-fencing-watchdog)
 - [Recovering a Fenced Node](#recovering-a-fenced-node)
 
 ## Design Rationale
 
-A node that cannot communicate with etcd cannot be trusted to continue accessing the shared block device. The external fencing controller is the mechanism that definitively isolates a failed node and records that isolation in etcd, so that other nodes can safely reclaim its resources.
+A node that cannot reach etcd must not keep using the shared device. The controller isolates such a node from outside and records that in etcd, so that other nodes can safely reuse its arenas.
 
-The controller exists because self-fencing alone is insufficient:
+Self-fencing alone is not enough:
 
 - A node may be partitioned from etcd but still alive and writing to the block device.
 - The self-fencing watchdog may fail to fire (process stuck, kernel unresponsive).
 - A node may crash without self-fencing (instant power loss, kernel panic).
 
-The external fencing controller must **confirm** that the node is truly isolated before allowing other nodes to reclaim its state. That confirmation comes from outside etcd, through one of two implementations of the `Fencer` interface (`pkg/fencing/detach.go`):
+The controller must **confirm** that the node is isolated before raising its generation. The confirmation comes from outside etcd, through one of two implementations of the `Fencer` interface (`pkg/fencing/detach.go`):
 
 - **NVMe reservations (`pkg/fencing/nvme.go`, preferred).** A survivor preempts the expired node's reservation key on the shared namespace. The device itself then rejects that node's writes, synchronously — its next `write()` fails with `EBADE` and no bytes reach the volume. Enabled with `--nvme-reservations`, which requires `--block-device` and a device supporting the reservation command set (an EBS `io2` Multi-Attach volume does; `gp3` and loopback devices do not).
 - **EBS detach (`pkg/fencing/detach.go`, fallback).** The controller calls `ec2:DetachVolume` with `Force=true` and polls `ec2:DescribeVolumes` until the attachment is gone. Enabled with `--ebs-volume-id`. Detachment is asynchronous, which is why the poll exists: `DetachVolume` returns when the request is accepted, not when the device is gone, and the poll runs every 2 s for up to 60 s before the attempt is reported as a failed fence. The preempt path confirms too — `NVMeFencer.Fence` issues a Reservation Report after the preempt and fails if the victim's key is still registered — but one read settles it, because the preempt is already synchronous at the device.
 
-With neither flag the controller degrades to single-signal fencing — bumping the generation on lease expiry alone. That is correct for Docker and single-host testing, where there is no shared device to cut off, but it stops a node publishing metadata without stopping it writing bytes.
+With neither flag, the controller raises the generation as soon as the lease expires ("single-signal" fencing). That suits Docker and single-host testing, where there is no shared device to cut off, but it only stops the node publishing metadata, not writing bytes.
 
 ## Controller Architecture
 
-The controller runs as a background goroutine within the Go daemon (etcfuse-meta). It watches the etcd membership prefix for DELETE events, and runs a second goroutine — the reconciliation sweep — which is authoritative: every 30 seconds it compares the nodes the cluster knows of against live membership and fences whatever is missing, whether or not any controller ever saw an event for it. The two paths share three etcd keys: a durable record of a fence that is owed, a lease-bound claim that stops two controllers performing it at once, and a mark recording that a departed node has already been fenced.
+The controller runs as goroutines inside `etcfuse-meta`, and has two ways of finding nodes to fence:
+
+- **The membership watch** reacts to each DELETE of a `membership:` key.
+- **The reconciliation sweep** runs every 30 s, compares the nodes the cluster knows of with live membership, and fences any node that is missing, whether or not a watch event was seen for it. The sweep is the authoritative one: anything the watch misses, it catches.
+
+Both use three etcd keys: a durable record that a fence is owed (`fence_pending:`), a lease-bound claim so that only one controller performs a given fence (`fence_claim:`), and a mark that a departed node has already been fenced (`fence_done:`).
 
 ```
 ┌────────────────────────────────────────────────┐
@@ -69,21 +74,21 @@ The controller runs as a background goroutine within the Go daemon (etcfuse-meta
 
 ### Fence Intent (`fence_pending:<node_id>`)
 
-The membership watch is edge-triggered: it fires once, on the DELETE of a key that is already gone, so a fence that fails, times out, or dies with its controller has no event left to re-trigger it. `fence_pending:<node_id>` is the durable record that closes that gap. It is written on the watch goroutine, before the fence is attempted, and deleted only after the generation bump succeeds — so anything left behind is by definition an incomplete fence. Its value is the expired node's instance ID, stored because that value lives only inside the membership key, which is already deleted by the time a retry runs.
+The membership watch fires once, when the key is deleted. A fence that fails, times out or dies with its controller would therefore never be retried by the watch. `fence_pending:<node_id>` records that a fence is owed. It is written before the fence is attempted and deleted only after the generation bump succeeds, so a key left behind always means an unfinished fence. Its value is the node's instance ID, because that ID was stored only in the membership key, which is gone by the time a retry runs.
 
-The key is not lease-bound. An owed fence must survive the death of whichever controller happened to observe the expiry.
+The key has no lease, so an owed fence is not forgotten if the controller that saw the expiry dies.
 
 ### Fence Mark (`fence_done:<node_id>`)
 
-Because the sweep decides from current state rather than from a recorded intent, it needs to tell a node that is gone and still owed a fence from one that is gone and already fenced. The intent is deleted on completion, and the generation alone cannot answer the question: a node fenced during an earlier departure it has since recovered from carries a raised generation too. `fence_done:<node_id>` records the generation the fence bumped it to, and is deleted the moment the node is seen alive in membership again — so a node that leaves twice is fenced twice, and a node that leaves once is fenced once however many sweeps run.
+The sweep decides from current state, so it must tell apart a node that is gone and still owed a fence from one that is gone and already fenced. The intent cannot tell it, because it is deleted when the fence completes; neither can the generation, because a node fenced during an earlier departure also has a raised generation. `fence_done:<node_id>` records the generation the fence raised the node to. It is deleted as soon as the node is seen alive in membership again, so a node that leaves twice is fenced twice, and a node that leaves once is fenced once however many sweeps run.
 
-The mark is written before the intent is cleared. Between the two a sweep sees a node that is both marked and owed, and treats it as owed: one harmless retry, rather than skipping a fence that never completed.
+The mark is written before the intent is deleted. A sweep that runs in between sees a node that is both marked and owed, and treats it as owed. That costs one harmless retry, instead of skipping a fence that may not have completed.
 
 ### Fence Claim (`fence_claim:<node_id>`)
 
-Every survivor watches the same prefix and receives the same DELETE, so all of them begin fencing the same node simultaneously — observed on AWS on 2026-08-06, where two survivors fenced `n1` within 2 ms of each other. `fence_claim:<node_id>` is a create-CAS on an empty key, bound to a lease: exactly one controller wins it and proceeds, and the rest log and return.
+Every surviving node watches the same prefix and receives the same DELETE, so all of them start fencing the same node at the same moment (on AWS, two survivors started fencing `n1` within 2 ms). `fence_claim:<node_id>` is created with a compare-and-swap that requires the key not to exist, under a lease: exactly one controller creates it and continues, and the others log and stop.
 
-The claim is lease-bound because the intent is not. A controller that crashes mid-fence must release its claim automatically, or the retry the intent exists to enable would be blocked forever by a claim nobody will ever drop. The lease TTL (120 s) must exceed the longest a single fence attempt can take — the EBS detach path polls for up to a minute — since a claim expiring under a live fencer would readmit the duplicate fence it exists to prevent. Erring long costs only retry latency after a crash.
+The claim has a lease, unlike the intent, so that a controller crashing mid-fence releases its claim automatically. Otherwise the retry that the intent makes possible would be blocked forever by a claim nobody will drop. The lease TTL (120 s) must be longer than one fence attempt can take (the EBS detach path polls for up to a minute); a claim expiring while its controller is still fencing would let a second controller start the same fence. A long TTL only delays the retry after a crash.
 
 ## Membership Watch
 
@@ -104,27 +109,25 @@ if the watch channel is closed:
     continue the loop
 ```
 
-A revision that has been compacted away cannot be resumed from, and retrying it would spin: the watch reports the error, the controller starts again from the current revision, and the sweep covers the gap. That is exactly what the sweep is authoritative for.
+If etcd has compacted its history past that revision, the watch cannot resume there, and retrying would loop forever. The controller then restarts the watch from the current revision, and the sweep fences any node whose DELETE fell in the gap.
 
-Reconnecting from "now" unconditionally instead silently dropped everything that happened during the gap. That mattered because a fence was only ever triggered by an event: a DELETE arriving in the reconnection window was fenced by nothing at all. Resuming from the last revision closes the routine case, and the authoritative sweep covers what remains — a revision compacted away, or a controller that was not running at the time.
+Reconnecting from the current revision every time would lose every DELETE during the gap. Resuming from the last revision covers the ordinary case, and the sweep covers the rest: a compacted revision, or a controller that was not running.
 
 ## Intentional Departure
 
-A node that shuts down on purpose is not fenced. Without this it was: every membership-key disappearance looked like a crash, so a node stopped with `SIGTERM` had its EBS volume detached out from under it and could not be restarted until an operator put the volume back.
+A node that shuts down on purpose is not fenced. Otherwise every departure would look like a crash, and a node stopped with `SIGTERM` would have its EBS volume detached and could not be restarted until an operator attached it again.
 
-The departing node writes `departed:<node_id>`, and its peers skip the fence when they see it. Three things make that safe, none of which involves taking the node's word for anything.
+The departing node writes `departed:<node_id>`, and the other nodes skip the fence when they see it. Three properties make this safe without trusting the node:
 
-**It is atomic with leaving membership.** `MarkDeparted` is one transaction — `Put(departed:<node>)` together with `Delete(membership:<node>)`. A controller can therefore never observe the departure without already being able to see the marker, which is what removes the need for a grace window, and with it any dependence on clocks.
+- **It is written in the same transaction as leaving membership.** `MarkDeparted` puts `departed:<node>` and deletes `membership:<node>` in one transaction. A controller can never see the departure without also seeing the marker, so no grace period, and no clock, is needed.
+- **Only a live member can write it.** The transaction requires `membership:<node_id>` to still exist. A node whose lease has already expired is not a member, so its transaction fails. A partitioned or hung node, the kind fencing exists for, therefore cannot later declare its departure intentional.
+- **The marker is checked against the arena records.** Before honouring a marker, the controller checks whether the node still owns any arena. If it does, it has not given everything back, and it is fenced as usual. If either check fails to read, the node is fenced: fencing a node that left cleanly costs a detach and a manual reattach, while not fencing one that did not leave cleanly can let two nodes write to one arena.
 
-**Only a live member can write one.** The transaction is conditioned on `membership:<node_id>` still existing. A node whose lease has already timed out is no longer a member and the comparison fails, so the node this whole protocol exists to contain — the partitioned one, the hung one — cannot come back and declare its departure intentional. It has no way to write itself an exemption.
+Before writing the marker, the departing node stops writing. `leaveCluster` runs only after the IPC server has stopped, so no further write can come from the node. It then gives back its cached locks, closes its lock session and releases its arenas. The departure is announced only if every arena was released; otherwise the node is still recorded as an owner, and the only safe way for other nodes to reuse the arena is to fence it.
 
-**The claim is checked, not believed.** Before honouring a marker the controller asks whether the cluster still records the node as owning any arena. A node that says it gave everything back while the records say otherwise has not, and is fenced exactly as it would have been. Both reads fail into fencing: fencing a node that left cleanly costs a detach and a manual reattach, while failing to fence one that did not is how two nodes end up writing to one arena.
+The node must stop writing before writing the marker. TLC finds a violation of `ReleasedArenaHasNoLiveWriter` in a variant where a node releases its arenas and writes the marker while still running: the arena goes back to the free pool while its previous owner can still write to it. The arena check above does not catch this, because the records are clean while the node is still alive, so the order has to be enforced, not inferred from the records. See `specs/FencingDepartureNotQuiescent.cfg`.
 
-What the node does before writing the marker is the other half. `leaveCluster` runs only after the IPC server has stopped — a departing node is its own proof of quiescence, since no further write can be issued from it — and then gives back its cached locks, closes its lock session, and releases its arenas. Only if every arena actually came back is the departure announced; a partial release leaves the node recorded as an owner, and the only safe way for peers to reclaim that range is to fence it.
-
-Quiescence comes before the marker because TLC breaks `ReleasedArenaHasNoLiveWriter` on a variant that publishes the marker from a node that gave its arenas back but has not stopped: the arena returns to the free pool while its previous owner can still write to it. Notably the arena check above does *not* catch that variant — the records are clean and the node is alive anyway — which is why quiescence has to come first rather than be inferred from the bookkeeping. See `specs/FencingDepartureNotQuiescent.cfg`.
-
-The marker describes one departure, not the node for ever: `Membership.grantAndRegister` deletes it as the node re-registers, alongside the stale fence intent and mark, so a node that leaves cleanly, comes back, and later dies badly is fenced like any other.
+A marker covers one departure. `Membership.grantAndRegister` deletes it when the node registers again, together with any old fence intent and mark, so a node that leaves cleanly, comes back and later crashes is fenced like any other.
 
 ## Fence Protocol
 
@@ -140,7 +143,7 @@ if not won:
 defer store.ReleaseFenceClaim(leaseID)
 ```
 
-The claim is cluster-wide, not per-process: the same node's expiry is observed by every survivor, so an in-memory dedup map would collapse only the duplicates originating within one controller. A duplicate fence was never corrupting — both `Fencer` implementations are idempotent (a second preempt of an unregistered key still leaves it absent, and `EBSDetacher` treats an already-detached volume as success) and the generation CAS serialises the bumps — but it is wasted work against a cloud API or a device during an incident, and it made the logs read as two independent fences of the same node.
+The claim is stored in etcd, not in memory, because every survivor sees the same expiry; an in-memory check would only stop duplicates within one controller. A duplicate fence would not corrupt anything: both `Fencer` implementations can safely run twice (removing an already-removed key leaves it removed, and `EBSDetacher` treats an already-detached volume as success), and the generation compare-and-swap orders the bumps. It would still be wasted calls to a cloud API or a device during an incident, and the logs would show two fences of the same node.
 
 ### 2. Re-check the Intent (sweep path only)
 
@@ -151,9 +154,11 @@ if the caller is the reconciliation sweep:
         return
 ```
 
-The check is a listing rather than a read of the single key: an intent recorded for a node whose instance ID was never known has an empty value, which a plain `Get` cannot distinguish from a missing key. Winning the claim proves no one else is fencing this node *now*; it does not prove the fence is still owed. The sweep chooses what to fence from a `ListFenceIntents` snapshot, and that snapshot ages while the call waits on a contended claim: two sweeps can list the same intent, the first completes the fence and releases its claim, and the second then wins the now-free claim holding a view of the world from before any of that happened. Without this step it replays the whole fence — a second real preempt or detach against the device, and a second generation bump. Observed on Docker with three controllers on 2026-08-06.
+Winning the claim proves nobody else is fencing the node *now*, not that the fence is still owed. The sweep picks nodes from a `ListFenceIntents` snapshot, which can be out of date by the time it wins the claim. For example: two sweeps list the same intent; the first completes the fence and releases its claim; the second then wins the free claim with its old snapshot and repeats the whole fence, a second preempt or detach and a second generation bump. This happened on Docker with three controllers. The sweep therefore checks the intent again after winning the claim.
 
-The watch path skips the check. It acts on a single DELETE event it observed itself rather than a snapshot, so it has nothing stale to guard against; and making it conditional on the intent would mean an intent that failed to record silently disables fencing for that node, which trades a duplicate for a miss.
+The check lists the intents rather than reading the one key, because an intent for a node whose instance ID was never known has an empty value, which `Get` cannot tell apart from a missing key.
+
+The watch path skips this check. It acts on a DELETE it saw itself, not on a snapshot, so it has nothing out of date to guard against. Requiring the intent there would mean that an intent which failed to be written would silently disable fencing for that node.
 
 ### 3. Read Current Generation
 
@@ -165,14 +170,14 @@ Reads the `gen:<node_id>` key from etcd. If the key does not exist (never fenced
 
 ### 4. External Confirmation
 
-The controller calls `Fencer.Fence(ctx, nodeID, instanceID)` and proceeds to the generation bump only if it returns nil. Note the ordering: severing device access is a *precondition* of the bump, not a parallel action, because the bump is what tells peers they may reclaim the node's arenas and locks.
+The controller calls `Fencer.Fence(ctx, nodeID, instanceID)` and raises the generation only if it succeeds. Cutting off device access must come first, because after the bump the node's arenas may be released to other nodes.
 
 Under NVMe reservations the step is:
 
 1. Preempt the expired node's reservation key, derived from its node ID (`nvmeresv.KeyForNode`, FNV-1a 64). Deriving rather than assigning means any survivor can compute the key without a registry.
 2. Re-read the reservation report and confirm the key is no longer registered. A preempt that reports success while the registration survives is treated as a failed fence.
 
-Under the EBS fallback it is the detach-then-poll sequence described above. Either way, a fence that cannot be confirmed aborts without bumping: a node the cluster believes is fenced, but is not, is more dangerous than one it knows it failed to fence. The abort leaves `fence_pending:<node_id>` in place, so the reconciliation sweep retries the attempt rather than abandoning it.
+With EBS detach, it is the detach and poll described above. Either way, a fence that cannot be confirmed stops without raising the generation: a node the cluster wrongly believes is fenced is more dangerous than one it knows it failed to fence. `fence_pending:<node_id>` stays in place, so the sweep tries again.
 
 ### 5. Bump Generation
 
@@ -180,7 +185,7 @@ Under the EBS fallback it is the detach-then-poll sequence described above. Eith
 newGen, err = store.BumpGeneration(ctx, nodeID, currentGen)
 ```
 
-The CAS bump atomically transitions the generation from `currentGen` to `currentGen + 1`. If another controller replica has already bumped the generation (race condition), the CAS fails and the controller re-reads the new generation and logs a warning — the fence was already performed by another replica, and the dedup check ensures no duplicate recovery actions.
+The compare-and-swap moves the generation from `currentGen` to `currentGen + 1`. If another controller has already raised it, the compare-and-swap fails, and this controller reads the new value and logs a warning.
 
 ### 6. Cleanup
 
@@ -190,11 +195,11 @@ release fence_claim:<node_id> (revoke its lease)
 log: "node fenced", node_id, generation, previous
 ```
 
-The intent is cleared only here, at the one point where nothing is owed any more; leaving it would make the sweep re-fence the node on every tick. The generation is now one higher than before the fence, which blocks any pending metadata transactions from the fenced node.
+The intent is deleted only here, once nothing is owed; otherwise the sweep would fence the node again every 30 s. The generation is now one higher, so etcd rejects every further metadata transaction from the fenced node.
 
 ## Dual-Confirmation Model
 
-The most safety-critical aspect of the external fence is **dual confirmation**: the controller must have at least two independent sources of truth confirming the node is isolated before bumping the generation.
+The controller raises the generation only when two independent sources confirm that the node is isolated:
 
 The two confirmations are:
 
@@ -202,80 +207,61 @@ The two confirmations are:
 
 2. **Device or cloud-API confirmation.** Either the reservation report confirms the node's key is no longer registered (NVMe path), or the EC2 API confirms the shared volume is detached from the instance (`DescribeVolumes` no longer lists the attachment). Both are confirmations that the node cannot reach the block device; the reservation report is the stronger of the two, because the enforcement and the evidence come from the same device rather than from a control plane describing an asynchronous operation.
 
-The generation bump is NOT performed until both confirmations are received. If only one confirmation arrives (e.g., the membership key is deleted but the volume detach API times out), the controller alerts but does not bump.
+If only the first arrives (for example, the membership key is deleted but the detach call times out), the controller raises an alert and does not bump the generation.
 
-That state is no longer a terminal limbo requiring an administrator. The recorded intent makes it a retry: the sweep re-attempts the fence every 30 s until either the second confirmation arrives and the generation is bumped, or the node re-registers. A transient failure — an EC2 API throttle, a device busy during a namespace re-enumeration, a controller killed mid-fence — therefore resolves itself. What still requires intervention is a failure that never clears, such as a device that refuses every preempt; the difference is that the cluster keeps trying and keeps logging `retrying incomplete fence` rather than falling silent after one attempt.
+The recorded intent turns this into a retry: the sweep tries the fence again every 30 s, until the second confirmation arrives and the generation is raised, or the node registers again. Temporary failures (an EC2 API throttle, a device busy re-enumerating namespaces, a controller killed mid-fence) therefore resolve themselves. A failure that never clears, such as a device that refuses every preempt, still needs an operator, and the cluster keeps logging `retrying incomplete fence` until then.
 
 ### Re-registration Drops the Intent
 
-If the sweep finds a live `membership:<node_id>` key for a node with a pending intent, it deletes the intent instead of fencing. A node holding a live membership lease again has recovered from the expiry that triggered the fence: its own self-fencing watchdog did not stop it, and it is reachable from etcd. Severing a healthy node's device access on the strength of an expiry it has already recovered from would convert a transient partition into an outage, and the epoch separation the generation provides is only needed against a node that cannot be told it is gone.
+If the sweep finds a live `membership:<node_id>` key for a node with a pending intent, it deletes the intent instead of fencing. A node with a live membership lease again has recovered: its watchdog did not stop it, and it can reach etcd. Cutting off a healthy node because of an expiry it has recovered from would turn a short partition into an outage.
 
 ### Simulation Mode
 
-In the test harness, dual confirmation is simplified: the membership key deletion alone is sufficient to trigger the generation bump, since a Docker loopback device supports neither reservations nor detachment. Both real paths are exercised against AWS: `scripts/test/chaos-fencing-detach.sh` for the EBS fallback, and `scripts/test/chaos-nvme-fencing.sh` for reservation preempt, which additionally asserts that a preempted node's raw `O_DIRECT` write is rejected by the device itself.
+In the test harness, the membership key deletion alone triggers the generation bump, because a Docker loopback device supports neither reservations nor detaching. Both real paths are tested on AWS: `scripts/test/chaos-fencing-detach.sh` for EBS detach, and `scripts/test/chaos-nvme-fencing.sh` for reservations, which also checks that the device rejects a preempted node's raw `O_DIRECT` write.
 
 ## Generation Bump
 
-The generation bump is the authoritative record that a fence has occurred. It serves three purposes:
+The raised generation records that the fence happened. It is used in two ways:
 
-1. **Notification to the scrubber.** The scrubber reads each node's generation and compares it against the generation stamps on every extent. If an extent has a stale generation, it was written before the fence and may be part of an incomplete write — the scrubber reports it.
+1. **By the metadata guard.** Every metadata transaction includes `WithGenerationGuard`, which requires the writer's generation to equal the value it read at startup. After a bump, every transaction from the fenced node is rejected, even if it recovers and tries to continue.
+2. **By the scrubber**, which compares each extent's generation stamp with its writer's current generation and reports anomalies.
 
-2. **Lock reclamation gate.** When acquiring a lock that was held by the fenced node, the new holder checks that the generation has been bumped. This ensures the old holder's writes are definitively blocked before the new holder begins writing.
+The generation is not what frees the dead node's locks: they are freed when its lock session expires, without waiting for the fence (see [Concurrency Control](../metadata/concurrency-control.md#lease-backed-expiry)). If the dead node is in fact still running, the guard stops its commits.
 
-3. **Metadata transaction guard.** Every metadata mutation includes `WithGenerationGuard`, which checks that the writer's generation matches the expected current value. After a bump, the fenced node (if it recovers and tries to resume) will find its generation stale and all its metadata transactions will be rejected.
-
-The generation is monotonically non-decreasing. It never resets, never wraps, and never decreases. This is guaranteed by the CAS comparison in `BumpGeneration`.
+The generation never decreases, resets or wraps; the compare-and-swap in `BumpGeneration` guarantees it.
 
 ## Leader Election
 
 The fencing controller supports multiple replicas for high availability. They watch the same membership prefix and receive the same DELETE events; the per-node `fence_claim:<node_id>` lease described above is what serialises them, so exactly one replica executes any given fence.
 
-This is deliberately per-fence mutual exclusion rather than cluster-wide leadership. A single fencing leader would be a single point of failure for the one operation that must not be missed, and it would gain nothing here: fences of different nodes are independent, and the claim already gives each one an owner. It also degrades better — a controller that dies holding a claim releases it when its lease expires, and any other replica's sweep picks the fence up.
+There is no single fencing leader, on purpose. A leader would be a single point of failure for the one operation that must not be missed, and would add nothing: fences of different nodes are independent, and the claim already gives each fence one owner. A controller that dies holding a claim releases it when its lease expires, and another node's sweep takes the fence over. A cluster-wide leader would only be needed if some fencing action had to be ordered across all nodes, which none does.
 
-A full leader-election protocol (etcd lease-backed lock) remains a possible future direction if a fencing action ever needs to be globally serialised rather than per-node. In that model:
 
-1. Multiple controller replicas watch the `fencing/leader` key.
-2. Each replica attempts to acquire the leadership lease via CAS.
-3. The replica that holds the lease performs the actual fence.
-4. If the leader's lease expires, another replica acquires the leader role and takes over.
-
-## Integration with Lock Reclamation
-
-When the external fencing controller bumps a node's generation, the lock subsystem reacts:
-
-1. Other nodes holding blocked SETLKW requests on inodes locked by the fenced node receive a DELETE event from their lock watchers.
-2. Before attempting to re-acquire the lock, the requesting node checks `GenerationGuard(nodeID)`. This guard includes a comparison on the fenced node's generation being equal to its post-bump value.
-3. If the generation has not been bumped (the fence is not yet complete — the dual confirmation hasn't happened), the lock acquisition fails with EAGAIN, and the caller retries after a brief backoff.
-4. Once the generation is confirmed bumped, the lock acquisition proceeds.
-
-This is the mechanism that prevents a node from acquiring a lock while the old holder might still be writing to the block device.
 
 ## Integration with Arena Reclamation
 
-The controller releases a fenced node's arena immediately after the generation bump, but only when a `Fencer` confirmed the severance — see [Arena Allocator § Arena Release](../storage/arena-allocator.md#arena-release) for the mechanism (`Store.ReleaseArena`, `free_arena:<arena_id>`, `ClaimFreeArena`). In single-signal mode (no `Fencer` configured) the controller does not release the arena: a lease expiry alone is not proof the node has stopped writing, so nothing satisfies invariant 4 of [Kleppmann's Stale-Write Hazard](../storage/kleppmann-stale-write-analysis.md) — the arena leaks deliberately rather than being handed to a node that might still be writing into it.
+Right after the generation bump, the controller releases the fenced node's arenas, but only if a `Fencer` confirmed the cut-off (see [Arena Allocator § Arena Release](../storage/arena-allocator.md#arena-release)). Without a `Fencer`, the arenas are not released: an expired lease does not prove the node has stopped writing (invariant 4 of [Kleppmann's Stale-Write Hazard](../storage/kleppmann-stale-write-analysis.md)), so the arenas stay unused rather than being given to another node while the old owner might still write to them.
 
 ## Integration with the Self-Fencing Watchdog
 
 The self-fencing watchdog and the external fencing controller operate independently and are designed to work together:
 
-| Scenario | Self-fencing | Controller | Outcome |
+| Scenario | Watchdog | Controller | Outcome |
 |---|---|---|---|
-| Normal crash (SIGKILL) | Does not fire (process dead) | Detects membership expiry, fences | Clean generation bump |
-| Network partition from etcd | Fires after 2× TTL margin | Detects membership expiry | Both fence; node crashes before controller |
-| Process hang (no SIG | Fires when polling detects death | Also fires independently | Both fence; generation bumped once (dedup) |
-| Split-brain (node can write but not reach etcd) | Fires | Fires | Self-fence closes block FD; controller bumps gen; double protection |
+| Crash (`SIGKILL`, power loss) | Does not run (process gone) | Sees the expiry, fences | Device cut off, generation raised |
+| Network partition from etcd | Stops the daemon after 2–3 × TTL | Sees the expiry, fences | Both act; the generation is raised once |
+| Process hung | Stops the daemon if its goroutine still runs | Sees the expiry, fences | Both act; the generation is raised once |
+| Node can write to the device but not reach etcd | Stops the daemon | Cuts the device off, raises the generation | Device writes and metadata commits both stopped |
 
-The self-fencing watchdog is always faster (10 seconds for 5s TTL), making it the primary mechanism. The external controller is the backup that ensures the fence is recorded even if the watchdog fails.
+The controller usually acts first: the membership lease expires after one TTL (10 s by default), while the watchdog waits 2–3 TTLs. The watchdog is the one that still works when the controllers cannot act on the node, for example when no other node can reach etcd either.
 
 ## Recovering a Fenced Node
 
-A fence is deliberately not self-reversing. The detach (or NVMe preempt) that
-severs a node's device access is never undone by the controller, and nothing in
-the daemon re-attaches on startup. That is not an omission: a fence that undid
-itself the moment the fenced node came back would not be a fence, and the whole
-ordering argument above — sever, confirm, bump, only then release the arena —
-depends on the severance outlasting the node's own opinion of whether it is
-healthy.
+A fence is not undone automatically. The controller never reverses the detach
+or NVMe preempt that cut a node off, and the daemon does not reattach the volume
+at startup. A fence that undid itself when the node came back would not protect
+anything: the order cut off, confirm, bump, then release the arenas relies on
+the cut-off lasting regardless of whether the node thinks it is healthy.
 
 **The supported recovery is to replace the instance, not to resurrect it.** A
 replacement gets a fresh instance ID, attaches the shared volume itself (in
@@ -285,36 +271,34 @@ the repository does it this way: `add-compute-node.sh`, the chaos suite's
 node-replacement helpers, and the autoscaling user-data described in
 [Autoscaling](../../deployment/autoscaling.md).
 
-Restarting the daemon in place on a fenced instance does not work and should not
-be expected to. The volume is gone from that instance, so the daemon fails at
-startup with `open /dev/nvme1n1: no such file or directory` — which names the
-symptom rather than the cause. If a node reports that after having been up, the
-first thing to check is whether it was fenced:
+Restarting the daemon on a fenced instance does not work. The volume is no
+longer attached, so the daemon fails at startup with
+`open /dev/nvme1n1: no such file or directory`, which does not say why. If a node
+that was running reports this, first check whether it was fenced:
 
 ```
 aws ec2 describe-volumes --volume-ids <vol> \
     --query 'Volumes[0].Attachments[].InstanceId'
 ```
 
-`bootstrap-cluster.sh` is the one exception, and it re-attaches on purpose. It
-rebuilds a cluster from scratch — killing every daemon and wiping every etcd
-member — so by the time it runs there is no fenced node left running for the
-severance to protect the volume from, and the operator invoking it has already
-decided the previous incarnation is gone.
+`bootstrap-cluster.sh` is the one exception, and reattaches on purpose. It
+rebuilds the cluster from scratch, killing every daemon and wiping every etcd
+member, so no fenced node is left running, and the operator running it has
+decided the old cluster is gone.
 
 ### Why this shows up during benchmarking
 
-Anything that kills daemons and restarts them — a re-deploy loop, a benchmark
-sweep across builds — expires membership leases and is therefore indistinguishable
-from a cluster of dying nodes. The survivors fence correctly, and the volume ends
-up detached from whichever nodes were killed. This is the system working, but it
-makes a re-deploy loop progressively strip the cluster of its data volume.
+Killing daemons and restarting them, as a redeploy loop or a benchmark sweep
+across builds does, lets membership leases expire, which looks exactly like
+nodes dying. The survivors fence the killed nodes correctly, and the volume is
+detached from them, so a redeploy loop gradually removes the data volume from
+the cluster.
 
-The failure is worse than it looks, because an EtcFS mount that does not come up
-leaves `/mnt/etcfuse` as an ordinary directory on the instance's root volume, and
-a benchmark pointed at it measures *that* volume. A root `gp3` outruns a modestly
-provisioned `io2` data volume, so the broken run reports numbers far above the
-device ceiling instead of failing. `benchmark.sh` and `benchmark-etcfs.sh` both
-check `mountpoint` before measuring for this reason. Any EtcFS figure above the
-data volume's provisioned IOPS on an `O_DIRECT` job should be treated as a
-misconfigured run until the mount and the attachments are confirmed.
+The result can look like success. A mount that does not come up leaves
+`/mnt/etcfuse` as an ordinary directory on the instance's root volume, and a
+benchmark pointed at it measures the root volume. A root `gp3` volume is faster
+than a modestly provisioned `io2` data volume, so the broken run reports numbers
+above the data volume's limit instead of failing. `benchmark.sh` and
+`benchmark-etcfs.sh` therefore check `mountpoint` before measuring. Treat any
+EtcFS figure above the data volume's provisioned IOPS on an `O_DIRECT` job as a
+misconfigured run until the mount and the attachments have been checked.
