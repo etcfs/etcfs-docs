@@ -181,7 +181,7 @@ If the replaced inode is a symlink, its target key is deleted in the same transa
 
 Some renames are refused: `RENAME_EXCHANGE`, a directory over a non-directory or the reverse, a non-empty directory as the target, and a destination inside the directory being moved. See [FUSE Write Operations](../fuse/fuse-write-operations.md#rejected-renames) for the error each returns and why.
 
-A rename between directories changes every key in one transaction. If two renames conflict, etcd orders them; the first commits and the second fails its comparison.
+A rename between directories changes every key in one transaction. When two renames compare a key the other writes (the same source or target name, or the same parent directory), etcd orders them: the first commits and the second fails its comparison. The check that the destination is not inside the directory being moved is a read made before the transaction and is not repeated as a comparison, so two directory renames into each other's subtrees, which share no compared key, can both commit.
 
 ## Directory Listing
 
