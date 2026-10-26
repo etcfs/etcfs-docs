@@ -143,23 +143,30 @@ debug at three in the morning.
 `/dev/fuse` descriptor, and the kernel request queue simply becomes the next
 place where the concurrency is lost.
 
-## Write barriers are opt-in, and the readback is one sector
+## Write barriers are opt-in, and are one `fdatasync`
 
-With barriers, every write ends with a `BLKFLSBUF` ioctl, a `sync_file_range`
-and a readback, and every read begins with another `BLKFLSBUF`: three device
-round trips added to each write and one to each read. They defend against
-caches that do not exist with `O_DIRECT` on an io2 Multi-Attach volume: the page
-cache is bypassed on every node, and the volume acknowledges a write only once
-it is durable and visible to every attached instance. The barriers are therefore
-behind `--write-barriers`, off by default, and forced on without `O_DIRECT`,
-where the page cache does hold data back.
+With barriers, the data of a write, or of every run a buffered flush puts on
+the device, is followed by one `fdatasync` on the device descriptor before the
+extent naming it is committed, and every read begins with a `BLKFLSBUF`. On a
+block device `fdatasync` writes back any dirty page cache and then sends the
+device a cache flush (`REQ_PREFLUSH`), so a write the device acknowledged into
+a volatile cache is on stable media before etcd points at it. Neither
+`O_DIRECT`, `sync_file_range` nor `BLKFLSBUF` asks the device for that flush,
+and a read of the written bytes can be served from the same volatile cache, so
+none of them is a barrier on such a device.
+
+The flush defends against a cache that does not exist with `O_DIRECT` on an io2
+Multi-Attach volume: the page cache is bypassed on every node, and the volume
+acknowledges a write only once it is durable and visible to every attached
+instance. The barriers are therefore behind `--write-barriers`, off by default,
+and forced on without `O_DIRECT`, where the page cache does hold data back.
 
 They stay as a flag rather than being removed, because the assumption that makes
 them unnecessary is about one kind of device. A device that acknowledges into a
 volatile write cache still needs them, and only the operator knows which device
-is in use. When they are on, the readback is one sector rather than the whole
-write: nothing compares the bytes, so what matters is the round trip, and one
-sector gives that as well as 128 KiB does.
+is in use. A buffered flush issues one `fdatasync` after all its runs are
+written rather than one per run: the flush covers everything the descriptor has
+completed, so further calls would only add device round trips.
 
 ## No write-ahead log for reserved blocks
 

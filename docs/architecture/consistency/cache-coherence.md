@@ -34,7 +34,8 @@ write only once it is durable and visible to every attached instance, so EtcFS
 by default does nothing more.
 
 For a device that acknowledges writes into a volatile cache, `--write-barriers`
-adds three steps around each write and one before each read (below). Buffered
+adds a device cache flush after each write and a buffer-cache flush before each
+read (below). Buffered
 mode (`--allow-buffered-io`) always turns them on, because there the page cache
 does hold bytes back.
 
@@ -48,12 +49,10 @@ The inode lock decides who may read and write (see
 1. Take the inode's exclusive lock (a map lookup if this node already holds it).
 2. Reserve blocks from the arena allocator.
 3. Copy the data into an aligned buffer and write it with `O_DIRECT` `pwrite`.
-4. With `--write-barriers`:
-   1. `BLKFLSBUF` ioctl, which makes the driver send a Flush command to the NVMe
-      controller;
-   2. `sync_file_range` of the written range;
-   3. read one sector back. The bytes are not compared; the read only makes
-      sure a full round trip to the device has completed after the flush.
+4. With `--write-barriers`, `fdatasync` the device descriptor once all the
+   write's runs are written. On a block device this writes back any dirty page
+   cache and sends the device a cache flush, so the bytes are on stable media
+   before step 5 names them.
 5. Publish the new extents and size to etcd, or buffer them for a later flush
    (see [Consistency and Durability](consistency-and-durability-model.md#durability-under-write-delegation)).
 6. Release the node-local lock. The etcd lock key stays cached until another

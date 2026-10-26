@@ -90,7 +90,10 @@ is misaligned. Callers on the data path avoid this by copying data into
 aligned buffers padded to whole blocks, and by reading into an aligned buffer
 before copying out the requested bytes.
 
-`Device.SyncRange(offset, length)` calls `sync_file_range` for one byte range.
+`Device.Sync()` calls `fdatasync` on the device descriptor. On a block device
+that writes back any dirty page cache and then sends the device a cache flush,
+which is what makes a write acknowledged into a volatile cache durable;
+`O_DIRECT` and `sync_file_range` reach the device but never ask for that flush.
 
 ## Data Durability
 
@@ -98,8 +101,8 @@ On a volume that acknowledges an `O_DIRECT` write only once it is durable and
 visible to the other attached nodes, the completed `pwrite` is enough, and no
 extra flush is needed. EtcFS assumes this by default.
 
-`--write-barriers` adds, after every write, a device flush, a `sync_file_range`
-of the written range and a read-back; and a device flush before every read. It
+`--write-barriers` adds one `Device.Sync()` after the data of every write (or of
+every run of a buffered flush) is written, and a `BLKFLSBUF` before every read. It
 is for devices with a volatile write cache, and it is always on in buffered
 mode.
 
@@ -107,7 +110,7 @@ Whichever is used, the data reaches the device before the extent that points to
 it is committed to etcd:
 
 1. write the data to the device;
-2. (with barriers) flush and sync the range;
+2. (with barriers) `fdatasync` the device;
 3. commit the extent to etcd.
 
 If the node crashes between 1 and 3, the bytes are on the device but no extent

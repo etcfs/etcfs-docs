@@ -43,8 +43,10 @@ stores no data. This is for testing metadata operations only.
 1. **Reserve blocks** from the arena allocator. They are marked allocated in this
    node's bitmap. No other node knows about them.
 2. **Write the data** to the reserved blocks with `pwrite()` (`O_DIRECT`).
-3. **(With `--write-barriers`) flush the device and sync the range.** Without
-   barriers, the completed `O_DIRECT` write is taken as durable.
+3. **(With `--write-barriers`) `fdatasync` the device**, once after all the
+   runs are written, which sends the device a cache flush. A failed flush fails
+   the write and nothing is committed. Without barriers, the completed
+   `O_DIRECT` write is taken as durable.
 4. **Commit the extent to etcd**, in a transaction carrying the generation guard.
    If the node has been fenced since it started, the transaction fails.
 

@@ -276,7 +276,8 @@ an acknowledged write is as durable as the system can make it:
 1. Allocate blocks from the node's own arena (in memory, no etcd).
 2. `pwrite()` the data with `O_DIRECT`. On a volume that acknowledges a write
    only when it is durable, the data is durable here. `--write-barriers` covers
-   devices with a volatile write cache.
+   devices with a volatile write cache by adding an `fdatasync` of the device
+   before step 3.
 3. Commit the extent and any size change to etcd. **This is when the bytes
    become part of the file.**
 4. Reply to the kernel; `write()` returns.
