@@ -103,6 +103,8 @@ first write, which almost always follows a create.
 
 - `EEXIST`: the name already exists. The application sees this as `open()`
   with `O_CREAT | O_EXCL` finding an existing file.
+- `ENOENT`: the parent directory was removed, on this node or another, after
+  the kernel resolved it.
 - `ENOSPC`: no inode number could be reserved.
 - `EIO`: the transaction could not reach etcd (connection or quorum lost).
 
@@ -383,6 +385,18 @@ in the meantime. A failed condition is not an error: the write re-reads the
 extents from the etcd leader and tries again. New extents are written with
 `CreateRevision == 0`, so a stale list also cannot make two writes use the same
 chunk key.
+
+**A failed condition can also mean the write already landed.** A commit that
+times out may have been applied with only the reply lost, and the retry then
+fails `CreateRevision == 0` on the keys the first attempt created. Proposing
+again would publish the same blocks under a new chunk and free the first chunk
+as covered, so a published extent would name blocks on the free list. Before
+proposing again, the write compares the re-read list with what it proposed; if
+every extent it proposed is there with the same value, the commit is adopted as
+its own. A commit that still fails after the retries returns `EIO` and keeps the
+write's blocks allocated, since it may have been applied: freeing them would let
+the next write overwrite a file etcd says owns them. If it was not applied, the
+free list rebuilt from etcd at the next start reclaims them.
 
 After the commit, the daemon applies the transaction's own operations to the
 cached list to produce the new cached copy, with the revisions etcd assigned,

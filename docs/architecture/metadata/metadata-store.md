@@ -83,7 +83,9 @@ adds context to errors, and turns a missing key into a `nil` result.
   read costs a round trip to the etcd leader. A serializable read, served by any
   member and possibly slightly behind, is used only where something else
   already guarantees the result is current:
-  - extent reads on the data path, because the inode lock keeps writers away;
+  - extent reads on the data path, because the inode lock keeps writers away
+    (a snapshot older than the latest revision the store has seen committed,
+    such as the lock acquisition, is read again linearizably);
   - the extent list a write plans from, because the write's own transaction
     rechecks every key it depends on.
 

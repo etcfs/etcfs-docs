@@ -109,13 +109,17 @@ anywhere in its own time interval, as linearizability requires, without
 contacting etcd.
 
 **A serializable metadata read is still correct.** On a cache miss, the record
-and extents are read serializably from the local etcd member, which could in
-principle lag behind. It cannot miss a relevant write:
+and extents are read serializably from the local etcd member, which can lag
+behind: a follower that has not yet applied the latest entries, or one cut off
+from the leader, still answers serializable reads. It cannot miss a relevant
+write:
 
-- the lock acquisition before it is a transaction, which the local member must
-  have applied before answering;
+- the store records the highest revision it has seen committed, which includes
+  the lock acquisition before the read;
+- a snapshot whose revision is below that is read again linearizably, so the
+  answer reflects at least the acquisition;
 - any write committed before that acquisition has a lower revision, so the
-  local member has applied it too;
+  answer includes it too;
 - no write can happen after it while this node holds the lock.
 
 **What is not covered:**

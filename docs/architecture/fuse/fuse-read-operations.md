@@ -197,7 +197,7 @@ The kernel sends READ when an application reads file data and the data is not in
 **2. Read the inode record and the extents.** The record gives the file's size, used to shorten a request that goes past the end. The extents (`extent:<ino>/<chunk>`) say where each range of the file is on the device.
 
 - If this node already held the lock, both come from the copy cached with the lock, and the read makes no etcd request (see [Lock Caching](../metadata/lock-caching.md)).
-- Otherwise they are read in one serializable transaction (`Store.GetInodeAndExtents`), so the read costs one round trip and sees both at the same revision. A serializable read is enough because the shared lock, not etcd's ordering, is what keeps a writer off the file.
+- Otherwise they are read in one serializable transaction (`Store.GetInodeAndExtents`), so the read costs one round trip and sees both at the same revision. A serializable read is enough because the shared lock, not etcd's ordering, is what keeps a writer off the file, provided the answering member has applied the lock acquisition. The store remembers the highest revision it has seen committed, and a snapshot older than that is read again linearizably.
 
 **3. Clamp the request** to the file size from the record. The kernel usually does this itself, but not always. A request past the end that was not clamped would come back as a buffer of zeroes, and the application would not get the short read that tells it the file has ended.
 

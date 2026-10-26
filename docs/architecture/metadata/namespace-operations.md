@@ -107,9 +107,10 @@ Creating a regular file is one transaction:
 
 1. **Comparison 1:** `CreateRevision(dirent:parent/name) == 0` — the name must not already exist in the parent directory
 2. **Comparison 2:** `CreateRevision(inode:ino) == 0` — the inode number must not already be allocated
-3. **Success operations:** Insert the dirent key with the inode number as its value; insert the inode key with the new inode record
+3. **Comparison 3:** `CreateRevision(inode:parent) != 0` — the parent directory must still exist. The parent was resolved before the transaction, and an `rmdir` on another node can commit in between; without this, the new name and inode would sit under a deleted directory, unreachable from the root and counted as referenced by the orphan checks. Only existence is compared, so unrelated creates in one directory still never abort each other. The root is exempt, since a filesystem may be seeded without an etcd record for it and it is never removed.
+4. **Success operations:** Insert the dirent key with the inode number as its value; insert the inode key with the new inode record
 
-If either comparison fails (the name exists, or another create took the inode number), nothing is written and an error is returned.
+If a comparison fails (the name exists, another create took the inode number, or the parent is gone), nothing is written and an error is returned: `EEXIST` or `ENOENT`.
 
 The other creating operations differ only in what they add:
 
@@ -133,7 +134,7 @@ The TLA+ model shows why the delete matters. Without it no safety property break
 
 ## Atomic Link
 
-`AtomicLink` adds another name for an existing inode. The new entry and the raised link count commit together, on two conditions: the new name is free, and the inode is unchanged since its count was read. If either fails nothing is written, so a link refused with `EEXIST` cannot leave the count too high.
+`AtomicLink` adds another name for an existing inode. The new entry and the raised link count commit together, on two conditions: the new name is free, and the inode is unchanged since its count was read. Like a create, it also requires the parent directory to still exist. If any fails nothing is written, so a link refused with `EEXIST` cannot leave the count too high.
 
 Hard links to directories are refused with `EPERM`. They would allow a cycle that no unlink could break, and POSIX allows filesystems to refuse them.
 
@@ -181,7 +182,7 @@ If the replaced inode is a symlink, its target key is deleted in the same transa
 
 Some renames are refused: `RENAME_EXCHANGE`, a directory over a non-directory or the reverse, a non-empty directory as the target, and a destination inside the directory being moved. See [FUSE Write Operations](../fuse/fuse-write-operations.md#rejected-renames) for the error each returns and why.
 
-A rename between directories changes every key in one transaction. When two renames compare a key the other writes (the same source or target name, or the same parent directory), etcd orders them: the first commits and the second fails its comparison. The check that the destination is not inside the directory being moved is a read made before the transaction and is not repeated as a comparison, so two directory renames into each other's subtrees, which share no compared key, can both commit.
+A rename between directories changes every key in one transaction. When two renames compare a key the other writes (the same source or target name, or the same parent directory), etcd orders them: the first commits and the second fails its comparison. A directory rename also checks that the destination is not inside the directory being moved, by walking the parent chain from the destination up to the root before the transaction. Every dirent on that path is pinned in the transaction at the revision the walk read. Two directory renames into each other's subtrees share no source, target or parent key, but each one's commit changes a dirent on the other's path, so the second fails its comparison instead of making the two directories each other's parent. The destination directory must also still exist, as for a create.
 
 ## Directory Listing
 

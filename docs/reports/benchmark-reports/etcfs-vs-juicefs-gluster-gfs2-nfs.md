@@ -77,11 +77,13 @@ seconds, twice in two attempts: the mount answered `ECONNABORTED`, then
 `ENOTCONN`, and `etcfuse` logged `daemon exited with error -9` after `writing
 device: Bad file descriptor`. The metadata daemon stayed up. The thread-exit
 destructor for each worker's IPC connection (`ipc_fd_destroy`,
-`pkg/fuse/fuse.c`) closes the thread-local value as stored, which is the
-descriptor plus one, so a worker that exits closes an unrelated descriptor —
+`pkg/fuse/fuse.c`) closed the thread-local value as stored, which is the
+descriptor plus one, so a worker that exited closed an unrelated descriptor —
 another worker's IPC socket or its cloned `/dev/fuse` handle. Bursty async I/O
 is what makes libfuse spawn and retire extra workers, which is why only this job
-hits it.
+hit it. The destructor now subtracts the offset (etcfs commit `ddea391`, covered
+by the C unit test `test_a_retiring_thread_closes_only_its_own_connection`); the
+depth-32 row awaits a rerun on a build with that fix.
 
 **The read column is not comparable across backends and should not be read as
 one.** nfs's 44.5k and juicefs's 69.2k read IOPS are client page-cache hits on a
