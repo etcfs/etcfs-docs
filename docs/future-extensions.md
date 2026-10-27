@@ -11,6 +11,8 @@ decision rather than a surprise.
 ## Table of Contents
 
 - [Backup and Restore from the Revision Log](#backup-and-restore-from-the-revision-log)
+- [Several Shared Volumes](#several-shared-volumes)
+- [Sharding the Metadata Across Several etcd Clusters](#sharding-the-metadata-across-several-etcd-clusters)
 - [Known Ceilings](#known-ceilings)
 
 ## Backup and Restore from the Revision Log
@@ -87,6 +89,68 @@ means holding space proportional to churn, a durable pin record the arena
 rebuild respects, a scrubber that knows the floor, and etcd compaction held
 back indefinitely. Freeing blocks promptly is worth more than time travel. See
 [Design Decisions](design-decisions.md).
+
+## Several Shared Volumes
+
+Capacity and IOPS are bounded by one io2 volume. Attaching several, each to every
+node, keeps the property the design rests on: any node reads any file's bytes
+directly from the device, without involving the node that wrote them.
+
+The addressing change is contained. An extent names a device offset; it would
+name a volume and an offset. Arenas would be numbered per volume, and the
+allocator, the ownership records and the bitmap rebuild would work per volume
+as they do now.
+
+Fencing is the hard part. An arena may change owner only after the device has
+cut its old owner off, so a fence must cover every volume: one reservation
+removal or one detach each. A fence that succeeds on some volumes and fails on
+others may release only the arenas on the volumes it fenced, and the fencing
+controller would have to record which those are. The controller and the TLA+
+model of the fencing protocol both assume one device, so both need extending
+before the allocator does.
+
+Multi-Attach still limits each volume to 16 instances in one availability zone,
+so this raises capacity and throughput, not cluster size.
+
+One private disk per node is a different design, not a variant of this one.
+Other nodes could no longer read a file's bytes from the device, so every
+cross-node read would go through the owner over the network, and a node's
+failure would make its files unreadable rather than only unwritable.
+
+## Sharding the Metadata Across Several etcd Clusters
+
+All metadata lives in one etcd cluster, which is one Raft group. That is what
+makes every namespace operation a single atomic transaction, a cross-directory
+rename included. It also bounds the filesystem: the file count by the size of
+one etcd keyspace, and the metadata write rate by the commit rate of one Raft
+log.
+
+Splitting the keyspace across several etcd clusters removes both bounds and
+gives up the single transaction. The choices are in how the keys are split:
+
+- **By subtree.** Each top-level directory, or each mount, lives in one
+  cluster. Almost every operation stays within one cluster and keeps its
+  current transaction. A rename between subtrees either returns `EXDEV`, as a
+  rename between two filesystems does, or needs a commit protocol across
+  clusters.
+- **By inode number.** Load spreads evenly, but a create (the parent's entry
+  and the child's inode), a hard link and most renames touch two clusters, so
+  most namespace operations need that commit protocol.
+
+A commit protocol across clusters is two-phase commit: intents written in each
+cluster, a decision recorded durably, intents resolved after a crash. It is the
+machinery the single Raft group was chosen to avoid.
+
+The safety mechanisms are per cluster too. The generation guard compares
+`gen:<node>` in the cluster that runs the transaction, so a fence must raise the
+generation in every cluster before any of the node's arenas can be released, and
+a fence that reaches only some clusters must not count as complete. Membership
+and leases would live in one cluster that the others consult. Revisions are
+per cluster, so incremental backup by revision diff, which relies on one total
+order, would need a cut that is consistent across clusters.
+
+Splitting by subtree with `EXDEV` across subtrees keeps every invariant of a
+single cluster inside each subtree, and is the variant to build first.
 
 ## Known Ceilings
 
