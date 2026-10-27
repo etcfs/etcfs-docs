@@ -20,7 +20,7 @@ Split-brain means two nodes each believing they may write the same data. The wat
 
 The fencing protocol has three layers:
 
-1. **Self-fencing** (this component) — local detection, no network calls; fires 2–3 × TTL after the lease is lost, after the external fence has started.
+1. **Self-fencing** (this component) — local detection, no network calls; fires 2–2⅓ × TTL after the lease is lost, after the external fence has started.
 2. **External fencing** — distributed detection, cloud API calls; starts when etcd expires the lease (1 × TTL plus watch latency).
 3. **Generation guards** — metadata-layer CAS protection, prevents any residual writes from committing to etcd even if both previous layers failed.
 
@@ -58,7 +58,7 @@ The watchdog does not fence the node from outside: it calls no cloud API and cha
 
 The watchdog polls the health of the membership lease by calling `IsAlive()` on the membership layer. `IsAlive()` returns `true` as long as the node's keepalive stream to etcd is active and the lease is being refreshed.
 
-The polling interval is set to the lease TTL (configurable with `--lease-ttl`, default 10s). This means the watchdog checks once per TTL whether the lease is still alive.
+The polling interval is a third of the lease TTL (configurable with `--lease-ttl`, default 10s), so the watchdog checks three times per TTL whether the lease is still alive. Each check is a mutex-protected read, so the shorter interval costs nothing measurable.
 
 ### The Two-TTL Margin
 
@@ -68,11 +68,9 @@ The watchdog does not fence as soon as `IsAlive()` returns false. It waits until
 - **Second TTL gap:** If the stream hasn't re-established within one full TTL, the lease is now past its expiry point in etcd. The etcd cluster will have deleted the membership key. The watchdog waits one more TTL to confirm the condition is persistent.
 - **After 2 × TTL:** The watchdog triggers self-fence.
 
-**The watchdog fires 2–3 × TTL after the lease is lost, not exactly 2 × TTL.** 2 × TTL is the threshold, but `Run` checks it only once per TTL, on a timer. A lease that passes the threshold just after a check is noticed one TTL later. On a partitioned node with a 10 s TTL, this took 22.98 s in one run and about 30 s in another; the difference is only where the check fell. Use 3 × TTL as the bound when reasoning about how long a dead node can keep writing.
+**The watchdog fires 2–2⅓ × TTL after the lease is lost, not exactly 2 × TTL.** 2 × TTL is the threshold, but `Run` checks it only every TTL/3, on a timer. A lease that passes the threshold just after a check is noticed up to a third of a TTL later. Use 2⅓ × TTL as the bound when reasoning about how long a dead node can keep writing.
 
-Checking more often would shorten this, but the generation guard on every etcd transaction already rejects the node's metadata once it has been fenced (see [Fencing Generation Protocol](fencing-generation-protocol.md)), so a faster check would only narrow a window that is already covered.
-
-With the default 10 s TTL, a node fences itself 20–30 s after losing its lease. In that time it could still write to the device while the cluster already treats it as dead.
+With the default 10 s TTL, a node fences itself 20–23.3 s after losing its lease. In that time it could still write to the device while the cluster already treats it as dead.
 
 ### How lease death is detected
 
@@ -149,7 +147,7 @@ The self-fencing watchdog and the external fencing controller form a two-layer d
 
 | Layer | Trigger | What it does | Latency |
 |---|---|---|---|
-| Self-fencing (watchdog) | Local lease health poll | Exit process (code 77) | 2–3 × TTL (~20–30s at the default TTL=10s) |
+| Self-fencing (watchdog) | Local lease health poll | Exit process (code 77) | 2–2⅓ × TTL (~20–23s at the default TTL=10s) |
 | External fencing (controller) | etcd watch on membership key deletion | Generation bump | TTL + watch latency |
 
 The watchdog does not close the device descriptor or unmount anything itself. `trigger()` sets the flag, closes the channel and logs; `main` does the rest, and the descriptor is closed when the process exits. Writes already passed to the kernel are therefore not cancelled. They complete, but once the generation guard rejects their metadata commit, no extent refers to them (see [Kleppmann's Stale-Write Hazard](../storage/kleppmann-stale-write-analysis.md)).
@@ -168,6 +166,6 @@ See [External Fencing Controller](external-fencing-controller.md), `pkg/fencing/
 
 | Parameter | Default | Description |
 |---|---|---|
-| `lease_ttl` | 10s (`--lease-ttl`) | The TTL of the etcd membership lease. Also the watchdog's poll interval, the staleness threshold `IsAlive()` compares the last keepalive against, and the unit of the fence margin below — all four are this one value. |
-| fence margin | 2 × TTL (hard-coded) | The lease must be dead longer than this before the watchdog fires. **Not configurable**: `NewWatchdog(membership, leaseTTL)` takes no margin parameter, and the factor lives in `config.SelfFenceWindow`, which returns `2 * leaseTTL`. Because the check only runs on a poll tick, the effective latency is 2–3 × TTL. |
+| `lease_ttl` | 10s (`--lease-ttl`) | The TTL of the etcd membership lease. Also the staleness threshold `IsAlive()` compares the last keepalive against and the unit of the fence margin below; the watchdog polls every third of it. |
+| fence margin | 2 × TTL (hard-coded) | The lease must be dead longer than this before the watchdog fires. **Not configurable**: `NewWatchdog(membership, leaseTTL)` takes no margin parameter, and the factor lives in `config.SelfFenceWindow`, which returns `2 * leaseTTL`. Because the check only runs on a poll tick every TTL/3, the effective latency is 2–2⅓ × TTL. |
 | `exit_code` | 77 | The process exit code when self-fence triggers. Used by deployment infrastructure to distinguish self-fence from crash. |

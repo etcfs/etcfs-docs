@@ -152,7 +152,7 @@ symmetry reduction is unsound for some temporal properties.
 
 ## What is deliberately not modelled
 
-- **Real time.** TLA+ has no clock, so the watchdog's 2–3× lease-TTL margin
+- **Real time.** TLA+ has no clock, so the watchdog's 2–2⅓× lease-TTL margin
   becomes "may fire at any point after the lease is lost". The bound is
   measured by the chaos suite; the spec checks the ordering.
 - **etcd itself.** Transactions are assumed linearizable and CAS atomic.

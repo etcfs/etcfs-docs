@@ -175,8 +175,10 @@ working for, or about, a node that is already fenced:
   the value it changes would make fencing impossible.
 - `RecordFenceIntent`, `ClaimFence`, `MarkFenceComplete`
   (`pkg/metadata/fence.go`): the controllers' records about a node being fenced.
-- `ReleaseArenaID`, `ClaimFreeArena` (`pkg/metadata/arena.go`): a fenced node
-  must still be able to give its arenas back, and a survivor to reuse them.
+- `ReleaseArenaID` (`pkg/metadata/arena.go`): a fenced node's arenas must
+  still be given back, often by a fencing controller acting on its behalf.
+  Claiming an arena (`ClaimFreeArena`) is guarded: taking space is not giving
+  it back.
 - `AnnounceLockWant` (`pkg/metadata/lock.go`): a request for a lock changes no
   filesystem state, and the acquisition it leads to is guarded as usual.
 

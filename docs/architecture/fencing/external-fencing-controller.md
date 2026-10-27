@@ -249,11 +249,11 @@ The self-fencing watchdog and the external fencing controller operate independen
 | Scenario | Watchdog | Controller | Outcome |
 |---|---|---|---|
 | Crash (`SIGKILL`, power loss) | Does not run (process gone) | Sees the expiry, fences | Device cut off, generation raised |
-| Network partition from etcd | Stops the daemon after 2–3 × TTL | Sees the expiry, fences | Both act; the generation is raised once |
+| Network partition from etcd | Stops the daemon after 2–2⅓ × TTL | Sees the expiry, fences | Both act; the generation is raised once |
 | Process hung | Stops the daemon if its goroutine still runs | Sees the expiry, fences | Both act; the generation is raised once |
 | Node can write to the device but not reach etcd | Stops the daemon | Cuts the device off, raises the generation | Device writes and metadata commits both stopped |
 
-The controller usually acts first: the membership lease expires after one TTL (10 s by default), while the watchdog waits 2–3 TTLs. The watchdog is the one that still works when the controllers cannot act on the node, for example when no other node can reach etcd either.
+The controller usually acts first: the membership lease expires after one TTL (10 s by default), while the watchdog waits 2–2⅓ TTLs. The watchdog is the one that still works when the controllers cannot act on the node, for example when no other node can reach etcd either.
 
 ## Recovering a Fenced Node
 

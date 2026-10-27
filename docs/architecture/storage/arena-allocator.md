@@ -91,24 +91,30 @@ When a node needs more disk space (its current arena is full, or it has no arena
 ### Claiming a Freed Arena
 
 ```
-ClaimFreeArena():
+ClaimFreeArena(nodeID):
   for each key in GetPrefix("free_arena:"):
-    Txn:
-      If CreateRevision(key) != 0:
-        Delete(key)             // the delete *is* the claim
+    owner = "arena:<nodeID>/<arenaID(key)>"
+    Txn (generation-guarded):
+      If CreateRevision(key) != 0 AND CreateRevision(owner) == 0:
+        Delete(key)                       // the delete *is* the claim
+        Put(owner, encode(arenaID(key)))  // ownership in the same commit
         return arenaID(key), claimed
       Else:
-        try the next candidate  // another node claimed it first
+        try the next candidate            // another node claimed it first
   return not-claimed
 ```
 
 The delete is conditioned on the key still existing, so when several nodes reach for the same freed arena exactly one wins and the losers move on. A plain read-then-delete would hand the same arena to two nodes, which is the one outcome the arena scheme exists to prevent.
 
+The ownership record is written in the same transaction as the delete. Split across two, a crash between them would leave the arena neither free nor owned, and nothing would ever hand it out again.
+
+The transaction carries the node's fencing-generation guard like every other metadata mutation. A fenced node's claim is rejected with `ErrFenced` and the arena stays in the pool; the allocator returns that error rather than falling back to a new arena, which the guard would refuse the same way.
+
 A freed arena is not necessarily an empty one. An arena released because its owner emptied it holds nothing, but one released by a departing or fenced node still holds whatever extents its files have, and the claimer cannot tell the two apart. A node that claims a recycled arena therefore rebuilds the arena's bitmap from the live extents in etcd (the same scan `Reconstruct` performs at startup) before allocating from it; a brand-new arena, which no node has ever owned, starts from an all-zero bitmap.
 
 **A new arena that would not fit on the device is refused.** An arena's offset is its ID times the arena size, and nothing else stops it from running past the end of the device. The allocator knows the device size, and returns `ENOSPC`. Otherwise the `pwrite` would fail with a short write or `EINVAL`, which the application would see as `EIO`, a disk error, instead of a full filesystem. The refused ID is not returned to the pool. The device has no room left for anyone until it is grown, and `fsck` reports the unowned ID as an orphaned arena.
 
-**If claiming a recycled arena fails**, for example because etcd did not answer, the allocator takes a new arena instead. That uses more of the device but always works, and is better than failing the write with an I/O error.
+**If claiming a recycled arena fails** for any reason other than a fence, for example because etcd did not answer, the allocator takes a new arena instead. That uses more of the device but always works, and is better than failing the write with an I/O error.
 
 ### Allocating a New Arena
 
@@ -145,7 +151,7 @@ recordOwnership(nodeID, arenaID):
 
 The compare-and-swap on the counter gives each arena ID to one node only. If two nodes advance it at once, one succeeds, and the other retries with the next value.
 
-Recording ownership is a second compare-and-swap, requiring that `arena:<nodeID>/<arenaID>` does not exist yet. If it already exists, the ID was handed out twice, which is a bug elsewhere rather than contention, so the error is returned instead of retried.
+Recording ownership is a second compare-and-swap, requiring that `arena:<nodeID>/<arenaID>` does not exist yet. If it already exists, the ID was handed out twice, which is a bug elsewhere rather than contention, so the error is returned instead of retried. A crash between the two steps leaves an ID that was drawn from the counter but never owned; it holds no data, and `fsck` reports it as an orphaned arena. A recycled arena skips this step, because `ClaimFreeArena` already wrote its record.
 
 An io2 Multi-Attach volume can be up to 64 TiB, which is 65,536 arenas of 1 GiB; the 64-bit counter is far from its limit.
 
@@ -218,7 +224,7 @@ Arenas must be given back, or every node that leaves, cleanly or not, would keep
 
 - `Store.ReleaseArenaID(ctx, nodeID, arenaID)` moves one arena from `arena:<node_id>/<arena_id>` to `free_arena:<arena_id>` in one transaction. Doing it in two steps could leave an arena both owned and free, and it could then be given to a second node.
 - `Store.ReleaseArena(ctx, nodeID)` releases *every* arena the node owns, each in its own transaction, so one arena released concurrently by someone else does not stop the others.
-- `ClaimFreeArena` (above) takes an arena back out of the free pool.
+- `ClaimFreeArena` (above) takes an arena back out of the free pool and records its new owner in one guarded transaction.
 
 An arena can be released only when its owner can no longer write to it. Release happens in three places, each with its own proof of that:
 
