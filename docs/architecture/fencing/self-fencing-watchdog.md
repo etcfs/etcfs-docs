@@ -20,8 +20,8 @@ Split-brain means two nodes each believing they may write the same data. The wat
 
 The fencing protocol has three layers:
 
-1. **Self-fencing** (this component) — local detection, no network calls, fires first.
-2. **External fencing** — distributed detection, cloud API calls, fires second.
+1. **Self-fencing** (this component) — local detection, no network calls; fires 2–3 × TTL after the lease is lost, after the external fence has started.
+2. **External fencing** — distributed detection, cloud API calls; starts when etcd expires the lease (1 × TTL plus watch latency).
 3. **Generation guards** — metadata-layer CAS protection, prevents any residual writes from committing to etcd even if both previous layers failed.
 
 The watchdog runs inside `etcfuse-meta`, the process that does the device I/O, and depends on nothing outside it except the lease renewal stream to etcd.
@@ -158,7 +158,7 @@ If the watchdog does not fire (for example, the daemon is stuck in a loop), the 
 
 **How strong the external fence is depends on the flags:**
 
-- **`--nvme-reservations`:** another node removes this node's NVMe reservation key, and from then on the device itself rejects this node's writes with `EBADE`. The watchdog is then no longer the only thing between a partitioned node and the disk; it frees resources and limits how long a stuck request can block. It is still the faster of the two, and the only one that acts when the node's own kernel is the problem.
+- **`--nvme-reservations`:** another node removes this node's NVMe reservation key, and from then on the device itself rejects this node's writes with `EBADE`. The watchdog is then no longer the only thing between a partitioned node and the disk; it frees resources and limits how long a stuck request can block. It is the only one that acts when the node's own kernel is the problem.
 - **`--ebs-volume-id`:** the controller calls `ec2:DetachVolume`, polls `ec2:DescribeVolumes` until the attachment is gone, and only then raises the generation. The detach is confirmed, but the device does not reject writes already in flight.
 - **Neither** (Docker, bare metal, or a node whose instance ID was never recorded): the controller raises the generation as soon as the lease expires.
 
