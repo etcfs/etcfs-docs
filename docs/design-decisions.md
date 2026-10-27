@@ -260,11 +260,18 @@ None of this is unreasonable to build. It is simply an allocator project with a
 coordination protocol attached, not a read pinned to a revision, and the
 metadata half being nearly free is what makes it look otherwise.
 
-## Arena rebalancing is not wired up
+## Arenas are never taken from a live node
 
-`RebalanceArena` stays harness-only. Imbalance has not been observed at the
-cluster sizes this runs at, and the trigger condition and manual-vs-automatic
-posture would have to be decided before the mechanism means anything.
+An arena moves to another node only through the free pool, and only when its
+owner has emptied it, left cleanly, or been fenced at the device. Moving one
+away from a live node by rewriting its ownership record cannot be made safe:
+both nodes hold current generations, so the generation guard rejects neither,
+and a raised generation alone does not stop the old owner's writes to the
+device. The cost is that free space inside one node's partly used arenas is
+unavailable to the others, so a node can get `ENOSPC` before the device is full.
+Imbalance has not been observed at the cluster sizes this runs at; the remedy
+that keeps one writer per range is the owner emptying an arena by relocating its
+files and then releasing it.
 
 ## Verification runs
 

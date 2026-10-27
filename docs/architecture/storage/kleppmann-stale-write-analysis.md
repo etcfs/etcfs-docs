@@ -118,17 +118,8 @@ with an io2 Multi-Attach volume.
 
 ## Remaining Exposure
 
-Three ways to break the arena property remain, with what currently prevents
+Two ways to break the arena property remain, with what currently prevents
 each:
-
-**Moving an arena between nodes.** `RebalanceArena`
-(`pkg/membership/membership.go`) moves an arena from one node to another in one
-transaction, and refuses unless the source node has been fenced (its
-generation is above 0). A raised generation proves the source can no longer
-commit metadata, but not that its kernel has stopped writing to the device, so
-invariant 4 below is only fully met on a cluster with NVMe reservations, where
-the reservation removal that precedes the generation bump is that proof.
-`RebalanceArena` is only called from tests.
 
 **Reads do not check the generation stamp.** Each extent records its writer's
 generation, and the scrubber checks it periodically

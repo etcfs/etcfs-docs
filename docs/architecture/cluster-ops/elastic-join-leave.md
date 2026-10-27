@@ -186,23 +186,19 @@ The next node that needs space claims a released arena; see
 
 ## Arena Rebalancing
 
-`RebalanceArena` (`pkg/membership/membership.go`) moves an arena from one node to
-another in one transaction. It refuses unless the source node has been fenced
-(its generation is above 0): moving an arena away from a healthy node would
-leave two nodes, neither fenced, able to write into the same range, and no
-guard would stop them.
+There is no operation that moves an arena away from a live node. Both nodes
+would hold current generations, so no guard could reject either of them, and
+they could write into the same range. An arena changes owner only through the
+free pool: after its owner empties it (`ReleaseEmptyArenas`), on a clean
+departure, or after a device-enforced fence (see
+[Arena Allocator § Arena Release](../storage/arena-allocator.md#arena-release)).
 
-A raised generation proves that the source can no longer commit metadata, but
-not that its kernel has stopped writing to the device. Rebalancing is therefore
-only fully safe on a cluster with NVMe reservations, where the fence that raised
-the generation was enforced by the device. `RebalanceArena` is called only from
-tests.
-
-Rebalancing moves no data. Existing extents keep pointing to the same device
-offsets; only the owner changes. The new owner rebuilds the arena's bitmap from
-the extents in etcd before allocating from it. Calling `RebalanceArena` twice
-with the same arguments fails the second time, because the source no longer owns
-the arena.
+Free space can therefore be stranded. Once every node's arenas are partly used,
+a node that needs a new arena on a device with no room for one gets `ENOSPC`,
+although other nodes' arenas still hold free blocks. The safe remedy is for the
+owner to give space away: relocate the few live files out of a mostly free
+arena into its other arenas, then release the emptied arena. It is not
+implemented.
 
 ## Concurrent Joins
 
