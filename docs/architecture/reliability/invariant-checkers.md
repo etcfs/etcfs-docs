@@ -100,39 +100,42 @@ The simulator does not implement the full arena allocator (bitmap, free-list, et
 
 ## Generation Staleness Detection
 
-Every extent carries a fencing generation stamp. The generation checker verifies that no extent's generation is less than the current generation of the node that wrote it. A stale generation indicates a post-fence write that should have been rejected.
+This check is not part of the simulator; it runs in the scrubber and `fsck` (`scrub.CheckGenerationConsistency`). Every extent carries the fencing generation of the node that wrote it, and the check compares that stamp against the writer's current `gen:<node>` value.
 
 ### Algorithm
 
 ```
-current_gen = GetGeneration(ctx, nodeID)
 for each extent key:
-    if extent.generation < current_gen:
-        report GENERATION MISMATCH: extent at disk_off=X stamped gen=Y, expected <current_gen>
+    current_gen = gen:<extent.writer>
+    if extent.generation > current_gen:
+        report GENERATION MISMATCH
 ```
+
+A stamp *below* the writer's current generation is not reported: every extent written before a fence carries one.
 
 ### When It Triggers
 
-- **Missed generation guard.** If a mutation transaction forgot to include `WithGenerationGuard`, a post-fence extent could be committed to etcd without the generation check. The scrubber's generation checker is the second line of defence that detects this.
-- **Generation counter rollover or reset.** If the generation key is deleted or reset to a lower value (which should not happen in normal operation), extents with older stamps are flagged.
-- **Cross-node generation mismatch.** In a multi-node scenario, a node that restarts with a stale generation (its generation key in etcd was bumped by the fencing controller while it was down) will have all its pre-fence extents flagged.
+- **A guard that admitted a write.** A stamp above the writer's generation is unreachable through the guarded write path.
+- **Generation counter reset.** Deleting or lowering `gen:<node>` by hand leaves that node's existing extents stamped above the counter.
+
+It cannot detect a write that passed a broken guard with an old stamp, which looks like any write made before a fence.
 
 ## Multi-Checker Integration
 
-The checkers are composed into a single `checkInvariants` method that runs every checker after every operation. The method returns an integer count of violations found:
+The simulator composes its checkers into a single `checkInvariants` method that runs after every operation and returns the number of violations found:
 
 ```
 v = 0
 v += checkNlinkConsistency()
 v += checkInodeExistence()
-v += checkExtentCollisions()   // scrubber
-v += checkGenerationStaleness() // scrubber
 return v
 ```
 
+Extent collision and generation checks are not in the simulator; they run in `pkg/scrub` (the scrubber and `fsck`).
+
 The simulator's `Run` method calls `checkInvariants` after every operation. It accumulates the total violation count and returns it to the test. A test that expects 0 violations but gets 1 or more fails.
 
-The scrubber in production runs the same checks as a background pass. The harness checkers are structurally identical to the scrubber checks; they differ only in execution context (every-op vs periodic).
+The scrubber in production runs nlink and existence-style checks too, plus the extent checks the simulator lacks, as a background pass.
 
 ## Intentional Bug Detection
 
