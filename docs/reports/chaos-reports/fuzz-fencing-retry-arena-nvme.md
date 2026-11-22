@@ -20,6 +20,12 @@ one part of the fencing story Docker cannot exercise at all (a loopback device
 supports no NVMe reservation commands), so it is repeated on provisioned
 hardware whenever the fencing or commit path changes.
 
+It was re-run again on 2026-11-22 on `m7i.large` nodes, after the preempt was
+switched from plain Preempt to Preempt and Abort so that a fenced node's
+in-flight writes have completed before its arenas are released: 17 of 17. The
+run shows io2 Multi-Attach accepts the Preempt and Abort action; it does not
+exercise a write in flight at the moment of the preempt.
+
 ## Test areas
 
 ### integrity-fuzz.sh — randomized ops, no fault injection

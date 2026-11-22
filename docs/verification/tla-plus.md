@@ -159,6 +159,13 @@ symmetry reduction is unsound for some temporal properties.
   Those are the assumptions the design rests on, stated as such;
   [Porcupine](porcupine.md) checks the daemon's own use of them against
   recorded histories.
+- **Writes in flight at the device.** `FenceSever` cuts a node off in one
+  step: after it, no write from that node reaches the device, including one
+  already submitted. NVMe makes this true only for Preempt and Abort, whose
+  completion waits for the preempted host's in-progress commands; a plain
+  Preempt does not, and `pkg/nvmeresv` sends the former for that reason. EBS
+  detach gives no such guarantee: the controller waits for the detach to be
+  confirmed, but AWS documents no bound on I/O already in flight.
 - **Two controllers fencing one node concurrently.** The per-node
   `fence_claim` lease serialises them and `FenceBumpLostCAS` models the CAS
   losing, but two fully interleaved fence sequences for one node are not

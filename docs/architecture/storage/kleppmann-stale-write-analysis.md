@@ -37,7 +37,7 @@ On a traditional SAN the resource does enforce it. SCSI-3 Persistent Reservation
 
 EBS Multi-Attach `io2` volumes created after 18 September 2023 support the NVMe equivalent: the reservation commands Register, Acquire, Release and Report. One reservation type, **Write Exclusive – All Registrants**, fits this problem: every registered host may write at the same time, and any registered host can remove another.
 
-`pkg/nvmeresv` sends these commands as NVMe passthrough ioctls (there is no AWS API for them). At startup, each node registers a key derived from its node ID and joins the shared reservation. When `NVMeFencer` (`pkg/fencing/nvme.go`) removes a dead node's key, that node's next `write()` fails immediately with `EBADE` and writes nothing, while the other nodes keep writing. This was tested on a real io2 Multi-Attach volume, and `scripts/test/chaos-nvme-fencing.sh` checks it end to end.
+`pkg/nvmeresv` sends these commands as NVMe passthrough ioctls (there is no AWS API for them). At startup, each node registers a key derived from its node ID and joins the shared reservation. When `NVMeFencer` (`pkg/fencing/nvme.go`) removes a dead node's key, that node's next `write()` fails immediately with `EBADE` and writes nothing, while the other nodes keep writing. The key is removed with Preempt and Abort, whose completion waits for the writes the node had already submitted, so none of them can land after the fence returns. This was tested on a real io2 Multi-Attach volume, and `scripts/test/chaos-nvme-fencing.sh` checks it end to end.
 
 This is a fencing token checked by the storage itself, in Kleppmann's sense. Two consequences:
 
