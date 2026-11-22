@@ -32,10 +32,16 @@ no teeth.
 ## What is modelled
 
 Constants bound the model to a finite state space: a set of nodes, a set of
-arenas, a ceiling on the generation counter, and four switches —
+arenas, a ceiling on the generation counter, and switches — among them
 `FencerMode` (`reliable` / `unreliable` / `none`), `GuardEnabled`,
-`ReleaseNeedsFencer` and `FenceChecksIncarnation` — that turn the protocol's
-layers on and off independently.
+`ReleaseNeedsFencer`, `FenceChecksIncarnation` and `SeverDrains` — that turn
+the protocol's layers on and off independently.
+
+A write's bytes are modelled apart from its commit, as two steps:
+`SubmitWrite`, while the node has a write path, and `LandWrite`, which may come
+any time later. Nothing the node or the cluster does in between stops a command
+already at the device; only the sever can say what happens to it, and
+`SeverDrains` is that choice.
 
 Arena ownership is modelled **twice**:
 
@@ -87,6 +93,9 @@ exactly:
   make its cached generation match the cluster's.
 - `ReleasedArenaHasNoLiveWriter` — an arena returned to the free pool has no
   node still writing into it.
+- `NoStrayWrite` — no write lands on an arena that etcd records as another
+  node's. `NoDoubleWriter` is about write paths that exist now; this is about
+  the bytes a write path already sent, which outlive it.
 - `GenerationMonotone` — a node's recorded generation never decreases.
 
 ## Configurations
@@ -102,6 +111,7 @@ exactly:
 | `FencingNoGuard` | off | **off** | reliable | breaks `StaleWriteRejected` |
 | `FencingArenaBug` | on | on | none, **but reclaims arenas anyway** | breaks `ReleasedArenaHasNoLiveWriter` |
 | `FencingDepartureNotQuiescent` | on | on | reliable, **departure announced without stopping** | breaks `ReleasedArenaHasNoLiveWriter` |
+| `FencingSeverNoDrain` | on | on | reliable, **sever leaves in-flight writes running** | breaks `NoStrayWrite` |
 
 Three of these are worth reading past the pass/fail column:
 
@@ -121,6 +131,18 @@ arenas but is still running and still believes it owns them — and the arena
 check the controller performs cannot see it, because the records are clean.
 TLC breaks `ReleasedArenaHasNoLiveWriter` at the departure itself: the arena is
 in the free pool while its previous owner can still write to it.
+
+**`FencingSeverNoDrain` is why the preempt is Preempt and Abort.** A plain NVMe
+Preempt removes the node's registration, so its next write is rejected, but
+says nothing of the writes it had already submitted. This variant flips only
+`SeverDrains`, and TLC finds the trace in ten states: the node submits a
+write, is severed, the generation is bumped, its arena is released and claimed
+by a peer, and the write lands on the peer's arena. With `SeverDrains` on —
+Preempt and Abort, whose completion the NVMe Base Specification (2.0a, §8.19)
+holds until every command the preempted host had in progress has completed —
+`NoStrayWrite` holds in every configuration that checks it. EBS detach is the
+`SeverDrains = FALSE` case too: the controller confirms the detach, but AWS
+documents no bound on I/O already in flight.
 
 The mutation was chosen after the obvious one proved nothing. Announcing a
 departure while *still recorded* as owning arenas is caught by the controller's
@@ -159,13 +181,6 @@ symmetry reduction is unsound for some temporal properties.
   Those are the assumptions the design rests on, stated as such;
   [Porcupine](porcupine.md) checks the daemon's own use of them against
   recorded histories.
-- **Writes in flight at the device.** `FenceSever` cuts a node off in one
-  step: after it, no write from that node reaches the device, including one
-  already submitted. NVMe makes this true only for Preempt and Abort, whose
-  completion waits for the preempted host's in-progress commands; a plain
-  Preempt does not, and `pkg/nvmeresv` sends the former for that reason. EBS
-  detach gives no such guarantee: the controller waits for the detach to be
-  confirmed, but AWS documents no bound on I/O already in flight.
 - **Two controllers fencing one node concurrently.** The per-node
   `fence_claim` lease serialises them and `FenceBumpLostCAS` models the CAS
   losing, but two fully interleaved fence sequences for one node are not
@@ -176,15 +191,16 @@ symmetry reduction is unsound for some temporal properties.
 
 | Configuration | Result |
 |---|---|
-| `Fencing` | pass, 127,126 states |
+| `Fencing` | pass, 242,471 states |
 | `Fencing3Nodes` | pass, 13,972,753 states |
-| `FencingNoFencer` | pass, 86,185 states |
-| `FencingUnreliableFencer` | pass, 1,206 states |
-| `FencingGuardIsBackstop` | pass, 1,328,303 states |
+| `FencingNoFencer` | pass, 233,735 states |
+| `FencingUnreliableFencer` | pass, 3,231 states |
+| `FencingGuardIsBackstop` | pass, 8,863,605 states |
 | `FencingNoIncarnationCheck` | counterexample found, as expected |
 | `FencingNoGuard` | counterexample found, as expected |
 | `FencingArenaBug` | counterexample found, as expected |
 | `FencingDepartureNotQuiescent` | counterexample found, as expected |
+| `FencingSeverNoDrain` | counterexample found, as expected |
 
 `.github/workflows/ci.yml`'s `test-tla` job runs the 2-node models on every
 push and pull request.
