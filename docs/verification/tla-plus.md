@@ -192,7 +192,7 @@ symmetry reduction is unsound for some temporal properties.
 | Configuration | Result |
 |---|---|
 | `Fencing` | pass, 242,471 states |
-| `Fencing3Nodes` | pass, 13,972,753 states |
+| `Fencing3Nodes` | pass, 28,393,258 states |
 | `FencingNoFencer` | pass, 233,735 states |
 | `FencingUnreliableFencer` | pass, 3,231 states |
 | `FencingGuardIsBackstop` | pass, 8,863,605 states |
