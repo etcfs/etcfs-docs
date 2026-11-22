@@ -22,8 +22,8 @@ community binary; JuiceFS figures are from `t3.medium` only.
 
 | Scenario | Metric | etcfs | Best competitor | Advantage |
 |---|---|---|---|---|
-| [Node-kill recovery](node-kill-recovery.md) | takeover of a dead node's file | **3.0–3.5 s** (median 3.11 s over 8 runs) | gluster 22.3–22.7 s (3 runs) | **about 7x faster** — and gfs2, nfs and juicefs never recovered it inside 180 s. GFS2 with real `fence_aws` STONITH confirmed the fence in all three runs, but DLM stayed in `wait fencing`; why is not established, so GFS2's fenced recovery time is still unmeasured |
-| [Node-kill recovery](node-kill-recovery.md) | survivor still serving I/O after the kill | **yes** (0.02–1.47 s worst gap over 8 runs) | gluster yes (77–78 s worst gap) | gfs2/nfs/juicefs survivors went silent for the rest of the run |
+| [Node-kill recovery](node-kill-recovery.md) | takeover of a dead node's file | **3.0–3.5 s** (median 3.11 s over 8 runs) | GFS2 with `fence_aws` 15.9–21.7 s (median 18.3 s, 4 runs); gluster 22.3–22.7 s (3 runs) | **about 6x faster** than fenced GFS2 and needs no fence device; nfs and juicefs lose their only server and never recover. Earlier "GFS2 never recovers" rows were a harness fault (DLM's fence helper aborting), fixed 2026-11-22 |
+| [Node-kill recovery](node-kill-recovery.md) | survivor still serving I/O after the kill | **yes** (0.02–1.47 s worst gap over 8 runs) | fenced GFS2 yes after a 11.8–17.2 s pause; gluster yes (77–78 s worst gap) | unfenced GFS2, nfs and juicefs survivors went silent for the rest of the run |
 | [Node-count scaling](node-count-scaling.md) | shared-directory metadata, 2 → 6 nodes | **+79%** (301 → 540 ops/s) | gfs2 **−44%** (1637 → 916 ops/s) | etcfs's curve keeps climbing where gfs2's collapses; gfs2 is still 1.7x faster at 6 nodes, and gluster (+98%) and nfs (+59%) scale too and finish 3.7x and 2.8x ahead. `m5.large`, 2026-10-16/17 |
 | [Node-count scaling](node-count-scaling.md) | disjoint write bandwidth at 8 → 16 nodes | **1593 → 1800 MiB/s** (+13%), metadata flat at +2.3% | not run — gfs2 needs one journal per node (`mkfs.gfs2 -j` or `gfs2_jadd`), and no 16-node gfs2 cluster was provisioned | etcfs was swept alone to sixteen nodes; no competitor row exists at that width |
 | [Negative lookup](negative-lookup.md) | warm µs per missing-name lookup | **2.21 µs** | nfs 3.68 µs | **1.7x faster than the next best**, 130–230x faster than gluster/juicefs, which do not cache absences at all |
@@ -85,9 +85,10 @@ message between kernels.
 
 **Anything involving failure, etcfs wins.** A dead node's locks come
 back in 3.0–3.5 s across eight runs, with no fence device, no operator and no
-journal replay, while the survivors keep working. GFS2's survivors stopped in
-every run measured, unfenced and fenced alike; whether that is GFS2 or this
-harness's DLM–pacemaker integration is not established. The two
+journal replay, while the survivors keep working. GFS2 with a working fence
+device takes 15.9–21.7 s, most of it EC2 confirming the stop, and grants no lock
+on any inode until then, so its survivors pause for 12–17 s. Unfenced, it never
+recovers, as designed. The two
 server-mediated backends simply end. This is the design's actual claim and it is the one the measurements
 support.
 

@@ -39,10 +39,9 @@ scenario, including those where EtcFS is slower.
 **Recovery without a fence device or journal replay.**
 A node is powered off mid-write while holding locks. A survivor takes over the
 dead node's file in **3.0–3.5 s** (median 3.11 s over eight runs) and keeps
-serving its own I/O. GlusterFS, the only competitor that recovered inside
-180 s, took 22.3–22.7 s. GFS2, NFS and JuiceFS did not recover the file. GFS2's
-survivors stopped serving I/O, with the DLM lockspace in `wait fencing`, both
-without a fence device and in runs where `fence_aws` confirmed the fence. In
+serving its own I/O. GFS2 with a `fence_aws` fence device took 15.9–21.7 s and paused every
+survivor's I/O until the fence was confirmed; GlusterFS took 22.3–22.7 s. NFS and
+JuiceFS lose their only server and did not recover. In
 EtcFS, recovery is a lease that is no longer renewed, plus a generation guard
 that rejects the dead node's writes if it returns.
 [Node-kill recovery](reports/benchmark-reports/node-kill-recovery.md)

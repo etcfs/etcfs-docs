@@ -107,23 +107,18 @@ replayed. The scenario itself is unchanged — same sysrq power-off, same probes
 |---|---|---|
 | fence confirmed | no device configured | **yes**, ~10 s after the kill |
 | survivor's own I/O | stopped for the rest of the run | **never stopped** (0.266 s worst stall, 0 failed ops) |
-| takeover of the dead node's file | never, in 203 s | **never, in 180 s** |
+| takeover of the dead node's file | never, in 203 s | **never, in 180 s** — a harness fault, see [below](#why-fenced-gfs2-never-recovered-2026-11-22) |
 
 Fencing fixes the part of the failure that made the unfenced run hard to read.
 The survivors keep their own filesystem: they resume in 0.042 s and lose no
 operations, where before one node's death stopped every surviving node
 outright. That is the difference a fence device makes, and it is large.
 
-What it does not do, in this configuration, is hand the dead node's inode to a
-survivor inside the window. With the fence confirmed at about ten seconds, the
-file that node had been writing stayed inaccessible for the remaining 180 s —
-any access to it blocked indefinitely, to the point that an unguarded `ls` on it
-hung the harness itself. Whether a further recovery step is missing from this
-setup or GFS2 takes longer than three minutes to release that
-lockspace is not established here; what is established is that the take-over did
-not happen inside the window, with fencing working. Against EtcFS's 2.19 s, GFS2 with real STONITH keeps its survivors alive — the
-unfenced cluster does not — and still did not recover the dead node's file in
-three minutes.
+What it did not do in these runs was hand the dead node's inode to a survivor
+inside the window. That "never" is not GFS2 behaviour: DLM's fence helper crashed
+on every call, so DLM never learned of the fence pacemaker completed. The cause,
+the fix and GFS2's measured recovery time are in
+[the section below](#why-fenced-gfs2-never-recovered-2026-11-22).
 
 ### Repeated runs on a non-burstable class (2026-10-16)
 
@@ -156,21 +151,84 @@ node's inode lock lives under a 2 s session lease (`inodeLockTTL`), and the
 measured 3.0–3.5 s is that lease plus detection and acquisition backoff. The
 2.19 s single run sits below this range and should not be quoted on its own.
 
-The fenced GFS2 result needs correcting, not just repeating. In all three runs
-pacemaker recorded the fence as complete, yet the survivor's DLM lockspace was
-still in `wait fencing` with `kern_stop` two minutes later, and the survivor's
-own probe, after briefly resuming, went silent for the last ~152 s of every run
-(a `dd` blocked in `path_openat`, in the captured `dmesg`). So the survivors did
-not keep their filesystem in this configuration either; the 2026-08-27 "never
-stopped" row came from a probe window too short to see it. The likely cause is
-that `dlm_controld` never learns of the fence pacemaker completed, which would be
-a harness integration fault rather than GFS2 behaviour. That has not been
-established, so GFS2's recovery time under working fencing remains unmeasured.
+The gfs2-fenced column above is the broken harness described in the next
+section, not GFS2: every one of those runs had DLM's fence helper crashing.
+
+### Why fenced GFS2 never recovered (2026-11-22)
+
+DLM does not watch pacemaker's fence history. Before it releases a dead node's
+locks, `dlm_controld` runs a helper, `dlm_stonith`, which asks pacemaker for the
+last time that node was fenced and returns success if it is later than the
+failure; otherwise it asks pacemaker to fence the node (`dlm_stonith(8)`,
+`fence/stonith_helper.c`). On these AL2 nodes the helper aborted on every call:
+
+```
+dlm_stonith: utils.c:57: common: Assertion `"implicit callsite section is observable,
+otherwise target's and/or libqb's build is at fault, preventing reliable logging" ...' failed.
+```
+
+`dlm_tool dump` on the survivor shows the loop: a request every two seconds,
+each ending `result -1 term signal 6`, 29 times in 155 s. The lockspace stayed
+in `wait fencing` although pacemaker had recorded the fence.
+
+The abort reproduces in a plain `amazonlinux:2` container with only `dlm` and
+`pacemaker` installed, with no cluster at all. The helper loads pacemaker's
+`libstonithd` at run time, and libqb 1.0.x's logging asserts that the main
+program carries a `qb_log` callsite section; `dlm_stonith` never logs through
+libqb, so it has none. Rebuilding AL2's `dlm-4.0.7` source package unchanged
+still aborts, so the fault is in the pairing of dlm's code with that libqb, not
+in AL2's build. libqb removed the check in 2.0 (commit `633f262`, "Remove linker
+'magic'"); on Fedora with `dlm-4.3.0` and `libqb-2.0.10` the stock helper runs.
+
+The harness now rebuilds `dlm_stonith` on each node from AL2's own source with
+one `qb_log` call added, and refuses to run if the rebuilt helper still aborts.
+It also captures `dlm_tool status`, `dlm_tool dump`, the corosync nodelist and
+pacemaker's fence log on every fenced run (`survivor-dlm-fence-debug.txt`).
+
+A second defect surfaced once the helper worked. `dlm_stonith` asks for a
+*reboot* — upstream chose that deliberately (dlm commit `de04b4e0`) — and AL2's
+`fence_aws` performs a reboot as stop-then-start, so the dead instance was
+powered back on about 15 s after it was stopped, and DLM waited for it to be
+running before it released the locks. It never got far enough to answer SSH,
+because pacemaker's own `off` fence stopped it again within seconds and its
+cluster services are not enabled at boot, but it contradicted
+`stonith-action=off`. The fence device now sets `pcmk_reboot_action=off`
+(Pacemaker Explained 3.0.1, §8.8), and CloudTrail shows no `StartInstances`
+call in the runs below.
+
+GFS2 with working fencing, `m5.large`, one fresh cluster per run:
+
+| | reboot (DLM default), 4 runs | **off (`pcmk_reboot_action=off`), 4 runs** |
+|---|---|---|
+| fence confirmed | yes, all four | yes, all four |
+| `dlm_stonith` aborts | 0 | 0 |
+| takeover of the dead node's file | 18.30–22.86 s | **15.87–21.66 s, median 18.26 s** |
+| survivor's worst stall after the death | 14.01–19.01 s | 11.78–17.21 s |
+| failed operations after the death | 0 | 0 |
+
+Two further runs on `t3.medium` with the reboot behaviour took 23.13 s and
+24.01 s.
+
+Most of the takeover is the fence itself. In the `off` runs DLM recorded the
+failure and the completed fence 7–13 s apart (`check_fencing 3 done … fail 404
+fence 412`), the time for EC2 to confirm a `StopInstances`; recovering the
+lockspace and replaying the journal takes the rest. The survivors' shared probe
+pauses for 12–17 s across the same interval, because GFS2 grants no lock on any
+inode until the fence is confirmed (`kern_stop`), then resumes and keeps
+writing to the end of the run. The survivors' 10–13 s of "silence at end of
+run" in these runs is the diagnostics collection after the probes are stopped:
+both probes wrote until the stop.
+
+So with fencing working, GFS2 takes over a dead node's file in 16–22 s, in the
+same band as GlusterFS (22.3–22.7 s) and five to seven times slower than etcfs
+(3.00–3.47 s), and it stops every survivor's I/O for the length of the fence
+while etcfs's survivors keep writing.
 
 **gluster recovers, slowly.** The replica set drops to two copies and the client
 takes 22.6 s to write the dead node's file, with a 78 s worst gap on the shared
-one. It is the only competitor here that recovers at all inside the window, and
-it does so about 10x slower than etcfs.
+one. In this table it is the only competitor that recovers inside the window;
+fenced GFS2, once its harness fault is fixed, lands in the same 16–22 s band
+(above). Both are about 7x slower than etcfs's eight-run 3.0–3.5 s.
 
 **nfs and juicefs are not recovery numbers and should not be read as such.**
 Both lose the single machine that *is* the filesystem, so the correct result is
@@ -213,8 +271,8 @@ one on this page that actually measures lock recovery.
 - The five-way table is one run per backend. The etcfs takeover is bounded by
   the 2 s inode-lock session lease (`inodeLockTTL`), not by the 10 s membership
   lease; eight repeated runs put it at 3.0–3.5 s.
-- GFS2's "never" is not a measured GFS2 recovery time. Unfenced, no fence agent
-  exists; fenced, DLM did not leave `wait fencing` after pacemaker's confirmed
-  fence, and why is not established.
+- Unfenced GFS2's "never" is the expected result with no fence agent, not a
+  recovery time. Fenced GFS2's recovery is 15.87–21.66 s over four runs, and is
+  dominated by how long EC2 takes to confirm the stop.
 - The victim is never restarted, so nothing here measures rejoin; that is
   `bench-elasticity.sh` and `bench-join-latency.sh`.

@@ -98,8 +98,8 @@ node the suspension is short enough to hide inside a 0.063 s stall — the same
 order as etcfs's 0.110 s and gluster's 0.174 s. A clean unmount also lets GFS2
 flush its own journal, so the survivors have nothing to replay. The
 stop-the-world cost GFS2 is known for shows up when the departure is *not*
-clean, and that is the node-kill scenario, where the same cluster's lockspace
-went to `wait fencing` and stayed there — see
+clean, and that is the node-kill scenario, where the lockspace waits in
+`wait fencing` until the fence is confirmed (never, with no fence device) — see
 [Node-Kill Recovery](node-kill-recovery.md).
 
 **The bandwidth column is noisier than it looks and should be read as a band,
@@ -142,8 +142,9 @@ it and points at where the other half lives:
   otherwise from these numbers.
 - For an **unplanned** one, the two designs diverge completely, and that
   divergence is measured in the node-kill report: etcfs takes over a dead node's
-  locks in 3.0–3.5 s while its survivors keep working, and GFS2's survivors
-  stopped in every run, with or without a confirmed fence.
+  locks in 3.0–3.5 s while its survivors keep working, and GFS2 takes
+  15.9–21.7 s with a working fence device, pausing every survivor's I/O until
+  the fence is confirmed (never, without one).
 
 ## Caveats
 
