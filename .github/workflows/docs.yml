@@ -19,6 +19,9 @@ concurrency:
 jobs:
   # Catches links that mkdocs --strict does not: links to source files in
   # the (now separate) code repos rather than pages, and fragments.
+  # A 429 is accepted: some hosts (wiki.lustre.org) rate-limit GitHub's
+  # runners, and a server that answers "too many requests" is up and the link
+  # resolves.
   links:
     name: Link check
     runs-on: ubuntu-latest
@@ -29,6 +32,7 @@ jobs:
           args: >-
             --no-progress
             --include-fragments
+            --accept '200..=299,429'
             --exclude-path site
             README.md 'docs/**/*.md'
           fail: true
