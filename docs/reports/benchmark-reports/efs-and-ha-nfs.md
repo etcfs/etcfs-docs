@@ -127,15 +127,15 @@ The one-job legs, run for 20 minutes each, with the bandwidth logged every
 10 s. The EtcFS runs skip the raw-device legs, so both backends start with the
 instance's EBS burst intact.
 
-| 20 min per leg | EtcFS (2 runs) | HA NFS (3 runs) |
+| 20 min per leg | EtcFS (3 runs) | HA NFS (3 runs) |
 |---|---|---|
-| write, average MiB/s | 328–330 | 374–389 |
-| write, last 5 min | 328 | 92–346 |
-| read, average MiB/s | 405–416 | 284–330 |
-| read, last 5 min | 404–417 | 299–320 |
+| write, average MiB/s | 306–330 | 374–389 |
+| write, last 5 min | 305–328 | 92–346 |
+| read, average MiB/s | 364–416 | 284–330 |
+| read, last 5 min | 355–417 | 299–320 |
 
 Neither backend reached the EBS baseline inside 40 minutes of this load. EtcFS
-holds its rate to within 1%; HA NFS's write rate varies more, and one run fell
+holds its rate to within 4% from the first five minutes to the last; HA NFS's write rate varies more, and one run fell
 to 92 MiB/s in its last five minutes.
 
 An earlier set of EtcFS long runs did reach the baseline. Those runs began with
@@ -182,7 +182,7 @@ batching them is the better shape.
 
 ## Caveats
 
-- Three runs per short point, two or three per long point, all in one session;
+- Three runs per point, all in one session;
   ranges, not confidence intervals.
 - One instance type and one volume size. A larger instance raises the EBS
   burst and the network flow count alike, and could move every row.
