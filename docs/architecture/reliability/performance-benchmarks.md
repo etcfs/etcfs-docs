@@ -66,6 +66,10 @@ at equal load GFS2's tail is tighter (see the
   bypasses the application's buffer but not ext4's own cache of the block
   device, and the 1 GiB file fits in memory. This row is not comparable to the
   others.
+- **The EFS row is bursting mode on a 1000-IOPS, `t3.medium` setup.** EFS in
+  elastic mode against EtcFS and an HA NFS pair, on `m7i.large` and an
+  8000-IOPS volume with matched jobs, is in
+  [EtcFS vs. EFS and HA NFS](../../reports/benchmark-reports/efs-and-ha-nfs.md).
 - **EFS is not limited by one volume.** `generalPurpose` mode scales with burst
   credits across many servers, and is reached over NFSv4.1 rather than a local
   device or FUSE, so it answers "what does the managed alternative deliver"

@@ -22,7 +22,7 @@ community binary; JuiceFS figures are from `t3.medium` only.
 
 | Scenario | Metric | etcfs | Best competitor | Advantage |
 |---|---|---|---|---|
-| [Node-kill recovery](node-kill-recovery.md) | takeover of a dead node's file | **3.0–3.5 s** (median 3.11 s over 8 runs) | GFS2 with `fence_aws` 15.9–21.7 s (median 18.3 s, 4 runs); gluster 22.3–22.7 s (3 runs) | **about 6x faster** than fenced GFS2 and needs no fence device; nfs and juicefs lose their only server and never recover. Earlier "GFS2 never recovers" rows were a harness fault (DLM's fence helper aborting), fixed 2026-11-22 |
+| [Node-kill recovery](node-kill-recovery.md) | takeover of a dead node's file | **3.0–3.5 s** (median 3.11 s over 8 runs) | GFS2 with `fence_aws` 15.9–21.7 s (median 18.3 s, 4 runs); HA NFS pair 12.1–12.4 s (6 runs, `m7i.large`); gluster 22.3–22.7 s (3 runs) | **about 4x faster** than an HA NFS pair, 6x than fenced GFS2 and needs no fence device; nfs and juicefs lose their only server and never recover. Earlier "GFS2 never recovers" rows were a harness fault (DLM's fence helper aborting), fixed 2026-11-22 |
 | [Node-kill recovery](node-kill-recovery.md) | survivor still serving I/O after the kill | **yes** (0.02–1.47 s worst gap over 8 runs) | fenced GFS2 yes after a 11.8–17.2 s pause; gluster yes (77–78 s worst gap) | unfenced GFS2, nfs and juicefs survivors went silent for the rest of the run |
 | [Node-count scaling](node-count-scaling.md) | shared-directory metadata, 2 → 6 nodes | **+79%** (301 → 540 ops/s) | gfs2 **−44%** (1637 → 916 ops/s) | etcfs's curve keeps climbing where gfs2's collapses; gfs2 is still 1.7x faster at 6 nodes, and gluster (+98%) and nfs (+59%) scale too and finish 3.7x and 2.8x ahead. `m5.large`, 2026-10-16/17 |
 | [Node-count scaling](node-count-scaling.md) | disjoint write bandwidth at 8 → 16 nodes | **1593 → 1800 MiB/s** (+13%), metadata flat at +2.3% | not run — gfs2 needs one journal per node (`mkfs.gfs2 -j` or `gfs2_jadd`), and no 16-node gfs2 cluster was provisioned | etcfs was swept alone to sixteen nodes; no competitor row exists at that width |
@@ -30,6 +30,8 @@ community binary; JuiceFS figures are from `t3.medium` only.
 | [Warm page cache](warm-page-cache.md) | daemon reads during a warm pass | **0** | n/a | a coherent, lock-scoped page cache that costs nothing to read through — 600k IOPS served entirely by the kernel |
 | [Online volume growth](online-volume-growth.md) | new space usable after growing the device | **3.90 s**, no restart anywhere | gfs2 needs `gfs2_grow`; nfs grows server-side | not measured for the others — the shared raw-device path has no equivalent |
 | [Batched cross-inode flush](batched-flush.md) | inodes published per etcd transaction, 256 files open per node | **40.5** (2428 inodes in 60 commits) | n/a | no competitor has an equivalent — this is the interval sweep's own batching, measured where it applies |
+| [EFS and HA NFS](efs-and-ha-nfs.md) | sequential throughput vs EFS (elastic) | 341–1038 MiB/s across the legs | EFS 40–431 MiB/s | **2.4x to 8.5x faster** on every leg; `m7i.large`, 8000-IOPS io2, 3 runs each, 2026-11-23 |
+| [EFS and HA NFS](efs-and-ha-nfs.md) | reads and handoffs vs an HA NFS pair | 1-job read 424, 4-job read 1038, 8 GiB handoff 473 MiB/s | HA NFS 278 / 592 / 246 MiB/s | **1.5x to 1.9x faster**; HA NFS's reads sit on EC2's 5 Gbps single-flow limit |
 
 ## Where etcfs is competitive
 
@@ -56,6 +58,7 @@ community binary; JuiceFS figures are from `t3.medium` only.
 | [Node-count scaling](node-count-scaling.md) | shared-file write bandwidth at 6 nodes | 234.2 MiB/s | gfs2 443.4 MiB/s | **1.9x slower** — every writer on one inode means a lock handover per turn (same session, 2026-10-16; the older build was 7.3x) |
 | [Single-node ceiling](single-node-ceiling.md) | random-write IOPS as % of raw device | 36.0% | gfs2 99.6% | **2.8x** less of the device's IOPS retained |
 | [4 KiB random tail](etcfs-vs-juicefs-gluster-gfs2-nfs.md) | p99 at matched load (psync, 4 × 1) | write 12.4 ms, read 9.9 ms | gfs2 8.1 ms / 8.1 ms | **1.5x / 1.2x worse**. The earlier "24x better" compared 4 requests in flight with 128. At depth 32 etcfs's FUSE daemon crashes — see the report |
+| [EFS and HA NFS](efs-and-ha-nfs.md) | concurrent writes vs an HA NFS pair | 4-job 469, 3-node aggregate 931 MiB/s | HA NFS 591 / 1157 MiB/s | **1.2x to 1.3x slower**; one job is a tie (341 vs 352). HA NFS and EFS also answer a fresh file's first byte in 28–32 ms against EtcFS's 44–46 |
 
 ## The shape of it
 
