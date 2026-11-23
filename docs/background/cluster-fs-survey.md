@@ -435,6 +435,10 @@ Split-brain is a first-class concern in GlusterFS replicated volumes:
 - Consistency is managed server-side — the client never has raw block access.
 - Multi-writer concurrency is handled through NFSv4 protocol semantics, not distributed locking at the block layer.
 
+Measured against EtcFS on large sequential I/O, EFS in elastic mode is 2.4x to
+8.5x slower on every leg and answers a fresh file's first byte sooner; see
+[EtcFS vs. EFS and HA NFS](../reports/benchmark-reports/efs-and-ha-nfs.md).
+
 ### 5.2 Google Cloud Filestore
 
 - Based on NFSv3 (Filestore) with newer tiers supporting NFSv4.1.

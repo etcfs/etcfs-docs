@@ -237,6 +237,10 @@ a hard mount (no error, no progress, silent for 193 s), and the JuiceFS client
 fast-fails every operation once Redis is gone (3,356 errors). They are included
 because the difference between "one node of several died" and "the filesystem
 died" is the point of a shared-device design, not because their numbers compete.
+NFS made highly available, as an active/passive pair under Pacemaker with
+`fence_aws`, does recover: 12.1–12.4 s over six runs on `m7i.large`, with a
+client holding a file open across the failover waiting about two minutes
+([EtcFS vs. EFS and HA NFS](efs-and-ha-nfs.md#failover)).
 
 ## What changed since the previous run of this scenario
 
