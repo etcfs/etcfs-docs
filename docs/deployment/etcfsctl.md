@@ -2,7 +2,7 @@
 
 `etcfsctl` is the operator's command-line tool. It connects directly to etcd,
 with no EtcFS daemon involved, and runs the code in `pkg/fsck`, `pkg/fsinfo`,
-`pkg/membership`, `pkg/arena` and `pkg/fencing`.
+`pkg/arena` and `pkg/fencing`.
 
 `etcfuse-meta` also has `--fsck` and `--info` flags, but using them means
 starting the daemon that mounts the filesystem. `etcfsctl` can check a cluster

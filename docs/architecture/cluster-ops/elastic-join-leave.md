@@ -158,10 +158,10 @@ A node that crashes runs none of the steps above:
 5. If the fence was device-enforced, the controller releases the node's arenas
    to the free pool.
 
-In the test harness, `pkg/membership.Manager` models this with
-`LeaveUngraceful`, which releases the node's resources at once instead of
-waiting for leases to expire. `Manager` is used only by the harness, never by the
-daemon.
+`test/harness/elastic_integration_test.go` drives these paths through the
+daemon's own `metadata.Membership` and `arena.Allocator` against a real etcd: a
+node whose client dies without revoking loses its membership key at lease
+expiry, keeps its arenas, and leaves no `departed:` marker.
 
 ## Arena Reuse After a Leave
 
