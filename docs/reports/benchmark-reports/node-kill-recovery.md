@@ -242,6 +242,24 @@ NFS made highly available, as an active/passive pair under Pacemaker with
 client holding a file open across the failover waiting about two minutes
 ([EtcFS vs. EFS and HA NFS](efs-and-ha-nfs.md#failover)).
 
+### Repeated runs on `m7i.large` (2026-11-24)
+
+Five runs on etcfs and five on GFS2 under pacemaker with `fence_aws`, each on
+a fresh cluster. Two of the GFS2 runs failed during provisioning (a shared
+volume attached while an instance was still booting never appeared as a
+device), so GFS2 has three.
+
+| | etcfs (5 runs) | gfs2-fenced (3 runs) |
+|---|---|---|
+| takeover of the dead node's file | **1.85–2.98 s, median 2.83 s** | 14.75–15.66 s, median 14.88 s |
+| survivor's worst stall after the death | 0.018–1.49 s, median 0.021 s | 11.73–11.87 s, median 11.84 s |
+| failed operations after the death | 0 | 0 |
+
+Both medians sit at the fast end of the earlier bands (etcfs 3.00–3.47 s on
+`m5.large`, fenced GFS2 15.87–21.66 s), and the ratio between them holds at
+about 5x. The GFS2 survivors' stall is again the fence: they grant no lock
+until EC2 confirms the stop.
+
 ## What changed since the previous run of this scenario
 
 The 2026-08-16 revision of this report published etcfs as the *slowest* of the

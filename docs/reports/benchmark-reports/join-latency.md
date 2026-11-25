@@ -12,17 +12,26 @@ this measures. GFS2 has no equivalent number to take: journals are allocated at
 mkfs, one per provisioned node, so a node past that count does not join slowly,
 it fails to join at all.
 
-The departing node now leaves *cleanly* — SIGTERM plus unmount — and a clean
-leave no longer causes a fencing detach, since a node that shuts down gracefully
-gives back its locks and arenas and announces the departure in the same
-transaction that removes it from membership. An earlier figure for this scenario included an EBS reattach
-that this path no longer triggers, which is what the re-run was for.
+The departing node leaves *cleanly*: SIGTERM plus unmount. A node that shuts
+down gracefully gives back its locks and arenas and announces the departure in
+the same transaction that removes it from membership, so its peers do not fence
+it.
+
+**Both runs below include a fence and an EBS reattach.** In the daemon these
+runs used, the membership heartbeat revoked its lease as soon as SIGTERM
+arrived, before the shutdown path could write the departure marker; the
+daemon logged `lease had already expired, so this departure cannot be
+announced as intentional`, and the survivors fenced the leaver and detached its
+volume. The harness reattached it before the restart, so the join time below
+contains a reattach. The defect was found and fixed on 2026-11-25
+(`fix(membership): kept the lease on cancellation…`); this scenario has to be
+re-run before its join time describes a clean leave.
 
 Single isolated 3-node etcfs cluster.
 
 ## Results
 
-| Metric | 2026-08-24 | 2026-08-17 (with reattach) |
+| Metric | 2026-08-24 (with reattach) | 2026-08-17 (with reattach) |
 |---|---|---|
 | Join time | 6.685 s | 4.492 s |
 | Survivor baseline throughput | 2.39 MiB/s | 13.74 MiB/s |
@@ -32,10 +41,11 @@ Single isolated 3-node etcfs cluster.
 ## Reading these numbers
 
 **The join itself is a process start, not a stall: 6.7 s from launching two
-daemons to a mount that answers a write.** That is slower than the previous
-run's 4.5 s despite no longer paying for an EBS reattach, so the reattach was
-evidently not the dominant term — daemon start, etcd membership registration and
-arena claim are. Both runs are in the same 4–7 s band.
+daemons to a mount that answers a write, including an EBS reattach** (see the
+summary). Both runs are in the same 4–7 s band. A 2026-11-25 churn run with the
+fix in place rejoined in 1.4–2.0 s per cycle with no reattach, under a
+different load, so the reattach probably accounts for several seconds of these
+figures.
 
 **The survivor-impact percentage should not be read as a throughput claim in
 either direction.** The load here is 4 KiB random writes with `direct=1` on a
@@ -55,7 +65,8 @@ join *time*.
 
 ## Caveats
 
-- One run.
+- One run, and it includes a fence and reattach that a clean leave does not
+  cause; re-run pending.
 - The survivor load is deliberately the small-random-write shape, which makes
   the percentage column noisy; see above.
 - etcfs only, by design — there is no comparable operation on GFS2.

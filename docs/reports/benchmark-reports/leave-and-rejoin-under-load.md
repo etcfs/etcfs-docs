@@ -19,7 +19,7 @@ Single isolated 3-node etcfs cluster, same shape as the other reports. This scen
 | Arenas owned before | 3 | 4 |
 | Arenas owned after 3 cycles | 4 | 4 |
 
-A clean leave is not fenced — a departing node announces itself in the same transaction that removes it from membership — so a rejoin reattaches nothing, and each cycle takes about four seconds (4.05 s mean).
+**Every leave in these runs was fenced.** A clean leave should not be: the departing node announces itself in the same transaction that removes it from membership. In the daemon these runs used, the membership heartbeat revoked its lease as soon as SIGTERM arrived, so the announcement found no membership key to delete and was refused, and the survivors fenced the node and detached its volume. Each cycle's 4–5 s therefore includes an EBS reattach by the harness. The defect was fixed on 2026-11-25; with the fix, a 5 s churn run rejoined in 1.4–2.0 s per cycle with no detach recorded in CloudTrail. These tables stand as measurements of a fenced leave until the scenario is re-run.
 
 One number moved in a direction worth watching: the cluster owned 3 arenas before the cycles and 4 after. The leaver's arena is released on departure and a fresh one is claimed on rejoin, and the count is read immediately after the last rejoin, so a reclaim still in flight explains it — but three cycles ending one arena up is exactly the shape a slow leak would have, and this scenario exists to catch that. The soak (see [Arena Fragmentation Soak](arena-fragmentation-soak.md)) is the run that would separate the two.
 
@@ -51,5 +51,8 @@ whatever this is, it is not costing throughput.
 
 What it means is still open: an arena claimed lazily by the rejoined node after
 it settles would look exactly like this and would be correct, and so would a
-reclaim that never runs. Distinguishing them needs the count broken down per
-node rather than summed, which this scenario does not currently record.
+reclaim that never runs. A third candidate follows from the fencing above: every
+cycle also ran a fencing controller's reclaim of the leaver's arenas in parallel
+with the node's own release and its rejoin. Distinguishing them needs the count
+broken down per node rather than summed, which this scenario does not currently
+record, and a re-run with clean leaves.
