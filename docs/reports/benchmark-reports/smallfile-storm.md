@@ -1,6 +1,6 @@
 # Benchmark Report — Small-File Metadata Storm
 
-*2026-08-25*
+*2026-08-25, updated 2026-11-26*
 
 ## Summary
 
@@ -94,6 +94,25 @@ GlusterFS and NFS ran the next day on the same class. Against them etcfs is
 4.8x and 1.4x slower; NFS barely moved from its `t3.medium` time, while
 GlusterFS ran 1.8x faster. JuiceFS was not re-run: its MinIO object store no
 longer has a downloadable community binary.
+
+### `m7i.large`, with EFS (2026-11-25/26)
+
+Three runs per backend, each on a fresh 3-node cluster with the 1000-IOPS io2
+volume. EFS is in elastic throughput mode and, separately, with 256 MiB/s of
+provisioned throughput.
+
+| Backend | Untar time, median (range) | Creates/sec | etcfs is slower by |
+|---|---|---|---|
+| **etcfs** | **1024.7 s** (1023.1–1066.4) | **78.07** (75.02–78.19) | — |
+| gfs2 | 12.9 s (11.8–13.1) | 6192.43 (6094.77–6808.51) | **79x** |
+| efs, elastic | 1432.3 s (1229.7–1471.9) | 55.85 (54.35–65.06) | etcfs 1.40x faster |
+| efs, provisioned 256 MiB/s | 1217.2 s (1182.4–1256.1) | 65.72 (63.69–67.66) | etcfs 1.19x faster |
+
+No lock-yield failures (`notify_failures` 0). On the faster class etcfs creates
+2.2 times as many files per second as on `t3.medium`, and GFS2 2.3 times as
+many, so the gap between them stays at about 80x. EFS is slower than etcfs:
+every create is a round trip to the NFS service, and provisioned throughput
+does not change that, since an untar of small files moves little data.
 
 ## Reading these numbers
 

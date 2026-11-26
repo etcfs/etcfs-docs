@@ -100,6 +100,7 @@ nav:
           - Warm Page Cache: reports/benchmark-reports/warm-page-cache.md
           - Negative Lookup: reports/benchmark-reports/negative-lookup.md
           - Cross-Node Handoff: reports/benchmark-reports/cross-node-handoff.md
+          - Cross-Node Coherence: reports/benchmark-reports/cross-node-coherence.md
           - EtcFS vs. EFS and HA NFS: reports/benchmark-reports/efs-and-ha-nfs.md
           - Node-Kill Recovery: reports/benchmark-reports/node-kill-recovery.md
           - Elasticity — Membership Change Cost: reports/benchmark-reports/elasticity.md

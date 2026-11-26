@@ -23,9 +23,10 @@ arrived, before the shutdown path could write the departure marker; the
 daemon logged `lease had already expired, so this departure cannot be
 announced as intentional`, and the survivors fenced the leaver and detached its
 volume. The harness reattached it before the restart, so the join time below
-contains a reattach. The defect was found and fixed on 2026-11-25
-(`fix(membership): kept the lease on cancellation…`); this scenario has to be
-re-run before its join time describes a clean leave.
+contains a reattach. The defect was fixed on 2026-11-25
+(`fix(membership): kept the lease on cancellation…`). This scenario was not
+re-run after the fix; the clean-leave join time comes from the elasticity and
+churn runs below.
 
 Single isolated 3-node etcfs cluster.
 
@@ -42,10 +43,10 @@ Single isolated 3-node etcfs cluster.
 
 **The join itself is a process start, not a stall: 6.7 s from launching two
 daemons to a mount that answers a write, including an EBS reattach** (see the
-summary). Both runs are in the same 4–7 s band. A 2026-11-25 churn run with the
-fix in place rejoined in 1.4–2.0 s per cycle with no reattach, under a
-different load, so the reattach probably accounts for several seconds of these
-figures.
+summary). Both runs are in the same 4–7 s band. With the leave announced, the
+same restart takes 1.46 s (1.39–1.54, five elasticity runs on `m7i.large`) and
+1.43–1.50 s per cycle across 60 rejoins in the churn runs, so the reattach
+accounts for most of these figures.
 
 **The survivor-impact percentage should not be read as a throughput claim in
 either direction.** The load here is 4 KiB random writes with `direct=1` on a
@@ -58,15 +59,16 @@ number, and nothing here separates "membership costs the cluster something" from
 
 The scenario that answers the same question under a load worth measuring is
 [Elasticity](elasticity.md), where the load is 1 MiB sequential writes at
-258 MiB/s and the join costs the survivors 11.3% with a 0.09 s worst stall, and
+about 260 MiB/s and an announced join costs the survivors 10.3% with a 0.12 s
+worst stall, and
 [Leave and Rejoin Under Load](leave-and-rejoin-under-load.md), where three
 leave/rejoin cycles cost 3.0%. Those are the numbers to quote; this one is a
 join *time*.
 
 ## Caveats
 
-- One run, and it includes a fence and reattach that a clean leave does not
-  cause; re-run pending.
+- One run per date, each including a fence and reattach that a clean leave does
+  not cause; the clean-leave join time is the elasticity report's.
 - The survivor load is deliberately the small-random-write shape, which makes
   the percentage column noisy; see above.
 - etcfs only, by design — there is no comparable operation on GFS2.

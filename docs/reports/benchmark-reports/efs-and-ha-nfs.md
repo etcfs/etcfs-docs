@@ -1,6 +1,6 @@
 # Benchmark Report — EtcFS vs. EFS and an HA NFS Pair on the Data Path
 
-*2026-11-23*
+*2026-11-23, updated 2026-11-26*
 
 ## Summary
 
@@ -35,6 +35,11 @@ from [Node-Kill Recovery](node-kill-recovery.md), measured on `m5.large`.
   several jobs or several nodes, and matches EtcFS on one job.
 - **HA NFS fails over in about 12 s,** four times EtcFS's takeover, and a client
   holding a file open across the failover waits about 117 s.
+- **GFS2 on the same volume is faster than EtcFS on every throughput row,**
+  by 1.2x to 2.5x on one node and 2.1x in aggregate; see
+  [GFS2 and provisioned EFS](#gfs2-and-provisioned-efs-on-the-same-setup).
+  EtcFS's advantages over GFS2 are elsewhere: membership changes and node
+  failure ([Elasticity](elasticity.md), [Node-Kill Recovery](node-kill-recovery.md)).
 
 ## Setup
 
@@ -121,6 +126,33 @@ device; the network alternatives move every byte. The first byte costs EtcFS
 the lock acquisition and the extent lookup, about 15 ms more than a server that
 already holds the file open.
 
+### GFS2 and provisioned EFS on the same setup
+
+The same jobs on GFS2 (three runs, 2026-11-24/25) and on EFS with 256 MiB/s of
+provisioned throughput instead of elastic mode (three runs, 2026-11-25), on the
+same instance class and the same 8000-IOPS volume. MiB/s, median (range).
+
+| Leg | EtcFS | GFS2 | EFS, provisioned 256 MiB/s |
+|---|---|---|---|
+| write, 1 job | 341 (267–354) | **855** (852–878) | 38 (37–40) |
+| read, 1 job | 424 (416–429) | **761** (760–781) | 112 (95–120) |
+| write, 4 jobs | 469 (435–482) | **1193** (1193–1193) | 153 (150–159) |
+| read, 4 jobs | 1038 (995–1136) | **1196** (1196–1196) | 412 (360–466) |
+| aggregate write, 3 nodes | 931 (779–938) | **2001** (2000–2006) | 116 (113–119) |
+| 8 GiB file read on another node | 473 (465–480) | **584** (577–626) | — |
+| …its time to first byte, ms | 44–46 | 30–32 | — |
+
+GFS2 is a kernel filesystem on the same device path, and it keeps 100–110% of
+the raw device's one-job rate where EtcFS keeps 43–57%. The cost EtcFS pays
+on that path is its own: FUSE, one request deep per job, and an etcd round trip
+per extent commit are the likely parts, and these runs do not separate them. GFS2's four-job legs sit flat on 1193–1196 MiB/s, which is the
+instance's 1250 MB/s EBS maximum. Its aggregate sits on the volume's
+2048 MiB/s cap.
+
+Provisioned throughput moves EFS by no more than run-to-run variation on any
+leg. A three-node cluster with jobs this size does not exhaust EFS's elastic
+throughput, so paying for a provisioned rate buys nothing here.
+
 ### Sustained throughput
 
 The one-job legs, run for 20 minutes each, with the bandwidth logged every
@@ -178,7 +210,9 @@ their state.
 
 So the direct path wins where data leaves the node that wrote it (reads,
 handoffs) and on failover, and loses on concurrent writes, where a single server
-batching them is the better shape.
+batching them is the better shape. A kernel filesystem on the same direct path,
+GFS2, is faster than EtcFS on every leg, so the gap to it is EtcFS's own
+overhead on that path rather than the cost of sharing a device.
 
 ## Caveats
 

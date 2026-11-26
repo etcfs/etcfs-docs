@@ -1,6 +1,6 @@
 # Benchmark Report — Deep Directory Walks
 
-*2026-08-25*
+*2026-08-25, updated 2026-11-26*
 
 ## Summary
 
@@ -26,6 +26,23 @@ different day's clusters.
 | nfs | 0.905 | 0.482 | 0.411 | 88397.79 |
 | juicefs | 1.560 | 1.510 | 20.875 | 51282.05 |
 | gluster | 7.635 | 5.245 | 5.311 | 10478.06 |
+
+### `m7i.large`, with EFS (2026-11-25/26)
+
+Three runs per backend on fresh 3-node clusters, the same 80,000-file tree.
+Medians, ranges in brackets.
+
+| Backend | find cold (s) | find warm (s) | du (s) | lookups/sec (cold) |
+|---|---|---|---|---|
+| **etcfs** | **4.048** (3.673–4.065) | **3.591** (3.061–3.745) | **59.6** (49.4–65.1) | **19762.85** |
+| gfs2 | 2.533 (2.115–4.848) | 0.046 (0.042–0.046) | 83.5 (82.8–84.6) | 31583.10 |
+| efs, elastic | 5.055 (4.644–6.137) | 0.502 (0.363–0.513) | 61.3 (53.4–73.4) | 15825.91 |
+| efs, provisioned 256 MiB/s | 5.655 (5.439–6.058) | 0.886 (0.805–0.933) | 84.9 (75.6–85.8) | 14146.77 |
+
+On this class etcfs's `du` is faster than GFS2's and level with EFS's, and its
+cold `find` sits between the two. The warm `find` is where etcfs still loses:
+3.6 s against 0.05 s for GFS2 and 0.5 s for EFS, because a repeated walk
+costs etcfs nearly as many etcd reads as the first one.
 
 ## Reading these numbers
 

@@ -19,7 +19,7 @@ Single isolated 3-node etcfs cluster, same shape as the other reports. This scen
 | Arenas owned before | 3 | 4 |
 | Arenas owned after 3 cycles | 4 | 4 |
 
-**Every leave in these runs was fenced.** A clean leave should not be: the departing node announces itself in the same transaction that removes it from membership. In the daemon these runs used, the membership heartbeat revoked its lease as soon as SIGTERM arrived, so the announcement found no membership key to delete and was refused, and the survivors fenced the node and detached its volume. Each cycle's 4–5 s therefore includes an EBS reattach by the harness. The defect was fixed on 2026-11-25; with the fix, a 5 s churn run rejoined in 1.4–2.0 s per cycle with no detach recorded in CloudTrail. These tables stand as measurements of a fenced leave until the scenario is re-run.
+**Every leave in these runs was fenced.** A clean leave should not be: the departing node announces itself in the same transaction that removes it from membership. In the daemon these runs used, the membership heartbeat revoked its lease as soon as SIGTERM arrived, so the announcement found no membership key to delete and was refused, and the survivors fenced the node and detached its volume. Each cycle's 4–5 s therefore includes an EBS reattach by the harness. The defect was fixed on 2026-11-25. This scenario was not re-run after the fix; the churn runs in [Elasticity](elasticity.md) repeat the same leave-and-rejoin six times per run with the leave announced, and rejoined in 1.43–1.50 s per cycle at every interval from 60 s down to 2 s, with no detach in CloudTrail and a worst survivor stall of 0.12–0.17 s. These tables stand as measurements of a fenced leave.
 
 One number moved in a direction worth watching: the cluster owned 3 arenas before the cycles and 4 after. The leaver's arena is released on departure and a fresh one is claimed on rejoin, and the count is read immediately after the last rejoin, so a reclaim still in flight explains it — but three cycles ending one arena up is exactly the shape a slow leak would have, and this scenario exists to catch that. The soak (see [Arena Fragmentation Soak](arena-fragmentation-soak.md)) is the run that would separate the two.
 
@@ -55,4 +55,7 @@ reclaim that never runs. A third candidate follows from the fencing above: every
 cycle also ran a fencing controller's reclaim of the leaver's arenas in parallel
 with the node's own release and its rejoin. Distinguishing them needs the count
 broken down per node rather than summed, which this scenario does not currently
-record, and a re-run with clean leaves.
+record, and a run with announced leaves. In the scale-cycle runs in
+[Elasticity](elasticity.md), a node removed with an announced leave had its
+arenas released within 0.006 s; that run does not count arenas across a rejoin,
+so it does not settle this question.

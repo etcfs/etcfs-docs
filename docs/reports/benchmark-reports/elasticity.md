@@ -1,6 +1,6 @@
 # Benchmark Report — Elasticity: What a Membership Change Costs Everyone Else
 
-*2026-08-24*
+*2026-08-24, updated 2026-11-26*
 
 ## Summary
 
@@ -49,14 +49,31 @@ that means a 4-node cluster, since node0 is their server and never mounts.
 
 Zero failed operations on every backend, in both phases.
 
-**The etcfs rows in both tables measure a fenced leave, not a clean one.** In
-the daemon these runs used, the membership heartbeat revoked its lease as soon
-as SIGTERM arrived, so the departure announcement was refused and the survivors
-fenced the leaver and detached its volume; the join then included the harness's
-EBS reattach. The survivors' stall and bandwidth columns still describe what
-the other nodes saw, because the fence runs asynchronously to their I/O; the
-etcfs join time does not describe a clean rejoin. Fixed on 2026-11-25; the etcfs
-rows are being re-measured.
+**The etcfs rows in this table and the next were taken with a daemon whose
+clean leave was fenced.** Its membership heartbeat revoked the lease as soon as
+SIGTERM arrived, so the departure announcement was refused, the survivors
+fenced the leaver and detached its volume, and the join included the harness's
+EBS reattach. The survivors' stall and bandwidth columns still describe what the
+other nodes saw, because the fence runs asynchronously to their I/O; the etcfs
+join time does not describe a clean rejoin.
+
+### etcfs with the leave announced (2026-11-25, `m7i.large`)
+
+Five runs on a fresh three-node cluster each, with the departure announced and
+no fence:
+
+| | median (range) |
+|---|---|
+| survivor baseline | 260.95 MiB/s (260.67–261.99) |
+| leave: max stall | 0.110 s (0.101–0.123) |
+| leave: bandwidth lost | 5.1% (4.8–6.3) |
+| join time | **1.464 s** (1.392–1.543) |
+| join: max stall | 0.120 s (0.117–0.126) |
+| join: bandwidth lost | 10.3% (9.3–11.1) |
+
+Zero failed operations. The survivors' stall is the same as with the fenced
+leave (0.115 s over five fenced runs on the same class), and the join is about
+4.7 s faster: the reattach was most of the old join time.
 
 ### Re-measure on a non-burstable class (2026-10-17)
 
@@ -99,86 +116,112 @@ editing that list on every node, which this scenario does not time. etcfs has no
 equivalent step — a joining node writes its membership key and claims its own
 arena.
 
-### GFS2 across cluster size and lock count (2026-11-24, `m7i.large`)
+### Across cluster size and lock count (2026-11-24/25, `m7i.large`)
 
-GFS2 only; the etcfs runs of the same sweep were taken with the fenced leave
-described above and are being re-measured. `ETCFS_ELASTIC_LOCKS` files are
-created on one survivor and stat'ed by every survivor before the event, so
-each holds their glocks; 100 files left 328 glocks on a survivor and 100,000
-left 200,123. The kernel's `dlm_recover … done` lines give each recovery's
-duration. Two runs per point unless noted, five at three nodes.
+`ETCFS_ELASTIC_LOCKS` files are created on one survivor and stat'ed by every
+survivor before the event, so each holds their locks: on GFS2, 100 files left
+328 glocks on a survivor and 100,000 left about 200,125. The kernel's
+`dlm_recover … done` lines give each GFS2 recovery's duration. Two runs per
+point unless noted.
 
-| Nodes | Files | leave: max stall (s) | DLM recovery, leave (ms) | DLM recovery, join (ms) |
-|---|---|---|---|---|
-| 3 | none | 0.018 (0.014–0.020) | 112 (104–212) | 100 (96–144) |
-| 6 | 100 | 0.039 (0.026–0.052) | 246 (232–260) | 202 (152–252) |
-| 6 | 100,000 | 0.037 (0.028–0.046) | 794 (740–848) | 570 (536–604) |
-| 8 | 100 | 0.047 (0.034–0.060) | 144 (116–172) | 178 (108–248) |
-| 8 | 100,000 | 0.072 (1 run) | 924 (1 run) | 752 (1 run) |
-| 10 | 100 | 0.125 (1 run) | 320 (1 run) | 252 (1 run) |
-| 10 | 100,000 | no run completed | — | — |
+| Nodes | Files | etcfs leave: max stall (s) | gfs2 leave: max stall (s) | gfs2 DLM recovery, leave (ms) | gfs2 DLM recovery, join (ms) |
+|---|---|---|---|---|---|
+| 3 | none | 0.110 (0.101–0.123), 5 runs | 0.018 (0.014–0.020), 5 runs | 112 (104–212) | 100 (96–144) |
+| 6 | 100 | 0.322 (0.310–0.333) | 0.039 (0.026–0.052) | 246 (232–260) | 202 (152–252) |
+| 6 | 100,000 | 0.309 (0.281–0.336) | 0.037 (0.028–0.046) | 794 (740–848) | 570 (536–604) |
+| 8 | 100 | 0.457 (0.448–0.465) | 0.047 (0.034–0.060) | 144 (116–172) | 178 (108–248) |
+| 8 | 100,000 | 0.480 (0.464–0.495) | 0.044 (0.038–0.072), 3 runs | 896 (828–924) | 752 (724–788) |
+| 10 | 100 | 0.587 (0.534–0.639) | 0.125 (1 run) | 320 (1 run) | 252 (1 run) |
+| 10 | 100,000 | 0.532 (0.531–0.533) | no run completed | — | — |
 
 Values are medians with the range in brackets; zero failed operations
-throughout. Recovery time grows with the number of locks held: at six nodes,
-1,000 times the files costs about three times the recovery. The survivors'
-probe stall stays under 0.13 s at every point.
+throughout. The etcfs leaves at six to ten nodes were the fenced ones described
+above; at three nodes the fenced and the announced leave stalled the survivors
+alike (0.115 s against 0.110 s), so the column is read as the cost of the
+change, not of the fence.
 
-**Mount hang at eight and ten nodes.** In four of the eight GFS2 setups at
-eight or ten nodes, one node's first `mount -t gfs2` did not return: its
-kernel thread sat in `dlm_new_lockspace` (hung-task trace) while
-`corosync-quorumtool` reported all nodes present and quorate. It happened in
-both 10-node runs with 100,000 files, once at 10 nodes with 100, once at 8
-with 100,000, and never at six or fewer. The hang is at provisioning, before
-any file is created, so the lock count is not its trigger. Whether it is a DLM
-limit of this unfenced stack or something in how the harness starts `dlm` and
-mounts the nodes one after another is not yet established; the 10-node,
-100,000-file point therefore has no data.
+The two designs scale along different axes. GFS2's recovery time grows with the
+number of locks held: at six nodes, 1,000 times the files costs about three
+times the recovery, while its survivors' stall stays under 0.13 s. etcfs's stall
+does not move with the lock count and grows with the node count instead, from
+0.11 s at three nodes to about 0.55 s at ten. The 8-node, 100,000-file GFS2
+join stalled the survivors for 0.36 s (0.26–0.38), its slowest join point.
 
-### Repeated and overlapping changes on GFS2 (2026-11-24)
+**GFS2 mount hang at eight and ten nodes.** A node's `mount -t gfs2` sometimes
+did not return: its kernel thread sat in `dlm_new_lockspace` (hung-task trace)
+while `corosync-quorumtool` reported every node present and quorate. At ten
+nodes it happened in 6 of 7 attempts — every attempt with 100,000 files and
+four of five with 100 — once on the rejoin after a clean leave and otherwise on
+the first mount at provisioning. At eight nodes it happened in 1 of 6, and never
+at six or fewer. Most hangs come before any file is created, so the lock count
+is not the trigger. Whether it is a DLM limit of this unfenced stack or
+something in how the harness starts `dlm` and mounts the nodes one after another
+is not yet established; GFS2 has no ten-node data beyond the single 100-file
+run.
+
+### Repeated and overlapping changes (2026-11-24/25, `m7i.large`)
 
 **Churn.** One node leaves and rejoins six times at a fixed interval while two
-survivors write. Two runs per interval (one at 30 s and 5 s):
+survivors write (`bench-churn.sh`). Two runs per interval and backend, three for
+GFS2 at 30 s and 5 s:
 
-| Interval | worst stall (s) | bandwidth lost | max DLM recovery (ms) |
-|---|---|---|---|
-| 60 s | 0.268 | 22.9% | 306 |
-| 30 s | 0.268 | 21.3% | 348 |
-| 10 s | 0.247 | 19.3% | 212 |
-| 5 s | 0.266 | 20.8% | 260 |
-| 2 s | 0.265 | 23.1% | 226 |
+| Interval | etcfs worst stall (s) | etcfs bandwidth lost | etcfs rejoin (s) | gfs2 worst stall (s) | gfs2 bandwidth lost | gfs2 rejoin (s) | gfs2 max DLM recovery (ms) |
+|---|---|---|---|---|---|---|---|
+| 60 s | 0.171 | 18.1% | 1.45 | 0.268 | 22.9% | 3.41 | 306 |
+| 30 s | 0.163 | 16.1% | 1.43 | 0.264 | 22.4% | 3.33 | 320 |
+| 10 s | 0.143 | 13.4% | 1.48 | 0.247 | 19.3% | 3.15 | 212 |
+| 5 s | 0.137 | 9.2% | 1.45 | 0.258 | 20.5% | 3.42 | 244 |
+| 2 s | 0.117 | 5.4% | 1.50 | 0.265 | 23.1% | 3.32 | 226 |
 
-The stall does not grow with the rate. At a 2 s interval the cluster sustained
-one change every 3.4 s: a leave and a rejoin take longer than 2 s, so each
-change started as soon as the previous one finished. All 24 recoveries the
-survivors' kernels started in each run also finished, so no change cut another's
-recovery short at any of these rates.
+Zero failed operations. Neither backend's stall grows with the rate. etcfs held
+the 2 s interval (2.02 s achieved); GFS2 sustained one change every 3.4 s,
+because a leave and a rejoin take it longer than 2 s, so each change started as
+soon as the previous one finished. All 24 recoveries the GFS2 survivors'
+kernels started in each run also finished, so no change cut another's recovery
+short at any of these rates. etcfs's bandwidth loss falls as the rate rises; the
+measured window is the same, and how much of it the leaver spends absent is the
+likely reason, not one these runs isolate.
 
 **Two changes at once.** With four nodes, two leave and then rejoin at the
-same instant, or one rejoins as another leaves. The two survivors' worst stall
-was 0.285 s (0.280–0.290) and 0.260 s (0.258–0.262), with recoveries of
-124 ms and 172 ms, two runs each. In one of the two double-join runs only two of
-the four recoveries the survivors started reported `done`, which is what the
-second join interrupting the first one's recovery would leave in the log; the
-interrupted recoveries' own log lines were not collected, so that reading is not
-confirmed. Either way it cost no visible stall.
+same instant, or one rejoins as another leaves. Two runs each:
 
-### Adding a node GFS2 has never seen (2026-11-24, one run each)
+| | etcfs worst stall (s) | gfs2 worst stall (s) | gfs2 DLM recovery (ms) |
+|---|---|---|---|
+| double join | 0.120 (0.118–0.122) | 0.285 (0.280–0.290) | 124 |
+| join while another leaves | 0.134 (0.130–0.138) | 0.260 (0.258–0.262) | 172 |
+
+Zero failed operations; each etcfs join took 1.45–1.49 s. In one of the two
+GFS2 double-join runs only two of the four recoveries the survivors started
+reported `done`, which is what the second join interrupting the first one's
+recovery would leave in the log; the interrupted recoveries' own log lines were
+not collected, so that reading is not confirmed. Either way it cost no visible
+stall.
+
+### Adding a node the cluster has never seen (2026-11-24/25, `m7i.large`)
 
 `bench-gfs2-journal-add.sh` with `ETCFS_JADD_FULL=1` admits a node that is in
-neither corosync's nodelist nor the journal count: write the new
-`corosync.conf` on every node (4.26 s), `corosync-cfgtool -R` (0.02 s), wait for
-the joiner to be a member (0.70 s), `gfs2_jadd -j 1` (0.90 s), mount (2.76 s).
-Admission took 8.62 s end to end, with a 0.232 s survivor stall and no failed
-operation.
+neither corosync's nodelist nor the journal count. Three runs, medians: write
+the new `corosync.conf` on every node (3.81 s, 3.29–4.26), `corosync-cfgtool -R`
+(0.02 s), wait for the joiner to be a member (0.70 s), `gfs2_jadd -j 1`
+(0.92 s), mount (2.80 s). Admission took 8.26 s (8.02–8.62) end to end, with a
+0.232 s survivor stall (0.226–0.264) and no failed operation.
 
 `bench-scale-cycle.sh` does the same to a freshly launched instance three times
-over and removes it again each time, as an autoscaler's hooks would. The GFS2
-steps of an add took 12 s (configuration on every node 7.6–7.9 s, `gfs2_jadd`
-1.0 s in the first cycle only, mount 3.2 s), and the whole add 44–47 s, most of
-it EC2 launching the instance. The survivors' worst stall was 5.35 s in the
-first add, the only one that ran `gfs2_jadd`, and 0.07–0.08 s in the other two;
-removal stalled them for at most 0.034 s. One run, so the 5.35 s is a single
-observation.
+over and removes it again each time, as an autoscaler's hooks would; three runs
+per backend.
+
+| Add, median | etcfs | gfs2 |
+|---|---|---|
+| filesystem steps | member add 0.04 s, etcd start 0.14–0.75 s, both daemons 0.12 s, first write 0.06–0.09 s | configuration on every node 7.8 s, `gfs2_jadd` 1.0 s (first cycle only), mount 2.9 s |
+| whole add, launch included | 42–45 s | 47 s |
+| survivors' worst stall, add | 0.19–0.20 s | 0.08–0.10 s |
+| survivors' worst stall, removal | 0.19–0.20 s | 0.03–0.04 s |
+
+EC2's launch (about 20 s) and the instance's package install dominate both
+totals. After an etcfs removal the node's membership was gone within 1.8 s and
+its arenas released within 0.006 s. One GFS2 run stalled the survivors for
+5.35 s during its first add, the only one that ran `gfs2_jadd`; the other two
+runs' first adds stalled them for 0.09–0.10 s, so that stall did not recur.
 
 ## Reading these numbers
 
@@ -201,13 +244,18 @@ throughput to a membership change: the worst measured loss is GFS2's 22.7%
 during a join, and the best is gluster's 2.6%, whose client mount touches no
 other client at all.
 
-**etcfs's join is the slowest at 5.1 s, and that is the expected shape.** A
-joining etcfs node starts two daemons, registers in etcd, claims an arena and
-waits for a mount that answers a write. A client mount for gluster/nfs/juicefs
-is a single mount syscall against a server that is already running (0.35–1.38 s),
-and GFS2's 3.8 s is a lockspace join plus mount. Nothing about a 5 s join is
-concerning — it is a process start, not a stall, and the survivors kept writing
-throughout — but it is not a number to claim a win on.
+**etcfs's join takes 1.46 s with the leave announced.** A joining etcfs node
+starts two daemons, registers in etcd, claims an arena and waits for a mount
+that answers a write. A client mount for gluster/nfs is a single mount syscall
+against a server that is already running (0.3–0.4 s), and GFS2's 3.2–3.8 s is
+a lockspace join plus mount. The 4–5 s etcfs join times in the first two tables
+include the EBS reattach of the fenced leave described above.
+
+**etcfs's survivors stall longer at larger cluster sizes than GFS2's do.** At
+ten nodes a clean leave stalls them for about 0.55 s against GFS2's 0.13 s, and
+a scale-cycle add or removal for 0.2 s against 0.03–0.1 s. Neither is a stop of
+the world, and GFS2's advantage holds only while its recovery stays short: it
+grows with the locks held, and at ten nodes GFS2 mostly did not mount at all.
 
 **juicefs's join-phase bandwidth is unmeasured, not zero.** fio returned an
 empty result file on both surviving nodes for that phase, the same failure mode
@@ -238,9 +286,11 @@ it and points at where the other half lives:
 
 ## Caveats
 
-- One run per backend per phase; the bandwidth deltas are single samples.
-- Three mounted nodes in the main tables. The 2026-11-24 GFS2 sweep covers six
-  to ten; etcfs's run of the same sweep is pending re-measurement.
+- The five-backend tables are one run per backend per phase; their bandwidth
+  deltas are single samples. The etcfs-and-GFS2 sections are two to five runs
+  per point.
+- The etcfs stalls at six to ten nodes were measured with the fenced leave; see
+  the sweep section for why they are kept.
 - The load is sequential 1 MiB writes to per-node files. A metadata-heavy load
   during the same event would stress the lock protocols harder than bulk writes
   do.

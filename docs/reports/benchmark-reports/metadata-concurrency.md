@@ -1,6 +1,6 @@
 # Benchmark Report — Metadata Under Concurrency
 
-*2026-08-25*
+*2026-08-25, updated 2026-11-26*
 
 ## Summary
 
@@ -53,6 +53,23 @@ GlusterFS and 3.4x behind NFS, against 2.4x and 3.7x in the older table.
 GFS2 is **5.1x** faster at three nodes, against the 4.6x in the table above, so
 the cross-day comparison did not flatter either side. Both curves keep their
 shape: GFS2 flattens between two and three nodes, etcfs keeps climbing.
+
+### `m7i.large`, with EFS (2026-11-25/26)
+
+Three runs per backend on fresh 3-node clusters. Operations per second,
+medians with ranges in brackets.
+
+| Backend | 1 node | 2 nodes | 3 nodes |
+|---|---|---|---|
+| **etcfs** | **299** (290–303) | **424** (403–434) | **508** (482–518) |
+| gfs2 | 2669 (2492–2778) | 5254 (4792–5282) | 2768 (2494–4509) |
+| efs, elastic | 287 (285–315) | 354 (320–356) | 411 (384–417) |
+| efs, provisioned 256 MiB/s | 337 (277–348) | 348 (327–363) | 416 (372–417) |
+
+GFS2 is 5 to 12 times faster at every node count, but its curve falls at three
+nodes, where the shared directory's lock starts to move between all of them.
+etcfs's rises by 1.7x from one node to three and EFS's by 1.4x. Provisioned
+throughput leaves EFS where it was.
 
 ## Reading these numbers
 
