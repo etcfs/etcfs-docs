@@ -44,6 +44,18 @@ cold `find` sits between the two. The warm `find` is where etcfs still loses:
 3.6 s against 0.05 s for GFS2 and 0.5 s for EFS, because a repeated walk
 costs etcfs nearly as many etcd reads as the first one.
 
+### `m5.large`, with EFS (2026-11-26)
+
+Three runs per backend on fresh 3-node `m5.large` clusters, EFS in elastic mode. Medians, ranges in brackets.
+
+| Backend | find cold (s) | find warm (s) | du (s) | lookups/sec (cold) |
+|---|---|---|---|---|
+| **etcfs** | **6.189** (5.822–6.406) | **5.400** (5.306–5.545) | **97.9** (96.1–99.1) | **12926.16** |
+| gfs2 | 4.958 (4.775–9.421) | 0.119 (0.117–0.120) | 81.7 (81.6–84.6) | 16135.54 |
+| efs | 5.148 (5.135–8.683) | 0.538 (0.496–0.640) | 99.4 (54.2–138.2) | 15540.02 |
+
+Without credit throttling etcfs's warm `find` is 5.4 s rather than 7.2 s, still 45x GFS2's and 10x EFS's. Its `du` is level with EFS's median, but EFS's three runs spread from 54 to 138 s.
+
 ## Reading these numbers
 
 **Cold `find` is not where etcfs loses**: 8.24 s on 80,000 files, between

@@ -21,6 +21,20 @@ Same five isolated 3-node clusters as the other reports.
 
 \* gfs2 and gluster's p99 both read 0us — an artifact of fio's percentile-key JSON format differing by version/backend rather than a genuine zero-latency result (this run's parser reads a specific `"99.000000"` key; some fio builds emit percentile keys without the trailing zeros, so the lookup misses and falls back to 0). Not fixed in this run; treat those two p99 figures as missing data, not as real numbers.
 
+### `m5.large`, with EFS (2026-11-26)
+
+Three runs per backend on fresh 3-node `m5.large` clusters, EFS in elastic mode. Medians, ranges in brackets.
+
+| Backend | sync-write IOPS | write p99 (us) |
+|---|---|---|
+| **etcfs** | **214** (213–219) | **3817** (3785–4178) |
+| gfs2 | 989 (989–990) | 9 |
+| efs | 157 (147–158) | 12 (12–15) |
+
+The table above ran on `t3.medium`, whose CPU credits run out during the run; on `m5.large` etcfs sustains 214 IOPS instead of 155, while GFS2 is unchanged at 989. That puts etcfs 4.6x behind GFS2 and 1.4x ahead of EFS, whose `fdatasync` is a commit at the NFS service.
+
+The p99 column is the `write` call's. fio reports the `fdatasync` after it separately, so GFS2's and EFS's single-digit microseconds only say their writes land in the page cache. In the last run of each, the `fdatasync` p99 was 6.06 ms on etcfs and 13.70 ms on EFS; the AL2 image's fio does not report it for GFS2.
+
 ## Bug found and fixed during this run
 
 The first attempt failed outright on gfs2 and gluster:

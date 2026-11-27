@@ -71,6 +71,16 @@ nodes, where the shared directory's lock starts to move between all of them.
 etcfs's rises by 1.7x from one node to three and EFS's by 1.4x. Provisioned
 throughput leaves EFS where it was.
 
+### `m5.large`, with EFS (2026-11-26)
+
+Three runs per backend on fresh 3-node `m5.large` clusters, EFS in elastic mode. Medians, ranges in brackets.
+
+| Backend | 1 node | 2 nodes | 3 nodes |
+|---|---|---|---|
+| efs | 285.93 (282.01–288.02) | 359.63 (351.70–368.05) | 426.86 (423.65–429.43) |
+
+At three nodes EFS is 5% above etcfs's 405 ops/s from the same-class re-measure and 3.2x below NFS's 1369.
+
 ## Reading these numbers
 
 **etcfs is still last in absolute throughput at every node count, by 3.7x

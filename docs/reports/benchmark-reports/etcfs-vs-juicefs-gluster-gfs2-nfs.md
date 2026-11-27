@@ -91,6 +91,16 @@ working set that fits in RAM; etcfs's 1016 is the device, because `direct=1` is
 in every job and etcfs honours it. The next section is the experiment that
 established that.
 
+### EFS at matched load (2026-11-26)
+
+The same psync 4 × 1 job against EFS in elastic mode on `m5.large`, three runs on fresh clusters (`bench-efs.sh`). Medians, ranges in brackets.
+
+| Backend | Job | write IOPS | write p99 (us) | read IOPS | read p99 (us) |
+|---|---|---|---|---|---|
+| efs | psync, 4 × 1 | 633 (581–655) | 11993 (9503–12648) | 9885 (7428–10008) | 758 (635–791) |
+
+EFS's write tail is level with etcfs's at two thirds of the IOPS. Its reads are served by the EFS service, not by a 1000-IOPS volume, so that column is not comparable with the device-bound backends.
+
 ## Follow-up: does EtcFS's page cache do anything under `direct=1`?
 
 > **Update.** The root cause given at the end of this section no longer holds:

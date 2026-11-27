@@ -114,6 +114,16 @@ many, so the gap between them stays at about 80x. EFS is slower than etcfs:
 every create is a round trip to the NFS service, and provisioned throughput
 does not change that, since an untar of small files moves little data.
 
+### `m5.large`, with EFS (2026-11-26)
+
+Three runs per backend on fresh 3-node `m5.large` clusters, EFS in elastic mode. Medians, ranges in brackets.
+
+| Backend | untar (s) | creates/s |
+|---|---|---|
+| efs | 1390.0 (1238.7–1441.0) | 57.55 (55.52–64.59) |
+
+Against the same-class re-measure above (etcfs 55.08 files/s, GFS2 4230.57), EFS creates files at etcfs's rate: on `m5.large` neither is ahead.
+
 ## Reading these numbers
 
 etcfs is still worst by a wide margin — 75x slower than gfs2 (a local-journal filesystem with no per-create network round trip), and 2-4x slower than the network filesystems. The gap tracks directly to what the scenario's header names: a `create()` here is a synchronous Raft commit through etcd, one network round trip plus consensus per file, issued serially by a single untar process with no batching.

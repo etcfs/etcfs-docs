@@ -134,6 +134,18 @@ points in the same run completed normally, so the cluster was not dead — the
 concurrent bulk-write jobs are what fail. Reported as missing rather than as
 zero throughput.
 
+### `m5.large`, with EFS (2026-11-26)
+
+Three runs per backend on fresh 3-node `m5.large` clusters, EFS in elastic mode. Medians, ranges in brackets.
+
+| Metric | 2n | 4n | 6n |
+|---|---|---|---|
+| shared-file write (MiB/s) | 149.42 (71.26–228.12) | 304.08 (151.47–470.49) | 474.56 (233.09–726.00) |
+| disjoint write (MiB/s) | 156.42 (74.22–238.58) | 322.32 (157.39–490.61) | 487.88 (238.89–741.77) |
+| shared-directory metadata (ops/s) | 353.02 (314.63–373.51) | 454.86 (422.15–464.11) | 482.96 (463.80–497.24) |
+
+Within each run EFS's bandwidth grows in proportion to the node count, and a shared file costs it nothing against disjoint ones. Between runs it does not hold still: 233, 475 and 726 MiB/s at six nodes, on a new file system each time. What sets that level was not measured, so the median puts EFS level with GFS2's 443 MiB/s without ranking the two; etcfs's 234 MiB/s is below both.
+
 ## Reading these numbers
 
 **The one clean structural result is GFS2's metadata curve turning over.** 1522
